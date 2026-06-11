@@ -121,3 +121,21 @@ Decisions are made against where models are *going*, not where they are:
 
 **Stop building** (will be commodity): per-app integrations, custom embeddings, OCR, single-user vector DBs, custom redaction LLMs.
 **The moat is** the distillation pipeline + expert relationships + judge models + the consented dataset — not the capture plumbing.
+
+---
+
+## Status — what the prototype implements (June 2026)
+
+The thesis above is now running code (see [`PROTOTYPE.md`](../PROTOTYPE.md) and [`ARCHITECTURE.md`](../ARCHITECTURE.md)). Tap-by-tap:
+
+| Tap (thesis) | Shipped as | Status |
+|---|---|---|
+| Screen (`SCStream`) | `SCScreenshotManager` per display, every display each tick, Vision OCR (EN + 中文) at capture time, per-display change detection | ✅ verified live on a 3-display desk |
+| System audio (`CATapDescription`) | **Deviation:** `SCStream capturesAudio` instead — rides the *existing* Screen Recording grant, so no fourth permission prompt. VAD-chunked **on-device** transcription (Apple Speech, multi-locale race); transcripts only, raw audio never written | ✅ verified e2e |
+| Input (`CGEventTap`) | As designed; control keys + click coordinates only, never raw typed text (drafts come from AX) | ✅ |
+| Filesystem (FSEvents) | Polling watcher + git source, opt-in via `--watch`/`PRAXIS_WATCH` | ✅ |
+| Clipboard (`NSPasteboard`) | As designed | ✅ |
+| AI traffic (local proxy) | Forwarding proxy on :4318, Anthropic + OpenAI shapes, records `(prompt, response)` pairs verbatim | ✅ — plus a **universal AX conversation scrape** that captures any chat UI (Claude desktop, ChatGPT web, Discord…) with zero per-app code, covering tools the proxy can't reach |
+| On-device normalizer (Rust) | **Deviation:** TypeScript (Node ≥23.6, zero runtime deps) + Swift capture client. Episode segmentation, commit-moment correlation, and the evidence-linked claim graph are all implemented; PII redaction is not yet | ⚙️ partial |
+
+Beyond the thesis, the prototype also ships: deterministic action reconstruction with noisy-OR confidence, episode fusion, a throttled multimodal observer, non-destructive claim consolidation with correction feedback, proactive expert questions (unsuppressible panel + notifications), a live evidence-first Studio, and `praxis export-skill` — the learned profile as a portable SKILL.md. One install ceremony, two prompts in practice (Screen Recording covers audio; Accessibility covers input/AX; mic is a separate opt-in).

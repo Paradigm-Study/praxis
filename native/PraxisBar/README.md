@@ -17,7 +17,8 @@ An ◉ icon appears in your menu bar. Click it:
 
 | Button | Does |
 |--------|------|
-| **Start / Stop Capture** | `praxis capture --native --agent` — live taps + reconstruction + agent loop |
+| **Start / Stop Capture** | taps run **in-process** (under this app's TCC grant), piped into `praxis capture --native-stdin --agent` |
+| **System Audio / Microphone** | per-channel audio opt-ins (persisted); on-device transcripts only, never raw audio |
 | **Open Studio** | starts `praxis studio` (if needed) and opens http://localhost:4319 |
 | **Start / Stop AI Proxy** | `praxis proxy` on :4318 — point an AI tool's base URL here |
 | **Request Screen Recording…** | triggers the macOS Screen-Recording prompt |
@@ -28,6 +29,12 @@ An ◉ icon appears in your menu bar. Click it:
 
 The menu shows live status (🟢/⚪️ for Capture/Studio/Proxy) and permission state
 (✓/✗ for Screen + Accessibility).
+
+The bar is also the **question surface**: when the agent loop is unsure it asks
+via a system notification (option buttons + free-text action) AND a floating
+glass panel that Focus/DND/screen-sharing cannot suppress; the menu-bar icon
+shows a count badge while questions wait. Answers post to the Studio API and
+become corrections. Diagnostics: `~/Library/Logs/praxis-bar.log`.
 
 ## Permissions
 
@@ -59,9 +66,15 @@ tree runs under the app's identity — and signs it:
 
 - **Developer ID Application** cert in your keychain → signs with it (+ hardened
   runtime). Notarize with `xcrun notarytool submit` if you want to distribute.
-- otherwise → **ad-hoc** signature. Works fine locally; the one caveat is that
-  re-packaging produces a new code hash, so macOS may re-ask for the
-  Screen-Recording/Accessibility grants after a rebuild.
+- otherwise → a **local self-signed cert** ("Praxis Local Signing", created by
+  `scripts/setup-signing.sh`) — the default in practice. Cert-based signing
+  keeps the TCC designated requirement stable, so **permission grants survive
+  rebuilds** (ad-hoc signatures re-hash every build and lose the grants).
+- last resort → **ad-hoc**; works, but macOS re-asks for grants after rebuilds.
+
+Lifecycle is orphan-proof: the capture pipeline exits when the bar dies (stdin
+EOF), the bar cleans up on SIGTERM like a normal Quit, and a second instance
+refuses to start.
 
 `install-launchagent.sh` writes `~/Library/LaunchAgents/com.paradigm.praxis.plist`
 with `PRAXIS_HOME` + `PRAXIS_NODE` baked in (launchd has a minimal environment),

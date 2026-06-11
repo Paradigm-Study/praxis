@@ -10,7 +10,9 @@ normalized **NDJSON raw events** on stdout for the TypeScript ingest bridge
 | Input events | `CGEventTap` | `input_events / key_down`, `mouse_click` | Accessibility |
 | Accessibility | `AXUIElement` | `accessibility / focused_text_changed`, `ui_snapshot` | Accessibility |
 | Conversations | AX tree walk | `accessibility / conversation_bubble_added` — **any chat UI**, no per-app code | Accessibility |
-| Screen frames | `ScreenCaptureKit` | `screen_video / frame` (+ PNG blob, OCR'd) | Screen Recording |
+| Screen frames | `ScreenCaptureKit` | `screen_video / frame` per display (+ PNG blob, OCR'd EN/中文; change-detected) | Screen Recording |
+| System audio | `SCStream capturesAudio` | `audio / transcript_segment`, `playback_state` — on-device transcription, transcripts only | Screen Recording (same grant) |
+| Microphone | `AVAudioEngine` | `audio / transcript_segment` (channel `mic`) | Microphone + Speech Recognition |
 
 The **conversation tap** is the universal alternative to a proxy-per-app: it
 walks the focused window's AX tree, *baselines* each app on first sight, then
@@ -37,7 +39,9 @@ swift run praxis-capture                 # long-running, low-FPS
 .build/debug/praxis-capture --no-prompt  # don't pop the Screen Recording dialog
 ```
 
-Flags: `--frame-interval=3.0`, `--ax-interval=2.0`, `--once`, `--no-prompt`.
+Flags: `--frame-interval=3.0`, `--ax-interval=2.0`, `--once`, `--no-prompt`,
+`--audio-system`, `--audio-mic` (audio is opt-in per channel; raw audio is never
+written — only on-device transcripts and playback transitions).
 
 Usually you don't run it directly — the TS pipeline spawns it:
 

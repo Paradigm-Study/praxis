@@ -38,3 +38,11 @@ The middle/deep moats matter most. All require being the company experts and lea
 ## The one sentence to carry through every decision
 
 > **"Would an expert proud of their craft hear how we're doing this and choose to participate?"**
+
+---
+
+## Status update (2026-06-11)
+
+**First-60-days item 3 (thin capture-client MVP) is shipped — and overshot.** Built from scratch (TypeScript + Swift, zero runtime dependencies) rather than forking MineContext, which resolves the "build vs. fork" open decision: built. All six root-layer taps are live and verified on a real machine, including the local AI proxy and a universal AX conversation scrape no per-app integration could match. The prototype goes well past "capture": deterministic action reconstruction → episodes → an evidence-backed memory graph → proactive expert questions with one-tap answers → `praxis export-skill`, the first end-to-end demonstration of the product loop (capture on the expert's terms → distill → a portable, expert-owned skill). See [`PROTOTYPE.md`](../PROTOTYPE.md).
+
+Still open from this phase: explicit-capture design-partner sessions (item 2), the founding essay (item 1), PII redaction in the normalizer, and the compliance track (item 5).

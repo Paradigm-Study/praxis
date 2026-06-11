@@ -1,7 +1,8 @@
 # Praxis Architecture
 
 ```
-Native capture client ─┐
+Native: screens ×N, ───┐
+  audio, AX, input     │
 clipboard / fs / git ──┤
 terminal / ai-proxy ───┼─▶ ingest ─▶ raw event ledger ─▶ action reconstructor
 browser / synthetic ───┘   (Layer 1)      (Layer 2)            (Layer 3)
@@ -58,6 +59,24 @@ reads any `blobFiles` the Swift process wrote, offloads them, and feeds the
 funnel. Wire format and permissions are documented in the
 [native README](native/PraxisCapture/README.md).
 
+**Screens:** every display is captured each tick (multi-monitor desks are fully
+visible) with per-display **content-hash change detection** — an unchanged
+screen skips OCR and emission entirely (30s heartbeat reuses cached OCR text).
+Vision OCR auto-detects language (English + Simplified/Traditional Chinese).
+The universal **AX conversation scrape** baselines any chat UI and emits only
+newly-appeared bubbles — ChatGPT, Claude, Discord, iMessage, with zero per-app
+code.
+
+**Audio** ([`AudioCapture.swift`](native/PraxisCapture/Sources/PraxisCaptureKit/AudioCapture.swift)):
+two opt-in channels, both OFF by default. System output rides the existing
+Screen Recording grant via SCStream `capturesAudio` (no extra prompt); the mic
+is a separate opt-in with its own TCC. A VAD-gated chunker accumulates sound and
+flushes on sustained silence into **on-device** speech recognition — each chunk
+races every installed-language recognizer and the most confident reading wins,
+so code-switching works and segments carry their `lang`. The privacy stance is
+structural: transcripts and coarse `playback_state` transitions are emitted;
+**raw audio never touches disk**.
+
 The **`ai_proxy`** source is a real forwarding HTTP proxy
 ([`aiProxyServer.ts`](src/capture/sources/aiProxyServer.ts)): a routed AI tool
 points its API base URL at it; the proxy extracts the model + prompt (Anthropic
@@ -83,7 +102,10 @@ weak, but Enter + a draft + a new conversation bubble + a matching AI request
 combine to ~0.98. Weak evidence yields a low-confidence action with an explicit
 `uncertainty[]` (e.g. `possibly_reading_discord` at 0.55, "focus and screen
 agree, but no AX text available"). Rules are grouped by domain under
-[`rules/`](src/reconstructor/rules) and cover all 20 supported action types.
+[`rules/`](src/reconstructor/rules) and cover all 23 supported action types —
+including the audio pairings: interleaved mic + system speech reconstructs an
+`attended_meeting`, system speech alone `listened_audio`, lone mic speech
+`spoke_aloud` (kept deliberately uncertain).
 
 ## Layer 4 — Episode Fuser
 
@@ -123,6 +145,16 @@ edges connect them to the episodes that evidence them, caused file changes,
 followed failing/passing tests, were taught, or were contradicted by a
 correction.
 
+**Consolidation** ([`consolidate.ts`](src/memory/consolidate.ts)) derives a
+tight profile from raw claims **without losing signal**: merging happens only
+within a kind, similarity is conservative (the safe failure mode is
+under-merging), evidence unions monotonically, and `evidenceCoverage()` proves
+no episode's signal was dropped. Entries carry a **durable / provisional** tier
+(recurrence across ≥2 episodes promotes) and a priority level. **Corrections
+feed back**: claims the user rejected are suppressed from the profile view —
+non-destructively, since raw claims are never mutated. `praxis profile` renders
+it; `praxis export-skill` ships it.
+
 ## Layer 7 — Agent Loop
 
 `observe → reconstruct → fuse → update graph → decide`. The policy
@@ -134,6 +166,16 @@ learned playbook), summarize-pattern, or mark-uncertainty. Runs as a debounced
 live loop or a single `tick()`. Each decision is **persisted** (`decisions`
 table) so the Studio can surface the agent's live questions — `capture --agent`
 feeds the loop straight from the capture stream.
+
+**The ask path is engineered for delivery.** Questions ship with the observer's
+candidate answers, throttled (≤1 per 5 min, never re-asked once answered), to
+`data/notifications.ndjson`. The menu-bar app tails it and surfaces each
+question **twice**: a system notification with option buttons + a text-input
+action, and a floating **glass question panel** that macOS cannot mute — built
+after Focus/DND and screen-sharing silently swallowed notifications twice in
+one day. Answers from any surface (panel, notification, Studio card) POST to
+`/api/answer`, become corrections, retract the question everywhere, and feed
+the consolidation layer as the highest-grade evidence there is.
 
 ## Layer 8 — Praxis Studio
 
@@ -157,6 +199,24 @@ rules, know-how, taste, open questions — each with evidence). `critique()` che
 a learner/agent's actions against it (e.g. "committed without running tests
 first") — conformance-checking, never invention. This is what the agent loop uses
 to intervene.
+
+**`praxis export-skill`** renders the consolidated, correction-filtered profile
+as a portable `SKILL.md` (priority-tiered rules, evidence episode counts,
+durable-first) that installs into any agent's skill directory — the learned
+model of the expert, made operable outside Praxis.
+
+## Operational hardening (learned in production)
+
+- **TCC identity**: capture runs **in-process inside the signed menu-bar app**
+  (a child helper does not inherit the grant), signed with a stable local cert
+  so permissions survive rebuilds ([`scripts/setup-signing.sh`](scripts/setup-signing.sh)).
+- **Orphan-proof lifecycle**: the capture pipeline's stdin is a pipe from the
+  bar — EOF on it shuts the pipeline down no matter how the bar died; the bar
+  handles SIGTERM with the same cleanup as Quit, refuses to start twice, and
+  the Studio defers (exit 0) to a healthy Studio already on its port.
+- **Bounded everything**: the observer sees only bounded bundles, the Studio
+  API ships only the newest slice of large tables, OCR runs only on changed
+  frames, and the recognizer runs only when sound is present.
 
 ## Toolchain notes
 

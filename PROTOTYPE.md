@@ -26,7 +26,7 @@ TypeScript stripping, `node:sqlite`, `node:test`, and `node:http`.
 cd praxis
 npm run demo        # full pipeline on a synthetic session, explained end-to-end
 npm run studio      # then open http://localhost:4319
-npm test            # 28 tests, ~200ms
+npm test            # 64 tests, ~300ms
 ```
 
 `npm run demo` ingests a realistic ~5-minute Codex session (ask → edit → test →
@@ -69,10 +69,12 @@ just launches the same `praxis` CLI commands below.
 | `npm run observer:check` | Verify the model-backed observer + proxy against the live Anthropic API (two small calls) |
 | `npm run typecheck` | `tsc --noEmit` (needs `npm install`) |
 | `npm run native:build` | `swift build` the native macOS capture client |
+| `node src/cli/praxis.ts profile` | Your consolidated profile: durable vs provisional traits, corrections applied, no signal lost |
+| `node src/cli/praxis.ts export-skill` | Distill the profile into a portable `SKILL.md` any agent can operate from (`--out --name --durable-only`) |
 | `node src/cli/praxis.ts hook` | Print the zsh hook for terminal-command capture |
 
-CLI also exposes `reconstruct`, `fuse`, `graph`, `observe`, `status`, and
-`proxy` (the AI recording proxy — point a tool's API base URL at it).
+CLI also exposes `reconstruct`, `fuse`, `graph`, `observe`, `status`, `reset`,
+and `proxy` (the AI recording proxy — point a tool's API base URL at it).
 
 **API key:** the CLI auto-loads `praxis/.env` (gitignored). With
 `ANTHROPIC_API_KEY` set, one-shot `praxis observe` uses the real multimodal
@@ -94,16 +96,17 @@ real code that needs macOS permissions to produce live data.
 | 1 — Capture (filesystem, git, terminal) | ✅ runs; **verified on real activity** end-to-end via `npm run capture:check` (real file edit + commands + commit → reconstructed actions) |
 | 1 — Capture (synthetic, clipboard, browser) | ✅ runs |
 | 1 — `ai_proxy` recording proxy | ✅ real forwarding HTTP proxy — records prompts/responses, returns upstream verbatim (tested against a mock upstream) |
-| 1 — Native taps (ScreenCaptureKit / CGEventTap / Accessibility / **Vision OCR**) | ✅ compiles & runs; OCR verified via `--selftest-ocr`; **live screen/AX/input needs Screen-Recording + Accessibility TCC grants** |
+| 1 — Native taps (ScreenCaptureKit / CGEventTap / Accessibility / **Vision OCR**) | ✅ **verified live**: captures ALL displays (per-display change detection skips OCR on static screens), OCR auto-detects EN + 中文, universal AX conversation scrape for any chat app |
+| 1 — **Audio** (system output + opt-in mic) | ✅ **verified e2e**: SCStream system tap rides the existing Screen Recording grant; VAD-chunked **on-device** transcription (multi-locale race — EN now, 中文 once the dictation model is installed); transcripts only, raw audio never touches disk |
 | 2 — Storage (SQLite WAL + content-addressed blobs) | ✅ runs |
 | 2 — DuckDB analytics | ⚙️ SQLite-backed today; DuckDB auto-detected if installed |
 | 3 — Action Reconstructor | ✅ runs + tested |
 | 4 — Episode Fuser | ✅ runs + tested |
-| 5 — Multimodal Observer | ✅ offline mock runs; ✅ Anthropic-backed **verified against the live API** (`npm run observer:check` — real screen frame as an image block + tool-forced structured output); frames are magic-byte sniffed so only genuine images reach the model |
-| 6 — Expert Memory Graph | ✅ runs + tested |
-| 7 — Agent Loop | ✅ runs + tested |
-| 8 — Praxis Studio UI | ✅ runs; **Live Feed streams in real time via SSE** (cross-process through the WAL DB) |
-| 11 — Learner/Agent Transfer | ✅ runs + tested |
+| 5 — Multimodal Observer | ✅ offline mock runs; ✅ Anthropic-backed **verified against the live API**; bundles lead with the newest frame of **every display** + audio transcripts; frames are magic-byte sniffed so only genuine images reach the model |
+| 6 — Expert Memory Graph | ✅ runs + tested; **non-destructive consolidation** (durable/provisional tiers, evidence-coverage proven, 0 episodes lost) + correction feedback suppresses rejected claims |
+| 7 — Agent Loop | ✅ runs + tested; **proactive questions** with candidate answers via an unsuppressible floating glass panel + notification actions + Studio cards — answers write back as corrections and stop re-asks |
+| 8 — Praxis Studio UI | ✅ runs; **Live Feed streams in real time via SSE**; dark-glass design; evidence drill-down to the exact frame behind any claim |
+| 11 — Learner/Agent Transfer | ✅ runs + tested; **`praxis export-skill`** emits a portable SKILL.md of the learned profile, installable for any agent |
 
 Nothing is faked: the demo's numbers come from running code, and the native
 client really did emit a live `app_focused` event for the frontmost app during
@@ -128,7 +131,9 @@ praxis/
     studio/       JSON API + zero-dep web UI (Layer 8)
     fixtures/     the synthetic Codex sessions that drive the demo + tests
     cli/          praxis CLI + demo runner
-  native/PraxisCapture/   Swift macOS capture client (SwiftPM)
+  native/PraxisCapture/   Swift capture client: screens ×N, audio, AX, input (SwiftPM)
+  native/PraxisBar/       Swift menu-bar app: runs capture in-process, audio toggles, question panel
+  scripts/        packaging, signing (stable TCC identity), launchd install
   test/           node:test suites
 ```
 
