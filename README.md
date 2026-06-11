@@ -23,7 +23,29 @@ The market is hot and the brand stakes are existential. The middleman that wins 
 
 ## What this repo is
 
-The founding documents — the source of truth for the narrative, product, tech approach, and non-negotiable principles — **plus the working prototype**: a zero-install macOS capture + reconstruction pipeline (multi-display screen/OCR, on-device audio transcription, universal app scraping → exact reconstructed actions → work episodes → an evidence-backed expert memory graph → a portable skill any agent can operate from). Every interpretation carries confidence and links back to raw evidence; raw audio and captured data never leave the machine. See [`PROTOTYPE.md`](PROTOTYPE.md) to run it.
+The founding documents — the source of truth for the narrative, product, tech approach, and non-negotiable principles — **plus the working prototype**: a zero-install macOS capture + reconstruction pipeline (multi-display screen/OCR, on-device audio transcription, universal app scraping → exact reconstructed actions → work episodes → an evidence-backed expert memory graph → a portable skill any agent can operate from). Every interpretation carries confidence and links back to raw evidence; raw audio and captured data never leave the machine.
+
+## Run it
+
+macOS + **Node ≥ 23.6**. No `npm install` — zero runtime dependencies (built-in TypeScript stripping, `node:sqlite`, `node:http`).
+
+```sh
+git clone https://github.com/Paradigm-Study/praxis && cd praxis
+
+npm run demo       # the whole pipeline on a synthetic session, explained step by step
+npm test           # 64 tests, ~300ms
+npm run studio     # the dashboard → http://localhost:4319
+```
+
+To capture **your own work** (the real thing — a menu-bar app with a stable permission identity that starts at login):
+
+```sh
+npm run app:package && npm run app:install
+```
+
+Click the ◉ menu-bar icon → grant **Screen Recording** and **Accessibility** via the Request… buttons → **Start Capture**. Audio (system output / microphone) is a separate per-channel opt-in in the same menu — on-device transcripts only, raw audio is never written. Set `ANTHROPIC_API_KEY` in `praxis/.env` to enable the multimodal observer (the only paid component; everything else runs locally for free).
+
+Full guide, commands, and the layer-by-layer status table: [`PROTOTYPE.md`](PROTOTYPE.md).
 
 ## Repo map
 
