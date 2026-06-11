@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Praxis Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">◭</div>
+        <div>
+          <div class="brand-name">Praxis</div>
+          <div class="brand-sub">Studio</div>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="counts" id="counts"></div>
+      <div class="tagline">
+        Raw taps prove what happened.<br />The model explains why it mattered.
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h1 id="view-title">Live Feed</h1>
+        <div class="view-sub" id="view-sub"></div>
+        <button id="refresh" class="refresh" title="Refresh">⟳</button>
+      </header>
+      <section id="content" class="content"></section>
+    </main>
+
+    <div id="agent-toast" class="agent-toast hidden"></div>
+
+    <div id="drawer" class="drawer hidden">
+      <div class="drawer-head">
+        <span id="drawer-title">Evidence</span>
+        <button id="drawer-close">✕</button>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

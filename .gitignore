@@ -31,3 +31,18 @@ venv/
 /data/
 *.episode
 *.sqlite
+
+# Praxis runtime data (event DB + content-addressed blobs)
+*.db
+*.db-wal
+*.db-shm
+
+# Packaged app
+/dist/
+
+# Swift
+native/*/.build/
+native/*/.swiftpm/
+
+# Node
+npm-debug.log*

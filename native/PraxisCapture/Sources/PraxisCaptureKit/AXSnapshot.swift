@@ -1,0 +1,60 @@
+import ApplicationServices
+import AppKit
+
+/// Accessibility tap: reads the focused element of the frontmost app — its role,
+/// value (for text fields), and title. Emits `focused_text_changed` when a text
+/// field's value changes and `ui_snapshot` otherwise. Needs Accessibility TCC.
+enum AXSnapshot {
+    private static var lastValue: String?
+
+    /// Title of the focused window of a given process (used to label focus events).
+    static func frontWindowTitle(pid: pid_t) -> String? {
+        let appEl = AXUIElementCreateApplication(pid)
+        var win: AnyObject?
+        guard AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &win) == .success,
+              let w = win else { return nil }
+        return copyString(w as! AXUIElement, kAXTitleAttribute)
+    }
+
+    static func snapshotFocused() {
+        let sys = AXUIElementCreateSystemWide()
+        var focused: AnyObject?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let el = focused else { return }
+        let element = el as! AXUIElement
+
+        let role = copyString(element, kAXRoleAttribute) ?? ""
+        let value = copyString(element, kAXValueAttribute)
+        let title = copyString(element, kAXTitleAttribute)
+        // An empty field often reports its placeholder as the value — skip those
+        // so the reconstructor doesn't treat "Type / for commands" as user input.
+        let placeholder = copyString(element, kAXPlaceholderValueAttribute)
+        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        let window = NSWorkspace.shared.frontmostApplication
+            .flatMap { frontWindowTitle(pid: $0.processIdentifier) } ?? app
+
+        if role == "AXTextField" || role == "AXTextArea" || role == "AXComboBox" {
+            guard let v = value, v != lastValue else { return }
+            let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || v == placeholder { return } // empty composer
+            lastValue = v
+            Emitter.shared.emit(
+                source: "accessibility", app: app, window: window,
+                type: "focused_text_changed",
+                payload: ["role": "textfield", "value": v]
+            )
+        } else {
+            Emitter.shared.emit(
+                source: "accessibility", app: app, window: window,
+                type: "ui_snapshot",
+                payload: ["focusedRole": role, "title": title ?? ""]
+            )
+        }
+    }
+
+    static func copyString(_ el: AXUIElement, _ attr: String) -> String? {
+        var v: AnyObject?
+        guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
+        return v as? String
+    }
+}

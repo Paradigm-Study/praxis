@@ -1,0 +1,16 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "studio",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--disable-warning=ExperimentalWarning",
+        "src/cli/praxis.ts",
+        "studio",
+        "--port=4319"
+      ],
+      "port": 4319
+    }
+  ]
+}

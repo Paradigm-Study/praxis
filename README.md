@@ -23,7 +23,7 @@ The market is hot and the brand stakes are existential. The middleman that wins 
 
 ## What this repo is
 
-Founding documents only — the output of the initial design work. **Zero code yet.** This is the source of truth for the narrative, product, tech approach, and the non-negotiable principles before we write a line.
+The founding documents — the source of truth for the narrative, product, tech approach, and non-negotiable principles — **plus the working prototype**: a zero-install macOS capture + reconstruction pipeline (multi-display screen/OCR, on-device audio transcription, universal app scraping → exact reconstructed actions → work episodes → an evidence-backed expert memory graph → a portable skill any agent can operate from). Every interpretation carries confidence and links back to raw evidence; raw audio and captured data never leave the machine. See [`PROTOTYPE.md`](PROTOTYPE.md) to run it.
 
 ## Repo map
 
@@ -36,6 +36,8 @@ Founding documents only — the output of the initial design work. **Zero code y
 | [`docs/04-data-moat.md`](docs/04-data-moat.md) | Do labs need it / does it accumulate / is it sparse; why consensual data is structurally better |
 | [`docs/05-brand-principles.md`](docs/05-brand-principles.md) | The eight non-negotiables; the press answer |
 | [`docs/06-roadmap.md`](docs/06-roadmap.md) | Phasing, the first 60 days, the moat layers |
+| [`PROTOTYPE.md`](PROTOTYPE.md) | The working prototype: quick start, the pipeline, the menu-bar app, Studio |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How the code is laid out — capture taps, reconstructor, fuser, observer, memory, transfer |
 
 ## The test that governs every decision
 

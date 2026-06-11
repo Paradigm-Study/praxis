@@ -1,0 +1,40 @@
+{
+  "name": "praxis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Praxis Context Firehose + Action Reconstructor — observes a user's whole computer context, reconstructs exactly what they did from a high-fidelity event ledger, fuses episodes, and builds an evidence-backed expert memory graph.",
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "demo": "node --disable-warning=ExperimentalWarning src/cli/praxis.ts demo",
+    "capture": "node --disable-warning=ExperimentalWarning src/cli/praxis.ts capture",
+    "reconstruct": "node --disable-warning=ExperimentalWarning src/cli/praxis.ts reconstruct",
+    "fuse": "node --disable-warning=ExperimentalWarning src/cli/praxis.ts fuse",
+    "graph": "node --disable-warning=ExperimentalWarning src/cli/praxis.ts graph",
+    "studio": "node --disable-warning=ExperimentalWarning src/cli/praxis.ts studio",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
+    "capture:check": "node --disable-warning=ExperimentalWarning scripts/real-capture-check.ts",
+    "observer:check": "node --disable-warning=ExperimentalWarning scripts/observer-live-check.ts",
+    "typecheck": "tsc --noEmit",
+    "native:build": "swift build --package-path native/PraxisCapture",
+    "native:run": "swift run --package-path native/PraxisCapture praxis-capture",
+    "bar:build": "swift build --package-path native/PraxisBar",
+    "bar": "swift run --package-path native/PraxisBar praxis-bar",
+    "app:package": "bash scripts/package-app.sh",
+    "app:install": "bash scripts/install-launchagent.sh",
+    "app:uninstall": "bash scripts/install-launchagent.sh --uninstall"
+  },
+  "keywords": [
+    "context-capture",
+    "action-reconstruction",
+    "event-ledger",
+    "agent",
+    "observability"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
