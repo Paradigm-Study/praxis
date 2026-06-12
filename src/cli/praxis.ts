@@ -5,7 +5,7 @@ import { reconstruct } from "../reconstructor/reconstructor.ts";
 import { fuse } from "../fuser/fuser.ts";
 import { buildGraph } from "../memory/graph.ts";
 import { buildBundle } from "../observer/bundle.ts";
-import { defaultObserver, MockObserver } from "../observer/observer.ts";
+import { AnthropicObserver, defaultObserver, MockObserver } from "../observer/observer.ts";
 import { CaptureManager } from "../capture/manager.ts";
 import { makeIngest } from "../capture/ingest.ts";
 import { SyntheticSource } from "../capture/sources/synthetic.ts";
@@ -65,6 +65,8 @@ async function main(): Promise<void> {
       return cmdExportSkill();
     case "observe":
       return cmdObserve();
+    case "ab":
+      return cmdAb();
     case "status":
       return cmdStatus();
     case "reset":
@@ -91,6 +93,7 @@ function usage(): void {
       `  ${green("fuse")}         Fuse actions into episodes\n` +
       `  ${green("graph")}        Build the expert memory graph\n` +
       `  ${green("observe")}      Observe the latest context window\n` +
+      `  ${green("ab")}           A/B two observers on the same real windows  [--rounds=3 --judge --step=15]\n` +
       `  ${green("status")}       Show ledger counts\n` +
       `  ${green("reset")}        Clear derived data (or everything with --all) + vacuum\n` +
       `  ${green("profile")}      Show your consolidated profile  [--all]\n` +
@@ -286,6 +289,108 @@ async function cmdCapture(): Promise<void> {
   }
   // keep the process alive
   await new Promise(() => {});
+}
+
+async function cmdAb(): Promise<void> {
+  const { runAb, makeClaudeJudge, estimateCost } = await import("../observer/ab.ts");
+  const { GeminiObserver } = await import("../observer/gemini.ts");
+  const anthropicKey =
+    process.env.PRAXIS_ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  if (!anthropicKey || !geminiKey) {
+    process.stderr.write(
+      `${red("✗")} ab needs both ANTHROPIC_API_KEY and GEMINI_API_KEY in praxis/.env\n`,
+    );
+    process.exit(1);
+  }
+
+  const store = openStore(flagVal("--data") ? { dir: flagVal("--data")! } : {});
+  const claudeModel = process.env.PRAXIS_OBSERVER_MODEL ?? "claude-haiku-4-5";
+  const geminiModel = process.env.PRAXIS_GEMINI_MODEL ?? "gemini-3.5-flash";
+  const a = new AnthropicObserver({ apiKey: anthropicKey, model: claudeModel });
+  const b = new GeminiObserver({ apiKey: geminiKey, model: geminiModel });
+
+  // Published per-1M-token prices, verified 2026-06-11 (ai.google.dev/pricing,
+  // platform.claude.com). Image tokens ≈ one 864×558 frame: Anthropic w*h/750;
+  // Gemini 3.x default media_resolution=high is 1120/image. Estimates for the
+  // table, not billing truth.
+  const GEMINI_PRICES: Record<string, { inPerM: number; outPerM: number; imageTokens: number }> = {
+    "gemini-3.5-flash": { inPerM: 1.5, outPerM: 9.0, imageTokens: 1120 },
+    "gemini-3-flash-preview": { inPerM: 0.5, outPerM: 3.0, imageTokens: 1120 },
+    "gemini-3.1-flash-lite": { inPerM: 0.25, outPerM: 1.5, imageTokens: 1120 },
+    "gemini-2.5-flash": { inPerM: 0.3, outPerM: 2.5, imageTokens: 258 },
+  };
+  const CLAUDE_PRICES: Record<string, { inPerM: number; outPerM: number; imageTokens: number }> = {
+    "claude-haiku-4-5": { inPerM: 1.0, outPerM: 5.0, imageTokens: 645 },
+    "claude-sonnet-4-6": { inPerM: 3.0, outPerM: 15.0, imageTokens: 645 },
+  };
+  const PRICE_A = CLAUDE_PRICES[claudeModel] ?? CLAUDE_PRICES["claude-haiku-4-5"]!;
+  const PRICE_B = GEMINI_PRICES[geminiModel] ?? GEMINI_PRICES["gemini-3.5-flash"]!;
+
+  const rounds = Number(flagVal("--rounds") ?? 3);
+  const judge = has("--judge") ? makeClaudeJudge(anthropicKey) : undefined;
+  process.stdout.write(header(`Observer A/B — ${claudeModel} vs ${geminiModel}`));
+  process.stdout.write(
+    `\n  ${dim(`${rounds} real windows from your ledger · nothing persisted` +
+      (judge ? " · blind judge: claude-haiku-4-5 (randomized positions)" : ""))}\n`,
+  );
+
+  const trunc = (s: string | undefined, n: number) => {
+    const c = String(s ?? "—").replace(/\s+/g, " ").trim();
+    return c.length > n ? c.slice(0, n) + "…" : c;
+  };
+
+  const results = await runAb(store, a, b, {
+    rounds,
+    stepMinutes: Number(flagVal("--step") ?? 15),
+    judge,
+    onRound: (r, i) => {
+      process.stdout.write(`\n${bold(cyan(`ROUND ${i + 1}`))} ${dim(`window ending ${r.endTs} · ${r.actionCount} actions`)}\n`);
+      for (const [tag, obs, ms] of [
+        ["A " + claudeModel, r.a, r.aMs],
+        ["B " + geminiModel, r.b, r.bMs],
+      ] as const) {
+        process.stdout.write(`  ${bold(tag)} ${dim(`(${ms}ms)`)}\n`);
+        process.stdout.write(`    intent:      ${trunc(obs.intent, 90)}\n`);
+        if (obs.inferredPreference)
+          process.stdout.write(`    preference:  ${trunc(obs.inferredPreference, 90)}\n`);
+        process.stdout.write(`    uncertainty: ${obs.uncertainty.length} item(s)\n`);
+        if (obs.suggestedQuestion)
+          process.stdout.write(`    question:    ${trunc(obs.suggestedQuestion, 90)}\n`);
+      }
+      if (r.verdict) {
+        const who = r.verdict.winner === "a" ? claudeModel : r.verdict.winner === "b" ? geminiModel : "tie";
+        process.stdout.write(`  ${green("⚖")} ${bold(who)} — ${trunc(r.verdict.reason, 110)}\n`);
+      }
+    },
+  });
+
+  if (!results.length) {
+    process.stdout.write(`\n${red("✗")} no recent windows with enough actions to compare\n`);
+    store.close();
+    return;
+  }
+
+  const avg = (xs: number[]) => Math.round(xs.reduce((s, x) => s + x, 0) / xs.length);
+  const textChars = 14_000; // typical rendered bundle
+  const costA = estimateCost({ textChars, images: 4 }, PRICE_A);
+  const costB = estimateCost({ textChars, images: 4 }, PRICE_B);
+  const tally = { a: 0, b: 0, tie: 0 };
+  for (const r of results) if (r.verdict) tally[r.verdict.winner]++;
+
+  process.stdout.write(header("Summary"));
+  process.stdout.write(
+    `\n  ${bold("A " + claudeModel)}   avg ${avg(results.map((r) => r.aMs))}ms · ~$${costA.toFixed(4)}/call\n` +
+      `  ${bold("B " + geminiModel)}   avg ${avg(results.map((r) => r.bMs))}ms · ~$${costB.toFixed(4)}/call ${dim(costB < costA ? `(${(costA / costB).toFixed(1)}x cheaper)` : `(${(costB / costA).toFixed(1)}x MORE expensive)`)}\n`,
+  );
+  if (judge)
+    process.stdout.write(
+      `  ${bold("judge:")} ${claudeModel} ${tally.a} · ${geminiModel} ${tally.b} · tie ${tally.tie}\n`,
+    );
+  process.stdout.write(
+    dim(`\n  Switch the live loop: PRAXIS_OBSERVER=gemini in the bar's env (or ask me).\n`),
+  );
+  store.close();
 }
 
 function cmdProfile(): void {

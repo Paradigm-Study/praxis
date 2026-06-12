@@ -2,6 +2,7 @@ import type { ContextBundle, Observation } from "../core/types.ts";
 import { newId as defaultNewId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
 import { renderBundle } from "./bundle.ts";
+import { GeminiObserver } from "./gemini.ts";
 import { logger } from "../core/log.ts";
 
 const log = logger("observer");
@@ -268,13 +269,23 @@ function arr(v: unknown): string[] {
 
 /**
  * Pick the model-backed observer when an API key is present, else the mock.
- * Overrides: PRAXIS_OBSERVER=mock|anthropic forces a choice;
- * PRAXIS_OBSERVER_MODEL picks the model (default claude-opus-4-8).
+ * Overrides: PRAXIS_OBSERVER=mock|anthropic|gemini forces a choice;
+ * PRAXIS_OBSERVER_MODEL picks the model. Gemini is OPT-IN only — it sends the
+ * bounded screen context to Google instead of Anthropic.
  */
 export function defaultObserver(): Observer {
   const apiKey =
     process.env.PRAXIS_ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY;
   const pref = process.env.PRAXIS_OBSERVER;
+  if (pref === "gemini") {
+    const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+    if (geminiKey) {
+      const model = process.env.PRAXIS_GEMINI_MODEL;
+      log.info(`using Gemini observer${model ? ` (${model})` : ""}`);
+      return new GeminiObserver({ apiKey: geminiKey, ...(model ? { model } : {}) });
+    }
+    log.warn("PRAXIS_OBSERVER=gemini but no GEMINI_API_KEY found — falling through");
+  }
   if (pref !== "mock" && apiKey) {
     const model = process.env.PRAXIS_OBSERVER_MODEL;
     log.info(`using Anthropic observer${model ? ` (${model})` : ""}`);
