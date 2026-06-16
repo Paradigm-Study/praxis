@@ -50,6 +50,13 @@ function contentWords(text: string): Set<string> {
   return new Set(words);
 }
 
+/** Number of content words shared between two word sets. */
+function sharedWordCount(a: Set<string>, b: Set<string>): number {
+  let n = 0;
+  for (const w of a) if (b.has(w)) n++;
+  return n;
+}
+
 /**
  * Topical overlap of two texts in [0,1], as the overlap coefficient
  * (shared content words / size of the smaller set). This is forgiving by design:
@@ -60,9 +67,7 @@ export function topicalOverlap(a: string, b: string): number {
   const wa = contentWords(a);
   const wb = contentWords(b);
   if (wa.size === 0 || wb.size === 0) return 0;
-  let inter = 0;
-  for (const w of wa) if (wb.has(w)) inter++;
-  return inter / Math.min(wa.size, wb.size);
+  return sharedWordCount(wa, wb) / Math.min(wa.size, wb.size);
 }
 
 /**
@@ -74,11 +79,8 @@ export function topicalOverlap(a: string, b: string): number {
  */
 export function termCoverage(query: string, text: string): number {
   const q = contentWords(query);
-  const t = contentWords(text);
   if (q.size === 0) return 0;
-  let inter = 0;
-  for (const w of q) if (t.has(w)) inter++;
-  return inter / q.size;
+  return sharedWordCount(q, contentWords(text)) / q.size;
 }
 
 /** The text that describes the current situation, for relevance scoring. */

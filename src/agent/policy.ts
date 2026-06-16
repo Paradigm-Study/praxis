@@ -146,13 +146,8 @@ export function decide(input: PolicyInput): Decision {
     };
   }
 
-  if (established) {
-    return {
-      ...base,
-      kind: "keep_observing",
-      reason: `Already established in long-term memory — ${established.text} No need to ask.`,
-    };
-  }
-
-  return { ...base, kind: "keep_observing", reason: "Nothing actionable yet." };
+  const reason = established
+    ? `Already established in long-term memory — ${established.text} No need to ask.`
+    : "Nothing actionable yet.";
+  return { ...base, kind: "keep_observing", reason };
 }
