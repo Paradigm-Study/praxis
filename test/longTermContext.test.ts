@@ -111,6 +111,53 @@ test("policy still asks when long-term memory has nothing relevant", () => {
   assert.equal(decision.kind, "ask_expert", "with nothing established, the agent still asks");
 });
 
+test("policy does NOT treat a non-answer-bearing claim as established", () => {
+  // An unresolved_question is the OPPOSITE of established knowledge — a lexical
+  // match against it must never suppress a real question.
+  const obs = observation({
+    uncertainty: ["unsure why the user picked this database"],
+    suggestedQuestion: "I think you switched to Postgres for the database. Correct?",
+  });
+  const openQuestion = claim({
+    kind: "unresolved_question",
+    text: "Was the switch to a Postgres database identified correctly?",
+    confidence: 0.9,
+  });
+
+  const decision = decide({
+    observation: obs,
+    actions: [],
+    claims: [],
+    longTermContext: [openQuestion],
+  });
+
+  assert.equal(decision.kind, "ask_expert", "an unresolved question cannot establish an answer");
+});
+
+test("policy still asks when a claim only shares a generic term with the question", () => {
+  // "Prefer MySQL database." shares only the generic word "database" with a
+  // question about switching to Postgres — it does not answer that question, so
+  // a symmetric overlap that fires on the short claim would be wrong.
+  const obs = observation({
+    uncertainty: ["unsure why the user picked this database"],
+    suggestedQuestion: "I think you switched to Postgres for the database. Correct?",
+  });
+  const tangential = claim({ kind: "decision_rule", text: "Prefer MySQL database.", confidence: 0.9 });
+
+  const decision = decide({
+    observation: obs,
+    actions: [],
+    claims: [],
+    longTermContext: [tangential],
+  });
+
+  assert.equal(
+    decision.kind,
+    "ask_expert",
+    "a claim that covers only a minority of the question's terms is not 'established'",
+  );
+});
+
 test("end to end: retrieved long-term context flows into the loop's decision", async () => {
   const { store } = await fullPipeline();
   // fullPipeline persists a high-confidence decision_rule:

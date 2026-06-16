@@ -1,5 +1,5 @@
 import type { ActionEvent, Claim, Observation } from "../core/types.ts";
-import { topicalOverlap } from "./retrieve.ts";
+import { termCoverage } from "./retrieve.ts";
 
 export type DecisionKind =
   | "keep_observing"
@@ -48,8 +48,25 @@ export interface PolicyInput {
 
 /** Minimum confidence for a long-term claim to count as "established". */
 const ESTABLISHED_CONFIDENCE = 0.8;
-/** Minimum topical overlap between a question and a claim to consider it answered. */
-const ESTABLISHED_OVERLAP = 0.4;
+/**
+ * Min fraction of the QUESTION's terms a claim must cover to count as answering
+ * it. Directional (not a symmetric overlap), so a short claim that merely shares
+ * one generic word with the question does not suppress it.
+ */
+const ESTABLISHED_COVERAGE = 0.5;
+/**
+ * Only claim kinds that represent settled, answer-bearing knowledge can establish
+ * an answer. Notably excludes `unresolved_question` (the opposite of settled) and
+ * descriptive kinds like `artifact_type` / `teaching_move`.
+ */
+const ANSWER_BEARING_KINDS = new Set<string>([
+  "decision_rule",
+  "decision_heuristic",
+  "correction",
+  "taste_rule",
+  "know_how",
+  "workflow_pattern",
+]);
 
 /**
  * The agent's decision policy. Deliberately general: the SAME policy runs for an
@@ -74,7 +91,8 @@ export function decide(input: PolicyInput): Decision {
       ? longTerm.find(
           (c) =>
             c.confidence >= ESTABLISHED_CONFIDENCE &&
-            topicalOverlap(obs.suggestedQuestion!, c.text) >= ESTABLISHED_OVERLAP,
+            ANSWER_BEARING_KINDS.has(c.kind) &&
+            termCoverage(obs.suggestedQuestion!, c.text) >= ESTABLISHED_COVERAGE,
         )
       : undefined;
 

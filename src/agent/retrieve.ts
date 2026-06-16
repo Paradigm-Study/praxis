@@ -65,6 +65,22 @@ export function topicalOverlap(a: string, b: string): number {
   return inter / Math.min(wa.size, wb.size);
 }
 
+/**
+ * Directional coverage in [0,1]: the fraction of `query`'s content words that
+ * also appear in `text`. Unlike the symmetric {@link topicalOverlap}, this does
+ * NOT fire just because a short `text` happens to be fully contained in a long
+ * `query` — it asks "how much of the QUESTION does this claim actually cover",
+ * which is the right test for "has this claim already answered the question".
+ */
+export function termCoverage(query: string, text: string): number {
+  const q = contentWords(query);
+  const t = contentWords(text);
+  if (q.size === 0) return 0;
+  let inter = 0;
+  for (const w of q) if (t.has(w)) inter++;
+  return inter / q.size;
+}
+
 /** The text that describes the current situation, for relevance scoring. */
 function situationText(obs: Observation): string {
   return [
