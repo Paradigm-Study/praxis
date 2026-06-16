@@ -1,4 +1,5 @@
 import type { ActionEvent, Claim, Observation } from "../core/types.ts";
+import { topicalOverlap } from "./retrieve.ts";
 
 export type DecisionKind =
   | "keep_observing"
@@ -18,6 +19,12 @@ export interface Decision {
   claim?: Claim;
   /** For intervene: advisories from the learned playbook. */
   advisories?: string[];
+  /**
+   * Relevant long-term knowledge that informed this decision (claim texts). Lets
+   * the agent ground its reasoning in what's already known — and explains why an
+   * already-established question was NOT re-asked.
+   */
+  grounding?: string[];
   observationId: string;
 }
 
@@ -30,7 +37,19 @@ export interface PolicyInput {
   /** Operating mode — the policy is role-agnostic; only behavior differs. */
   learnerMode?: boolean;
   advisories?: string[];
+  /**
+   * Long-term knowledge relevant to the CURRENT situation, retrieved before the
+   * policy runs (see {@link retrieveLongTermContext}). Bounded to what bears on
+   * the present observation — not the whole memory graph. The policy uses it to
+   * avoid re-asking established things and to ground its reasoning.
+   */
+  longTermContext?: Claim[];
 }
+
+/** Minimum confidence for a long-term claim to count as "established". */
+const ESTABLISHED_CONFIDENCE = 0.8;
+/** Minimum topical overlap between a question and a claim to consider it answered. */
+const ESTABLISHED_OVERLAP = 0.4;
 
 /**
  * The agent's decision policy. Deliberately general: the SAME policy runs for an
@@ -40,7 +59,24 @@ export interface PolicyInput {
  */
 export function decide(input: PolicyInput): Decision {
   const { observation: obs } = input;
-  const base = { observationId: obs.id, evidence: obs.evidence };
+  const longTerm = input.longTermContext ?? [];
+  const base = {
+    observationId: obs.id,
+    evidence: obs.evidence,
+    ...(longTerm.length ? { grounding: longTerm.map((c) => c.text) } : {}),
+  };
+
+  // Before asking or flagging anything, consult long-term memory: is the thing
+  // we're unsure about already established by durable, high-confidence knowledge?
+  // If so, we shouldn't re-ask it — we already know the answer.
+  const established =
+    obs.suggestedQuestion && obs.uncertainty.length > 0
+      ? longTerm.find(
+          (c) =>
+            c.confidence >= ESTABLISHED_CONFIDENCE &&
+            topicalOverlap(obs.suggestedQuestion!, c.text) >= ESTABLISHED_OVERLAP,
+        )
+      : undefined;
 
   // 1. In learner mode, a violation of the learned playbook => intervene.
   if (input.learnerMode && input.advisories && input.advisories.length > 0) {
@@ -52,8 +88,9 @@ export function decide(input: PolicyInput): Decision {
     };
   }
 
-  // 2. A pressing uncertainty about a low-confidence action => ask the expert.
-  if (obs.uncertainty.length > 0 && obs.suggestedQuestion) {
+  // 2. A pressing uncertainty about a low-confidence action => ask the expert —
+  //    UNLESS long-term memory has already established the answer.
+  if (obs.uncertainty.length > 0 && obs.suggestedQuestion && !established) {
     return {
       ...base,
       kind: "ask_expert",
@@ -81,12 +118,21 @@ export function decide(input: PolicyInput): Decision {
     };
   }
 
-  // 4. Lingering uncertainty with no question => just flag it.
-  if (obs.uncertainty.length > 0) {
+  // 4. Lingering uncertainty with no question => just flag it (unless long-term
+  //    memory already resolved it).
+  if (obs.uncertainty.length > 0 && !established) {
     return {
       ...base,
       kind: "mark_uncertainty",
       reason: obs.uncertainty[0]!,
+    };
+  }
+
+  if (established) {
+    return {
+      ...base,
+      kind: "keep_observing",
+      reason: `Already established in long-term memory — ${established.text} No need to ask.`,
     };
   }
 
