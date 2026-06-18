@@ -10,6 +10,7 @@ import { buildBundle } from "../observer/bundle.ts";
 import { defaultObserver, type Observer } from "../observer/observer.ts";
 import { buildPlaybook, critique } from "../transfer/transfer.ts";
 import { decide, type Decision } from "./policy.ts";
+import { retrieveLongTermContext } from "./retrieve.ts";
 import type { AskHandler } from "./notify.ts";
 import { logger } from "../core/log.ts";
 
@@ -130,6 +131,10 @@ export class AgentLoop {
       ? critique(buildPlaybook(this.#store), this.#store.actions.byIds(latest.actions))
       : [];
 
+    // Retrieve durable knowledge relevant to THIS observation before deciding,
+    // so the policy can ground in what's already known and avoid re-asking it.
+    const longTermContext = retrieveLongTermContext(this.#store, observation);
+
     const decision = decide({
       observation,
       actions: this.#store.actions.byIds(latest.actions),
@@ -137,6 +142,7 @@ export class AgentLoop {
       surfacedClaims: this.#surfaced,
       learnerMode: this.#learnerMode,
       advisories,
+      longTermContext,
     });
     if (decision.kind === "summarize_pattern" && decision.claim) {
       this.#surfaced.add(decision.claim.id);
