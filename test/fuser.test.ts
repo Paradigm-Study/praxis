@@ -42,6 +42,34 @@ test("a commit closes an episode", () => {
   );
 });
 
+test("goal provenance lands in payload.goalSource (commit vs prompt)", () => {
+  const fromPrompt = fuseActions(
+    [
+      action({
+        action: "submitted_message",
+        startTs: "2026-06-08T12:00:00.000Z",
+        text: "please migrate the billing tables\nand more detail here",
+      }),
+    ],
+    { newId: makeSeededIdGen() },
+  )[0]!;
+  assert.equal(fromPrompt.goal, "please migrate the billing tables");
+  assert.equal(fromPrompt.payload?.goalSource, "prompt");
+
+  const fromCommit = fuseActions(
+    [
+      action({
+        action: "committed",
+        startTs: "2026-06-08T12:00:00.000Z",
+        text: "fix: retry on 429",
+      }),
+    ],
+    { newId: makeSeededIdGen() },
+  )[0]!;
+  assert.equal(fromCommit.goal, "fix: retry on 429");
+  assert.equal(fromCommit.payload?.goalSource, "commit");
+});
+
 test("mid-task app switch with no gap does NOT split", () => {
   assert.equal(
     boundaryBetween(
@@ -50,4 +78,18 @@ test("mid-task app switch with no gap does NOT split", () => {
     ),
     undefined,
   );
+});
+
+test("agent transcript filePath values become episode artifacts", () => {
+  const episode = fuseActions(
+    [
+      action({
+        action: "edited_file",
+        startTs: "2026-06-08T12:00:00.000Z",
+        payload: { filePath: "/repo/src/agent-edit.ts", tool: "Edit" },
+      }),
+    ],
+    { newId: makeSeededIdGen() },
+  )[0]!;
+  assert.deepEqual(episode.artifacts, ["/repo/src/agent-edit.ts"]);
 });

@@ -82,20 +82,28 @@ function buildEpisode(
     s: start,
     first: actions[0]!.id,
   }).slice(0, 16)}`;
+  const inferred = inferGoal(actions);
   return {
     id: stableId,
     type: "context_episode",
     startTs: start,
     endTs: end,
     summary: summarize(actions),
-    goal: inferGoal(actions),
+    goal: inferred?.goal,
     actions: actions.map((a) => a.id),
     artifacts: artifactsOf(actions),
     decisionPoints: decisionPointsOf(actions),
     rejectedPaths: rejectedPathsOf(actions),
     uncertainty: uncertaintyOf(actions),
     boundaryReason,
-    payload: { actionCount: actions.length, apps: [...new Set(actions.map((a) => a.app))] },
+    payload: {
+      actionCount: actions.length,
+      apps: [...new Set(actions.map((a) => a.app))],
+      // Provenance of `goal`, so privacy boundaries downstream can tell a
+      // commit message (shareable) from a typed prompt prefix (mesh-unsafe:
+      // prompt bodies must never serialize into anything mesh-bound).
+      ...(inferred ? { goalSource: inferred.source } : {}),
+    },
   };
 }
 
@@ -136,11 +144,18 @@ function summarize(actions: ActionEvent[]): string {
   return `In ${apps.join(", ")}: ${parts.join("; ")}.`;
 }
 
-function inferGoal(actions: ActionEvent[]): string | undefined {
+/** Episode goal plus where it came from (see payload.goalSource). */
+export type GoalSource = "commit" | "prompt";
+
+function inferGoal(
+  actions: ActionEvent[],
+): { goal: string; source: GoalSource } | undefined {
   const commit = actions.find((a) => a.action === "committed");
-  if (commit?.text) return commit.text;
+  if (commit?.text) return { goal: commit.text, source: "commit" };
   const firstSubmit = actions.find((a) => a.action === "submitted_message");
-  if (firstSubmit?.text) return firstSubmit.text.split("\n")[0]!.slice(0, 100);
+  if (firstSubmit?.text) {
+    return { goal: firstSubmit.text.split("\n")[0]!.slice(0, 100), source: "prompt" };
+  }
   return undefined;
 }
 
@@ -149,6 +164,11 @@ function fileSet(actions: ActionEvent[]): Set<string> {
   for (const a of actions) {
     const p = a.payload?.path;
     if (typeof p === "string") files.add(p);
+		// Agent transcript reconstruction uses filePath to avoid conflating the
+		// tool's argument name with native filesystem event payloads. It is still
+		// an artifact and must reach WorkFrames/gates.
+		const agentPath = a.payload?.filePath;
+		if (typeof agentPath === "string") files.add(agentPath);
     const fs = a.payload?.files;
     if (Array.isArray(fs)) for (const f of fs) if (typeof f === "string") files.add(f);
   }

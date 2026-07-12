@@ -1,4 +1,5 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
+// Every target pins Swift 5 language mode so compile semantics remain stable.
 import PackageDescription
 
 let package = Package(
@@ -12,11 +13,25 @@ let package = Package(
         .library(name: "PraxisCaptureKit", targets: ["PraxisCaptureKit"]),
     ],
     targets: [
-        .target(name: "PraxisCaptureKit", path: "Sources/PraxisCaptureKit"),
+        .target(
+            name: "PraxisCaptureKit",
+            path: "Sources/PraxisCaptureKit",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .executableTarget(
             name: "PraxisCaptureCLI",
             dependencies: ["PraxisCaptureKit"],
-            path: "Sources/PraxisCapture"
+            path: "Sources/PraxisCapture",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // Pure headless self-check (this standalone Swift toolchain ships
+        // neither XCTest nor swift-testing). Runtime capture still requires
+        // Screen Recording TCC and is intentionally not exercised here.
+        .executableTarget(
+            name: "ClipRingSelfTest",
+            dependencies: ["PraxisCaptureKit"],
+            path: "Tests/PraxisCaptureKitTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
 )

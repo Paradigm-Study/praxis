@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Praxis Dev Telemetry",
+  "version": "0.0.1",
+  "description": "Localhost-only development error capture for the Praxis Studio telemetry ledger.",
+  "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

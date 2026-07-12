@@ -187,6 +187,9 @@ test("end to end: retrieved long-term context flows into the loop's decision", a
     observer,
     minEpisodeActions: 1,
     observeIntervalMs: 0,
+    // Wide window so the (dated) fixtures are observable (the loop refuses to
+    // observe episodes that ended outside its window - restart-staleness guard).
+    windowMs: 10 * 365 * 86_400_000,
     onDecision: (d) => {
       captured = { kind: d.kind, grounding: d.grounding };
     },

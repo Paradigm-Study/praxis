@@ -70,6 +70,9 @@ public final class CaptureRunner {
         let f = FocusTimeline(); f.start(); focus = f
         let i = InputTap(); i.start(); input = i
         let s = ScreenCapture(); screen = s
+        // Opt-in rolling clip ring (default OFF): only holds JPEG frames in a
+        // bounded buffer; nothing is persisted until persistClip is called.
+        if ProcessInfo.processInfo.environment["PRAXIS_CLIP_BUFFER"] == "1" { s.clipBuffer = ClipBuffer() }
         if opts.audioSystem || opts.audioMic {
             setAudio(system: opts.audioSystem, mic: opts.audioMic)
         }
@@ -108,6 +111,13 @@ public final class CaptureRunner {
         } else {
             audio?.stop(); audio = nil
         }
+    }
+
+    /// Flush the rolling clip ring (if enabled) to an mp4 blob + NDJSON event.
+    /// No-op unless PRAXIS_CLIP_BUFFER=1 armed the buffer. Fire-and-forget:
+    /// future trigger surfaces (hotkey, error rules, boardroom raise) call this.
+    public func persistClip(reason: String) {
+        Task { [weak self] in await self?.screen?.clipBuffer?.persistClip(reason: reason) }
     }
 
     /// One-shot snapshot (smoke testing without a long-running loop).

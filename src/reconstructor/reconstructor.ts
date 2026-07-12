@@ -11,6 +11,8 @@ import { fileRules } from "./rules/files.ts";
 import { terminalRules } from "./rules/terminal.ts";
 import { inputRules } from "./rules/input.ts";
 import { audioRules } from "./rules/audio.ts";
+import { agentRules } from "./rules/agent.ts";
+import { errorRules } from "./rules/errors.ts";
 
 /** The full deterministic rule set, in display order. */
 export const ALL_RULES: Rule[] = [
@@ -20,6 +22,8 @@ export const ALL_RULES: Rule[] = [
   ...terminalRules,
   ...inputRules,
   ...audioRules,
+  ...agentRules,
+  ...errorRules,
 ];
 
 export interface ReconstructOptions {

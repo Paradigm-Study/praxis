@@ -2,6 +2,7 @@ import type { Store } from "../storage/index.ts";
 import type { RawEvent } from "../core/types.ts";
 import type { CaptureSource } from "./source.ts";
 import { makeIngest, type Ingest } from "./ingest.ts";
+import { AgentSessionsSource } from "./sources/agentSessions.ts";
 import { logger } from "../core/log.ts";
 
 const log = logger("capture");
@@ -18,7 +19,11 @@ export class CaptureManager {
 
   constructor(store: Store, sources: CaptureSource[]) {
     this.#ingest = makeIngest(store);
-    this.#sources = sources;
+    // Agent-transcript ingestion (default OFF): opt in with PRAXIS_AGENT_SESSIONS=1.
+    this.#sources =
+      process.env.PRAXIS_AGENT_SESSIONS === "1"
+        ? [...sources, new AgentSessionsSource()]
+        : sources;
     this.#ingest.subscribe((e: RawEvent) => {
       if (e.source === "focus_timeline" && e.type === "app_focused") {
         this.#front = { app: e.app, window: e.window };

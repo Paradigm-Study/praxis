@@ -1,18 +1,23 @@
 import type { ActionEvent, Claim, Observation } from "../core/types.ts";
 import { termCoverage } from "./retrieve.ts";
+import { toMs } from "../core/time.ts";
+import { redactText } from "../mesh/redact.ts";
 
 export type DecisionKind =
   | "keep_observing"
   | "ask_expert"
   | "intervene"
   | "summarize_pattern"
-  | "mark_uncertainty";
+  | "mark_uncertainty"
+  | "dispatch";
 
 export interface Decision {
   kind: DecisionKind;
   reason: string;
   /** For ask_expert: the question to surface (doc's centerpiece). */
   question?: string;
+  /** For dispatch: the redacted task text to hand to a spawned agent. */
+  task?: string;
   /** Evidence ids backing the decision. */
   evidence?: string[];
   /** For summarize_pattern: the claim being surfaced. */
@@ -69,6 +74,37 @@ const ANSWER_BEARING_KINDS = new Set<string>([
 ]);
 
 /**
+ * Confidence floor for an `encountered_error` action to warrant dispatching an
+ * investigation agent — matches MIN_ERROR_CONFIDENCE in agent/dispatch.ts, the
+ * module that executes the decision (and re-checks the floor itself).
+ */
+const DISPATCH_ERROR_CONFIDENCE = 0.6;
+/**
+ * Only a FRESH error justifies a dispatch decision; measured against the newest
+ * action in the same window (not wall clock) so the policy stays deterministic.
+ * Once the error ages out, the branch stops shadowing lower-priority decisions.
+ */
+const DISPATCH_ERROR_FRESH_MS = 10 * 60_000;
+
+/**
+ * The newest high-confidence, still-fresh `encountered_error` action in the
+ * observed window, if any (see src/reconstructor/rules/errors.ts for how these
+ * are reconstructed).
+ */
+function freshError(actions: ActionEvent[]): ActionEvent | undefined {
+  let newestTs = -Infinity;
+  for (const a of actions) newestTs = Math.max(newestTs, toMs(a.startTs));
+  return actions
+    .filter(
+      (a) =>
+        a.action === "encountered_error" &&
+        a.confidence >= DISPATCH_ERROR_CONFIDENCE &&
+        newestTs - toMs(a.startTs) <= DISPATCH_ERROR_FRESH_MS,
+    )
+    .sort((a, b) => toMs(b.startTs) - toMs(a.startTs))[0];
+}
+
+/**
  * The agent's decision policy. Deliberately general: the SAME policy runs for an
  * OpenClaw maintainer, an influencer, a designer, or a founder — only the
  * learned graph differs. It chooses among observing, asking, intervening,
@@ -117,7 +153,29 @@ export function decide(input: PolicyInput): Decision {
     };
   }
 
-  // 3. A confident, reused pattern not yet surfaced => summarize it.
+  // 3. A fresh, high-confidence reconstructed error => dispatch an
+  //    investigation agent. Deliberately BELOW ask_expert: when the human is
+  //    already being engaged with a pressing question, don't also spin up an
+  //    agent (the same philosophy as dispatch's stand-down guard). Advisory
+  //    and cheap to repeat — agent/dispatch.ts enforces dedup, a daily budget,
+  //    and stand-down, and dry-runs unless PRAXIS_DISPATCH_SPAWN=1.
+  const errorAction = freshError(input.actions);
+  if (errorAction) {
+    const errorText =
+      typeof errorAction.payload?.errorText === "string"
+        ? errorAction.payload.errorText
+        : errorAction.text;
+    return {
+      ...base,
+      kind: "dispatch",
+      reason: "A high-confidence error was reconstructed; dispatch an investigation.",
+      task: redactText(errorText ?? "", { maxChars: 500 }),
+      // The trigger action id FIRST so dispatch resolves it precisely.
+      evidence: [errorAction.id, ...obs.evidence],
+    };
+  }
+
+  // 4. A confident, reused pattern not yet surfaced => summarize it.
   const pattern = input.claims
     .filter(
       (c) =>
@@ -136,7 +194,7 @@ export function decide(input: PolicyInput): Decision {
     };
   }
 
-  // 4. Lingering uncertainty with no question => just flag it (unless long-term
+  // 5. Lingering uncertainty with no question => just flag it (unless long-term
   //    memory already resolved it).
   if (obs.uncertainty.length > 0 && !established) {
     return {

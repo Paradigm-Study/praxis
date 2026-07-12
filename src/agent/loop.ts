@@ -11,6 +11,8 @@ import { defaultObserver, type Observer } from "../observer/observer.ts";
 import { buildPlaybook, critique } from "../transfer/transfer.ts";
 import { decide, type Decision } from "./policy.ts";
 import { retrieveLongTermContext } from "./retrieve.ts";
+import { maybeDispatch } from "./dispatch.ts";
+import { MeshPublisher } from "../mesh/publisher.ts";
 import type { AskHandler } from "./notify.ts";
 import { logger } from "../core/log.ts";
 
@@ -33,6 +35,12 @@ export interface AgentLoopOptions {
   /** Proactively surface the agent's questions (with options) for the user. */
   onAsk?: AskHandler;
   onDecision?: (d: Decision, ctx: TickResult) => void;
+  /**
+   * Mesh publisher for closed episodes (tests inject one). When omitted, one is
+   * built from PRAXIS_MESH_URL/PRAXIS_MESH_TOKEN/PRAXIS_PERSON — or publishing
+   * stays off entirely if those aren't set.
+   */
+  meshPublisher?: MeshPublisher;
 }
 
 export interface TickResult {
@@ -67,6 +75,11 @@ export class AgentLoop {
   #minEpisodeActions: number;
   #growthThreshold: number;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  #meshPublisher: MeshPublisher | undefined;
+  /** Episode ids whose final ("done") frame has been published. */
+  #publishedEpisodes = new Set<string>();
+  /** Episode ids announced as active while still open. */
+  #announcedEpisodes = new Set<string>();
 
   constructor(store: Store, opts: AgentLoopOptions = {}) {
     this.#store = store;
@@ -80,11 +93,45 @@ export class AgentLoop {
     this.#observeIntervalMs = opts.observeIntervalMs ?? 120_000;
     this.#minEpisodeActions = opts.minEpisodeActions ?? 4;
     this.#growthThreshold = opts.growthThreshold ?? 6;
+    // Mesh publishing (default OFF): active only with an injected publisher or
+    // PRAXIS_MESH_URL + PRAXIS_MESH_TOKEN + PRAXIS_PERSON in the env.
+    this.#meshPublisher = opts.meshPublisher ?? MeshPublisher.fromEnv(store);
+  }
+
+  /**
+   * Publish episode workframes: every newly-closed episode (all but the
+   * still-open last one) as "done", then the open episode as "active" (once
+   * per episode id). Publishing done-before-active keeps the materializer's
+   * latest-frame-per-(person, project) state pointing at the live work; the
+   * publisher serializes the underlying POSTs, preserving this order.
+   */
+  #publishClosedEpisodes(episodes: Episode[]): void {
+    const publisher = this.#meshPublisher;
+    if (!publisher) return;
+    for (const ep of episodes.slice(0, -1)) {
+      if (this.#publishedEpisodes.has(ep.id)) continue;
+      this.#publishedEpisodes.add(ep.id);
+      // Fire-and-forget, fail open: a down relay must never break the loop.
+      void publisher
+        .onEpisodeClosed(ep)
+        .catch((err) => log.warn("mesh publish failed", String(err)));
+    }
+    const open = episodes[episodes.length - 1];
+    if (open && !this.#announcedEpisodes.has(open.id)) {
+      this.#announcedEpisodes.add(open.id);
+      void publisher
+        .onEpisodeActive(open)
+        .catch((err) => log.warn("mesh publish failed", String(err)));
+    }
   }
 
   /** Should we spend a model observation on this episode right now? */
   #shouldObserve(ep: Episode, nowMs: number): boolean {
     if (ep.actions.length < this.#minEpisodeActions) return false;
+    // Never observe an episode that ended outside the loop's window: after a
+    // daemon restart the "latest" episode can be arbitrarily old, and acting
+    // on it would e.g. dispatch an investigation for a months-old error.
+    if (nowMs - toMs(ep.endTs) > this.#windowMs) return false;
     if (nowMs - this.#lastObserveTs < this.#observeIntervalMs) return false;
     const seen = this.#observed.get(ep.id);
     if (seen === undefined) return true; // never observed
@@ -100,6 +147,7 @@ export class AgentLoop {
     const sinceMs = Date.now() - this.#windowMs;
     reconstruct(this.#store, { newId: this.#newId, range: { startTs: toIso(sinceMs) } });
     const episodes = fuse(this.#store, { newId: this.#newId });
+    this.#publishClosedEpisodes(episodes);
 
     const latest = episodes[episodes.length - 1];
     if (!latest || !this.#shouldObserve(latest, Date.now())) return undefined;
@@ -179,6 +227,24 @@ export class AgentLoop {
           question: decision.question,
           options: observation.options ?? [],
         });
+      }
+
+      // A dispatch decision executes through maybeDispatch — the same
+      // persist-then-execute flow as ask_expert. Dry-run by default; only
+      // PRAXIS_DISPATCH_SPAWN=1 permits a real spawn (see agent/dispatch.ts).
+      if (decision.kind === "dispatch") {
+        try {
+          await maybeDispatch({
+            store: this.#store,
+            decision,
+            observation,
+            episode: latest,
+            decisionId: stableId,
+            newId: this.#newId,
+          });
+        } catch (err) {
+          log.warn("dispatch failed", String(err));
+        }
       }
     }
 

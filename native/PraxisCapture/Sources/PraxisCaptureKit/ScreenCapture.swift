@@ -14,6 +14,10 @@ import Foundation
 /// OCR and emission entirely, with a periodic heartbeat re-emit so a bounded
 /// context window never goes blind on a static screen.
 final class ScreenCapture {
+    /// Optional rolling clip ring (PRAXIS_CLIP_BUFFER=1). Fed every polled
+    /// frame of the main display so the clip keeps rolling even on frames the
+    /// still-emitter skips; inert (nil) unless CaptureRunner opts in.
+    var clipBuffer: ClipBuffer?
     /// Re-emit an unchanged display at most this often.
     private let heartbeatSec: TimeInterval = 30
     private var lastHash: [CGDirectDisplayID: String] = [:]
@@ -45,6 +49,10 @@ final class ScreenCapture {
             let image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter, configuration: config
             )
+            // Feed the rolling clip BEFORE the changed/stale guard so it keeps
+            // rolling on frames the still-emitter skips. Main display only —
+            // the clip writer needs stable dimensions.
+            if index == 0, let clip = clipBuffer { await clip.ingest(image: image) }
             guard let data = pngData(image) else { return }
 
             let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()

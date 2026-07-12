@@ -1,11 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
 import type { Store } from "../storage/index.ts";
 import type { ActionEvent, RawEvent } from "../core/types.ts";
 import { newId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
 import { buildPlaybook } from "../transfer/transfer.ts";
+import { buildBrief } from "./brief.ts";
+import { handleBrowserIngest } from "./browserIngest.ts";
+import { createMcpRouter } from "../mcp/router.ts";
+import { isAllowedOrigin } from "../mcp/protocol.ts";
+import { buildGraph } from "../memory/graph.ts";
 import { logger } from "../core/log.ts";
 
 const log = logger("studio");
@@ -23,11 +28,21 @@ const MIME: Record<string, string> = {
 export function startStudio(store: Store, port = 4319): void {
   const webDir = join(import.meta.dirname, "web");
   const clients = new Set<ServerResponse>();
+  const mcpRouter = createMcpRouter(store);
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
     const path = url.pathname;
     try {
+      // MCP mount (default OFF): every /mcp request goes to the router when
+      // PRAXIS_MCP=1; a false return falls through to normal handling.
+      if (
+        process.env.PRAXIS_MCP === "1" &&
+        (path === "/mcp" || path.startsWith("/mcp/")) &&
+        mcpRouter(req, res)
+      ) {
+        return;
+      }
       if (path === "/api/stream") return handleStream(req, res, clients);
       if (path.startsWith("/api/")) return handleApi(store, req, res, path, url);
       return serveStatic(webDir, path, res);
@@ -93,7 +108,8 @@ export function startStudio(store: Store, port = 4319): void {
         process.exit(1);
       });
   });
-  server.listen(port, () => {
+  // Privacy invariant: praxis servers bind loopback only by default.
+  server.listen(port, "127.0.0.1", () => {
     process.stdout.write(
       `\nPraxis Studio → http://localhost:${port}  (Ctrl-C to stop)\n`,
     );
@@ -137,6 +153,17 @@ function handleApi(
 ): void {
   // --- reads ---
   if (req.method === "GET") {
+    // Team brief (async — may consult the mesh relay; empty when mesh is off).
+    if (path === "/api/brief") {
+      void buildBrief(store, {
+        person: url.searchParams.get("person") ?? undefined,
+        project: url.searchParams.get("project") ?? undefined,
+        cwd: url.searchParams.get("cwd") ?? undefined,
+      })
+        .then((brief) => json(res, 200, brief))
+        .catch((err) => json(res, 500, { error: String(err) }));
+      return;
+    }
     switch (path) {
       case "/api/status":
         return json(res, 200, {
@@ -191,6 +218,31 @@ function handleApi(
     }
   }
 
+  // --- writes: browser-extension event batches ---
+  if (req.method === "POST" && path === "/api/ingest/browser") {
+    return handleBrowserIngest(store, req, res);
+  }
+
+  // Browser writes to loopback APIs must carry a local Origin. Non-browser
+  // clients (Electron main, CLI, hooks) normally omit Origin and are allowed.
+  if (req.method === "POST" && !isAllowedOrigin(headerValue(req.headers.origin))) {
+    return json(res, 403, { error: "origin not allowed" });
+  }
+
+  // --- writes: real local forget -----------------------------------------
+  if (req.method === "POST" && path === "/api/forget") {
+    return readBody(req, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      const minutes = Number(data?.minutes);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) {
+        return json(res, 400, { error: "minutes must be an integer from 1 to 1440" });
+      }
+      const result = forgetRecent(store, minutes);
+      log.info(`forgot ${result.events} event(s) from the last ${minutes} minute(s)`);
+      return json(res, 200, result);
+    });
+  }
+
   // --- writes: corrections (the human-in-the-loop) ---
   if (req.method === "POST" && path === "/api/correction") {
     return readBody(req, (body) => {
@@ -236,6 +288,91 @@ function handleApi(
   }
 
   json(res, 404, { error: "no such endpoint" });
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+export interface ForgetResult {
+  cutoff: string;
+  events: number;
+  actions: number;
+  episodes: number;
+  blobs: number;
+}
+
+/**
+ * Permanently remove the requested recent capture window and its derived
+ * interpretations. Candidate blobs are unlinked only when no retained event
+ * references them. Claims/graph are rebuilt from the retained episodes so no
+ * memory node keeps evidence that was deliberately forgotten.
+ */
+export function forgetRecent(
+  store: Store,
+  minutes: number,
+  nowMs = Date.now(),
+): ForgetResult {
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) {
+    throw new RangeError("minutes must be an integer from 1 to 1440");
+  }
+  const cutoff = new Date(nowMs - minutes * 60_000).toISOString();
+  const forgottenRows = store.db
+    .prepare("SELECT blob_refs FROM raw_events WHERE ts >= ?")
+    .all(cutoff) as Array<{ blob_refs: string }>;
+  const candidateBlobs = new Set<string>();
+  for (const row of forgottenRows) {
+    try {
+      for (const hash of JSON.parse(row.blob_refs) as unknown[]) {
+        if (typeof hash === "string") candidateBlobs.add(hash);
+      }
+    } catch {
+      // A malformed legacy ref list must not block forgetting its event.
+    }
+  }
+
+  const count = (table: string, column: string): number =>
+    Number((store.db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} >= ?`).get(cutoff) as { n: number }).n);
+  const result: ForgetResult = {
+    cutoff,
+    events: count("raw_events", "ts"),
+    actions: count("action_events", "end_ts"),
+    episodes: count("episodes", "end_ts"),
+    blobs: 0,
+  };
+
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    store.db.prepare("DELETE FROM raw_events WHERE ts >= ?").run(cutoff);
+    store.db.prepare("DELETE FROM action_events WHERE end_ts >= ?").run(cutoff);
+    store.db.prepare("DELETE FROM episodes WHERE end_ts >= ?").run(cutoff);
+    store.db.prepare("DELETE FROM observations WHERE created_ts >= ?").run(cutoff);
+    store.db.prepare("DELETE FROM decisions WHERE created_ts >= ?").run(cutoff);
+    store.db.prepare("DELETE FROM corrections WHERE created_ts >= ?").run(cutoff);
+    // Claims and graph are derived from the retained episodes/observations.
+    store.db.exec("DELETE FROM graph_edges; DELETE FROM graph_nodes; DELETE FROM claims;");
+    store.db.exec("COMMIT");
+  } catch (error) {
+    store.db.exec("ROLLBACK");
+    throw error;
+  }
+
+  buildGraph(store);
+  const retainedRefs = new Set(store.events.range().flatMap((event) => event.blobRefs));
+  for (const hash of candidateBlobs) {
+    if (retainedRefs.has(hash)) continue;
+    const record = store.blobs.record(hash);
+    if (record) {
+      try {
+        unlinkSync(record.path);
+      } catch {
+        // Missing blob bytes are already effectively forgotten.
+      }
+    }
+    store.db.prepare("DELETE FROM blobs WHERE hash = ?").run(hash);
+    result.blobs += 1;
+  }
+  return result;
 }
 
 /** Recurring patterns across days — for the Connections view. */

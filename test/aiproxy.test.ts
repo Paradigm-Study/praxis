@@ -83,3 +83,70 @@ test("ai_proxy records prompt + response and forwards verbatim", async () => {
   await close(upstream);
   store.close();
 });
+
+test("ai_proxy forwards multibyte UTF-8 split across chunk boundaries byte-identically", async () => {
+  // Upstream that echoes what it saw so we can verify byte integrity.
+  let upstreamSawBody = "";
+  const upstream = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      upstreamSawBody = Buffer.concat(chunks).toString("utf8");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ content: [] }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+
+  const store = openStore({ memory: true });
+  const source = new AiProxySource();
+  source.start(makeIngest(store).ingest);
+  const proxy = startAiProxy({
+    source,
+    port: 0,
+    upstreamBase: `http://localhost:${upstreamPort}`,
+  });
+  const proxyPort = await portOf(proxy);
+
+  const prompt = `${"A".repeat(10)}😀${"B".repeat(10)} 你好`;
+  const payload = Buffer.from(
+    JSON.stringify({
+      model: "claude-test",
+      messages: [{ role: "user", content: prompt }],
+    }),
+    "utf8",
+  );
+  // Split INSIDE the emoji's 4-byte sequence.
+  const emojiStart = payload.indexOf(0xf0);
+  assert.ok(emojiStart > 0);
+
+  const { request } = await import("node:http");
+  const status = await new Promise<number>((resolve, reject) => {
+    const req = request(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: "POST",
+      // No keep-alive agent: a pooled socket would hold the proxy's close() open.
+      agent: false,
+      headers: { "content-type": "application/json" },
+    }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode ?? 0));
+    });
+    req.on("error", reject);
+    req.write(payload.subarray(0, emojiStart + 2), () => {
+      setTimeout(() => req.end(payload.subarray(emojiStart + 2)), 20);
+    });
+  });
+
+  assert.equal(status, 200);
+  assert.equal(
+    upstreamSawBody,
+    payload.toString("utf8"),
+    "the proxy must forward the request body verbatim (no U+FFFD mangling)",
+  );
+  assert.ok(!upstreamSawBody.includes("�"));
+
+  source.stop();
+  await close(proxy);
+  await close(upstream);
+  store.close();
+});

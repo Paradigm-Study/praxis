@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AiProxySource } from "./aiProxy.ts";
+import type { Store } from "../../storage/index.ts";
+import { buildInjectionBlock, detectBodyShape, injectIntoBody } from "./proxyInject.ts";
 import { logger } from "../../core/log.ts";
 
 const log = logger("ai_proxy");
@@ -9,6 +11,8 @@ export interface AiProxyServerOptions {
   /** Upstream the proxy forwards to (real API or a mock). */
   upstreamBase?: string;
   port?: number;
+  /** Enables context injection (with PRAXIS_PROXY_INJECT=1) — see proxyInject.ts. */
+  store?: Store;
 }
 
 /**
@@ -33,11 +37,23 @@ export function startAiProxy(opts: AiProxyServerOptions): Server {
         opts.source.recordRequest({ app, model: model ?? "unknown", prompt });
       }
 
+      // Context injection (default OFF): with PRAXIS_PROXY_INJECT=1 and a
+      // store, splice praxis's relevant knowledge into the outgoing body.
+      // A null block means "inject nothing" and the request forwards verbatim.
+      let forwardRaw = raw;
+      if (process.env.PRAXIS_PROXY_INJECT === "1" && opts.store && prompt) {
+        const record = body as Record<string, unknown>;
+        const block = buildInjectionBlock(opts.store, { model, prompt }, { app });
+        if (block) {
+          forwardRaw = JSON.stringify(injectIntoBody(record, detectBodyShape(record), block));
+        }
+      }
+
       try {
         const upRes = await fetch(upstream + (req.url ?? "/"), {
           method: req.method,
           headers: forwardHeaders(req),
-          body: req.method === "GET" || req.method === "HEAD" ? undefined : raw,
+          body: req.method === "GET" || req.method === "HEAD" ? undefined : forwardRaw,
         });
         const text = await upRes.text();
         const data = safeJson(text);
@@ -65,7 +81,8 @@ export function startAiProxy(opts: AiProxyServerOptions): Server {
     log.error(`proxy failed: ${String(err)}`);
     process.exit(1);
   });
-  server.listen(opts.port ?? 4318, () => {
+  // Privacy invariant: praxis servers bind loopback only by default.
+  server.listen(opts.port ?? 4318, "127.0.0.1", () => {
     const bound = server.address();
     const port = bound && typeof bound === "object" ? bound.port : opts.port;
     log.info(`proxy on http://localhost:${port} → ${upstream}`);
@@ -128,7 +145,10 @@ function contentText(content: unknown): string {
 // --- http helpers ---------------------------------------------------------
 
 function forwardHeaders(req: IncomingMessage): Record<string, string> {
-  const drop = new Set(["host", "content-length", "accept-encoding", "connection"]);
+	// fetch/undici owns framing for the reconstructed request body. Forwarding
+	// the inbound Transfer-Encoding (typically "chunked") makes undici reject
+	// the request before it reaches upstream.
+	const drop = new Set(["host", "content-length", "transfer-encoding", "accept-encoding", "connection"]);
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (drop.has(k.toLowerCase())) continue;
@@ -143,9 +163,14 @@ function headerStr(req: IncomingMessage, name: string): string | undefined {
 }
 
 function readBody(req: IncomingMessage, cb: (raw: string) => void): void {
-  let data = "";
-  req.on("data", (c) => (data += c));
-  req.on("end", () => cb(data));
+  // Collect Buffers and decode ONCE. Coercing each chunk individually would
+  // corrupt any multibyte UTF-8 character split across a chunk boundary —
+  // and the proxy's contract is to forward the body verbatim.
+  const chunks: Buffer[] = [];
+  req.on("data", (c: Buffer | string) => {
+    chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+  });
+  req.on("end", () => cb(Buffer.concat(chunks).toString("utf8")));
 }
 
 function safeJson(s: string): Body | undefined {

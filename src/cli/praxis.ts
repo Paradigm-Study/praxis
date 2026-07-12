@@ -514,7 +514,7 @@ async function cmdProxy(): Promise<void> {
   const ingest = makeIngest(store);
   source.start(ingest.ingest);
   const port = Number(flagVal("--port") ?? 4318);
-  startAiProxy({ source, port, upstreamBase: flagVal("--upstream") });
+  startAiProxy({ source, port, upstreamBase: flagVal("--upstream"), store });
   process.stdout.write(
     `${green("●")} AI proxy on :${port} → ${flagVal("--upstream") ?? "https://api.anthropic.com"}\n` +
       dim("  point your AI tool's base URL here; prompts/responses are recorded.\n"),
