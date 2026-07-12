@@ -14,6 +14,7 @@ import Foundation
 /// OCR and emission entirely, with a periodic heartbeat re-emit so a bounded
 /// context window never goes blind on a static screen.
 final class ScreenCapture {
+    private let policy: NativePolicyChecking
     /// Optional rolling clip ring (PRAXIS_CLIP_BUFFER=1). Fed every polled
     /// frame of the main display so the clip keeps rolling even on frames the
     /// still-emitter skips; inert (nil) unless CaptureRunner opts in.
@@ -24,14 +25,40 @@ final class ScreenCapture {
     private var lastEmit: [CGDirectDisplayID: Date] = [:]
     private var lastOcr: [CGDirectDisplayID: [String]] = [:]
 
+    init(policy: NativePolicyChecking) {
+        self.policy = policy
+    }
+
     func captureOnce() {
+        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        let started = AcquisitionFence.perform(
+            policy: policy, source: .screenVideo, app: app, window: nil
+        ) { [weak self] in
+            self?.captureAllowed(frontApp: app)
+        }
+        if !started { Task { await clipBuffer?.clear() } }
+    }
+
+    private func captureAllowed(frontApp: String) {
         Task {
             do {
                 let content = try await SCShareableContent.current
-                let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+                // A display screenshot contains every visible window. If any
+                // visible app/window is excluded, skip the entire frame rather
+                // than allowing its pixels into ScreenCaptureKit output.
+                for window in content.windows where window.isOnScreen {
+                    let app = window.owningApplication?.applicationName ?? "unknown"
+                    let title = window.title ?? app
+                    guard self.policy.decision(
+                        source: .screenVideo, app: app, window: title, at: Date()
+                    ).allowed else {
+                        await self.clipBuffer?.clear()
+                        return
+                    }
+                }
                 for (index, display) in content.displays.enumerated() {
                     await self.capture(display, index: index,
-                                       totalDisplays: content.displays.count, app: app)
+                                       totalDisplays: content.displays.count, app: frontApp)
                 }
             } catch {
                 log("screen capture failed: \(error)")
@@ -42,6 +69,13 @@ final class ScreenCapture {
     private func capture(_ display: SCDisplay, index: Int,
                          totalDisplays: Int, app: String) async {
         do {
+            // Re-read the leased policy immediately before pixel acquisition.
+            guard policy.decision(
+                source: .screenVideo, app: app, window: nil, at: Date()
+            ).allowed else {
+                await clipBuffer?.clear()
+                return
+            }
             let filter = SCContentFilter(display: display, excludingWindows: [])
             let config = SCStreamConfiguration()
             config.width = max(640, display.width / 2)

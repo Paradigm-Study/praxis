@@ -36,6 +36,8 @@ export interface MeshPublisherOptions {
   /** Bearer token for this person (relay static token table). */
   token: string;
   person: string;
+  /** Hosted tenant identity. Sent as X-Mesh-Team-ID when present. */
+  teamId?: string;
   /** Defaults to os.hostname(). */
   device?: string;
   /** Git remote url or directory name. Defaults to basename(cwd). */
@@ -107,6 +109,7 @@ function readConsentConfig(path: string): ConsentConfig | undefined {
 export class MeshPublisher {
   readonly url: string;
   readonly person: string;
+  readonly teamId: string | undefined;
   readonly device: string;
   readonly project: string;
   protected token: string;
@@ -131,6 +134,7 @@ export class MeshPublisher {
     this.url = opts.url.replace(/\/$/, "");
     this.token = opts.token;
     this.person = opts.person;
+    this.teamId = opts.teamId;
     this.device = opts.device ?? config?.device ?? hostname();
     this.project = opts.project ?? basename(process.cwd());
     this.store = opts.store;
@@ -147,6 +151,8 @@ export class MeshPublisher {
 
   /**
    * Build from PRAXIS_MESH_URL + PRAXIS_MESH_TOKEN + PRAXIS_PERSON.
+   * Hosted credentials additionally use PRAXIS_MESH_TEAM_ID and the bound
+   * PRAXIS_MESH_DEVICE_ID.
    * Returns undefined when any of the three is unset (feature off).
    */
   static fromEnv(store?: Store): MeshPublisher | undefined {
@@ -157,7 +163,19 @@ export class MeshPublisher {
     const projects = store ? PrivacyControlStore.forStore(store).read().meshProjects : [];
     // Environment credentials alone no longer grant every project: the
     // versioned privacy control carries affirmative per-project consent.
-    return new MeshPublisher({ url, token, person, store, projects });
+    return new MeshPublisher({
+      url,
+      token,
+      person,
+      store,
+      projects,
+      ...(process.env.PRAXIS_MESH_TEAM_ID && {
+        teamId: process.env.PRAXIS_MESH_TEAM_ID,
+      }),
+      ...(process.env.PRAXIS_MESH_DEVICE_ID && {
+        device: process.env.PRAXIS_MESH_DEVICE_ID,
+      }),
+    });
   }
 
   /**
@@ -227,7 +245,10 @@ export class MeshPublisher {
 
   private async publishNow(frame: MeshFrame): Promise<PublishResult> {
     try {
-      const outbound = redactMeshFrame(frame);
+      // The credential is bound to this publisher's device. Canonicalize the
+      // wire record to the same identity as X-Mesh-Device-ID so callers cannot
+      // accidentally emit a frame that hosted authentication will contradict.
+      const outbound = redactMeshFrame({ ...frame, device: this.device });
       try {
         await this.flushSpool();
       } catch (error) {
@@ -323,6 +344,8 @@ export class MeshPublisher {
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${this.token}`,
+          ...(this.teamId && { "x-mesh-team-id": this.teamId }),
+          "x-mesh-device-id": this.device,
         },
         body,
       });

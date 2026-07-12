@@ -14,6 +14,7 @@ import { buildGraph } from "../memory/graph.ts";
 import { logger } from "../core/log.ts";
 import { PrivacyControlStore, type PrivacyControl } from "../privacy/control.ts";
 import { RuntimeStatusStore } from "../capture/runtimeStatus.ts";
+import { publishNativeAcquisitionPolicy } from "../privacy/nativePolicy.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
 import {
   RetentionPolicyStore,
@@ -291,11 +292,9 @@ function handleApi(
       if (typeof data !== "object" || data === null || Array.isArray(data)) {
         return json(res, 400, { error: "privacy control must be a JSON object" });
       }
-      return json(
-        res,
-        200,
-        PrivacyControlStore.forStore(store).update(data as Partial<PrivacyControl>),
-      );
+      const control = PrivacyControlStore.forStore(store).update(data as Partial<PrivacyControl>);
+      publishNativeAcquisitionPolicy(store);
+      return json(res, 200, control);
     });
   }
   if (req.method === "PUT" && path === "/api/runtime/resources") {
@@ -315,6 +314,7 @@ function handleApi(
         suspended: data.suspended,
         batteryAware: data.batteryAware,
       });
+      publishNativeAcquisitionPolicy(store);
       return json(res, 200, captureStatus(store, status));
     });
   }
@@ -326,15 +326,19 @@ function handleApi(
         return json(res, 400, { error: "minutes must be an integer from 1 to 1440" });
       }
       const control = PrivacyControlStore.forStore(store);
-      return json(res, 200, control.update({
+      const updated = control.update({
         mode: "paused",
         pausedUntil: new Date(Date.now() + minutes * 60_000).toISOString(),
-      }));
+      });
+      publishNativeAcquisitionPolicy(store);
+      return json(res, 200, updated);
     });
   }
   if (req.method === "POST" && path === "/api/capture/resume") {
     const control = PrivacyControlStore.forStore(store);
-    return json(res, 200, control.update({ mode: "normal", pausedUntil: undefined }));
+    const updated = control.update({ mode: "normal", pausedUntil: undefined });
+    publishNativeAcquisitionPolicy(store);
+    return json(res, 200, updated);
   }
 
   // --- writes: retention/quota maintenance ------------------------------

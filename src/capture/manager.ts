@@ -7,6 +7,7 @@ import { logger } from "../core/log.ts";
 import { PrivacyControlStore } from "../privacy/control.ts";
 import { RuntimeStatusStore } from "./runtimeStatus.ts";
 import { runMaintenance } from "../storage/maintenance.ts";
+import { publishNativeAcquisitionPolicy } from "../privacy/nativePolicy.ts";
 
 const log = logger("capture");
 
@@ -21,6 +22,7 @@ export class CaptureManager {
   #started: CaptureSource[] = [];
   #state: "stopped" | "starting" | "running" | "stopping" | "failed" = "stopped";
   #runtime: RuntimeStatusStore;
+  #privacy: PrivacyControlStore;
   #store: Store;
   #maintenanceTimer: ReturnType<typeof setInterval> | undefined;
   #heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -34,7 +36,8 @@ export class CaptureManager {
   ) {
     this.#store = store;
     this.#runtime = opts.runtime ?? RuntimeStatusStore.forStore(store);
-    this.#ingest = makeIngest(store, { privacy: opts.privacy, runtime: this.#runtime });
+    this.#privacy = opts.privacy ?? PrivacyControlStore.forStore(store);
+    this.#ingest = makeIngest(store, { privacy: this.#privacy, runtime: this.#runtime });
     // Agent-transcript ingestion (default OFF): opt in with PRAXIS_AGENT_SESSIONS=1.
     this.#sources =
       process.env.PRAXIS_AGENT_SESSIONS === "1"
@@ -72,6 +75,9 @@ export class CaptureManager {
       lastError: undefined,
     });
     try {
+      // Publish before starting any source. Native clients may already be
+      // alive, but remain fail-closed until this complete snapshot appears.
+      this.#publishNativePolicy();
       this.#maintain();
       this.#maintenanceTimer = setInterval(() => this.#maintain(), 60 * 60_000);
       this.#maintenanceTimer.unref();
@@ -103,6 +109,7 @@ export class CaptureManager {
           pid: process.pid,
           activeSources: this.#started.map((source) => source.name),
         });
+        this.#publishNativePolicy();
       }, 10_000);
       this.#heartbeatTimer.unref();
     } catch (error) {
@@ -154,6 +161,19 @@ export class CaptureManager {
     } catch (error) {
       // Retention is fail-open for capture, but the error is visible in logs.
       log.warn("storage maintenance failed", String(error));
+    }
+  }
+
+  #publishNativePolicy(): void {
+    try {
+      publishNativeAcquisitionPolicy(this.#store, {
+        privacy: this.#privacy,
+        runtime: this.#runtime,
+      });
+    } catch (error) {
+      // A missing/stale snapshot makes packaged native capture fail closed.
+      // Surface the failure rather than weakening that invariant.
+      log.error("native acquisition policy publication failed", String(error));
     }
   }
 }

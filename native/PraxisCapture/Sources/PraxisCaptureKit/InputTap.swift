@@ -6,8 +6,13 @@ import AppKit
 /// Tab/Esc/etc.) and click coordinates — never raw typed text. The actual draft
 /// content comes from the Accessibility tap, not keylogging.
 final class InputTap {
+    private let policy: NativePolicyChecking
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
+
+    init(policy: NativePolicyChecking) {
+        self.policy = policy
+    }
 
     func start() {
         let mask: CGEventMask =
@@ -20,7 +25,7 @@ final class InputTap {
             options: .listenOnly,
             eventsOfInterest: mask,
             callback: inputTapCallback,
-            userInfo: nil
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             log("could not create event tap (needs Accessibility permission)")
             return
@@ -39,6 +44,44 @@ final class InputTap {
         tap = nil
         source = nil
     }
+
+    fileprivate func handle(type: CGEventType, event: CGEvent) {
+        let app = NSWorkspace.shared.frontmostApplication
+        let appName = app?.localizedName ?? "unknown"
+        guard policy.decision(
+            source: .inputEvents, app: appName, window: nil, at: Date()
+        ).allowed else { return }
+        let window = app.flatMap { AXSnapshot.frontWindowTitle(pid: $0.processIdentifier) } ?? appName
+        guard policy.decision(
+            source: .inputEvents, app: appName, window: window, at: Date()
+        ).allowed else { return }
+
+        if type == .keyDown {
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+            var mods: [String] = []
+            if flags.contains(.maskCommand) { mods.append("cmd") }
+            if flags.contains(.maskShift) { mods.append("shift") }
+            if flags.contains(.maskAlternate) { mods.append("alt") }
+            if flags.contains(.maskControl) { mods.append("ctrl") }
+
+            let key = keyName(for: code)
+            let meaningful = key == "Enter" || !mods.isEmpty ||
+                ["Tab", "Escape", "Backspace", "Space"].contains(key)
+            if meaningful {
+                Emitter.shared.emit(
+                    source: "input_events", app: appName, window: window,
+                    type: "key_down", payload: ["key": key, "mods": mods]
+                )
+            }
+        } else if type == .leftMouseDown {
+            let loc = event.location
+            Emitter.shared.emit(
+                source: "input_events", app: appName, window: window,
+                type: "mouse_click", payload: ["x": Int(loc.x), "y": Int(loc.y)]
+            )
+        }
+    }
 }
 
 /// C-compatible callback (no captured context allowed).
@@ -46,34 +89,8 @@ private func inputTapCallback(
     proxy: CGEventTapProxy, type: CGEventType, event: CGEvent,
     refcon: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-
-    if type == .keyDown {
-        let code = event.getIntegerValueField(.keyboardEventKeycode)
-        let flags = event.flags
-        var mods: [String] = []
-        if flags.contains(.maskCommand) { mods.append("cmd") }
-        if flags.contains(.maskShift) { mods.append("shift") }
-        if flags.contains(.maskAlternate) { mods.append("alt") }
-        if flags.contains(.maskControl) { mods.append("ctrl") }
-
-        let key = keyName(for: code)
-        // Privacy: only report meaningful control keys, not raw typing.
-        let meaningful = key == "Enter" || !mods.isEmpty ||
-            ["Tab", "Escape", "Backspace", "Space"].contains(key)
-        if meaningful {
-            Emitter.shared.emit(
-                source: "input_events", app: app, window: app,
-                type: "key_down", payload: ["key": key, "mods": mods]
-            )
-        }
-    } else if type == .leftMouseDown {
-        let loc = event.location
-        Emitter.shared.emit(
-            source: "input_events", app: app, window: app,
-            type: "mouse_click", payload: ["x": Int(loc.x), "y": Int(loc.y)]
-        )
-    }
+    guard let refcon else { return Unmanaged.passUnretained(event) }
+    Unmanaged<InputTap>.fromOpaque(refcon).takeUnretainedValue().handle(type: type, event: event)
     return Unmanaged.passUnretained(event)
 }
 

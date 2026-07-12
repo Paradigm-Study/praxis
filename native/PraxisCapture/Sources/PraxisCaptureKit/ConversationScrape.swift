@@ -18,10 +18,14 @@ enum ConversationScrape {
     private static let maxEmitPerTick = 12
     private static var enhanced: Set<pid_t> = []
 
-    static func scan() {
+    static func scan(policy: NativePolicyChecking) {
         guard AXIsProcessTrusted() else { return }
         guard let app = NSWorkspace.shared.frontmostApplication else { return }
         let appName = app.localizedName ?? "unknown"
+        // Do not touch the app's AX tree until global/source/app policy allows it.
+        guard policy.decision(source: .accessibility, app: appName, window: nil, at: Date()).allowed else {
+            return
+        }
         let pid = app.processIdentifier
         let axApp = AXUIElementCreateApplication(pid)
 
@@ -41,6 +45,9 @@ enum ConversationScrape {
               let win = winRef else { return }
         let window = win as! AXUIElement
         let windowTitle = AXSnapshot.copyString(window, kAXTitleAttribute) ?? appName
+        guard policy.decision(
+            source: .accessibility, app: appName, window: windowTitle, at: Date()
+        ).allowed else { return }
 
         var texts: [String] = []
         var budget = maxNodes

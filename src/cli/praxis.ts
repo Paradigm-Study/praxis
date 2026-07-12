@@ -28,7 +28,9 @@ import { consolidate, evidenceCoverage, applyCorrections } from "../memory/conso
 import { renderSkill, skillStats } from "../transfer/skill.ts";
 import { nowIso } from "../core/time.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
-import { PrivacyControlStore } from "../privacy/control.ts";
+import { capturePolicyDecision, PrivacyControlStore } from "../privacy/control.ts";
+import { resourceCaptureDecision, RuntimeStatusStore } from "../capture/runtimeStatus.ts";
+import { nativePolicyPathForStore } from "../privacy/nativePolicy.ts";
 import { createBackup, restoreBackup, verifyBackup } from "../storage/backup.ts";
 import { doctorStore } from "../storage/doctor.ts";
 import { rotateMasterKey } from "../storage/crypto.ts";
@@ -280,6 +282,9 @@ function cmdStatus(): void {
 
 async function cmdCapture(): Promise<void> {
   const store = openStore(flagVal("--data") ? { dir: flagVal("--data")! } : {});
+  const privacy = PrivacyControlStore.forStore(store);
+  const runtime = RuntimeStatusStore.forStore(store);
+  let manager: CaptureManager;
   const sources = [];
   if (has("--synthetic")) {
     sources.push(
@@ -289,7 +294,28 @@ async function cmdCapture(): Promise<void> {
       }),
     );
   } else {
-    sources.push(new ClipboardSource({ frontApp: () => manager.frontApp() }));
+    const nativeCapture = has("--native") || has("--native-stdin");
+    // Consumer/native capture reads the pasteboard in PraxisCaptureKit, where
+    // the current app/window can be fenced before body acquisition. The legacy
+    // Node poller is explicit development compatibility only.
+    if (!nativeCapture && process.env.PRAXIS_NODE_CLIPBOARD_UNSAFE_DEV === "1") {
+      sources.push(new ClipboardSource({
+        frontApp: () => manager.frontApp(),
+        canAcquire: (front) => {
+          const contentPolicy = capturePolicyDecision(privacy.read(), {
+            source: "clipboard",
+            app: front.app,
+            window: front.window,
+            type: "clipboard_preflight",
+            payload: {},
+          });
+          return contentPolicy.allowed && resourceCaptureDecision(
+            runtime.read().resources,
+            "clipboard",
+          ).allowed;
+        },
+      }));
+    }
     sources.push(new TerminalSource({ logPath: join(homedir(), ".praxis", "cmdlog.ndjson") }));
 
     // Filesystem + git taps are OPT-IN — point them at YOUR project(s), not at
@@ -311,10 +337,14 @@ async function cmdCapture(): Promise<void> {
     // --native-stdin: native events arrive on stdin (the app spawned the capture
     // binary directly). --native: spawn it ourselves (dev / terminal use).
     if (has("--native-stdin")) sources.push(new StdinNativeSource());
-    else if (has("--native")) sources.push(new NativeCaptureSource());
+    else if (has("--native")) {
+      sources.push(new NativeCaptureSource({
+        policyPath: nativePolicyPathForStore(store),
+      }));
+    }
   }
 
-  const manager = new CaptureManager(store, sources);
+  manager = new CaptureManager(store, sources, { privacy, runtime });
   process.stdout.write(`${green("●")} capturing → ${cyan(store.paths.db)}  ${dim("(Ctrl-C to stop)")}\n`);
 
   let live = 0;

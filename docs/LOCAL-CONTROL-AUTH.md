@@ -53,3 +53,29 @@ suppresses all ingest and remote observations while preserving the process and
 pipe for a safe resume. Battery plus `batteryAware: true` suppresses screen
 frames and remote observer calls while retaining cheaper local signals. The
 same state and `effectiveState` are returned by `GET /api/capture/status`.
+
+## Native pre-acquisition policy
+
+Node publishes `data/native-acquisition-policy.json` as the versioned,
+cross-language projection of PrivacyControl plus runtime resource state. Each
+generation is written to an owner-only temporary file, fsynced, and atomically
+renamed. The policy is a 30-second lease; the capture manager refreshes it every
+10 seconds and publishes once before starting its first source.
+
+The packaged PraxisBar constructs `NativePolicyGate` in required mode with this
+fixed path. Missing, corrupt, unsupported, or expired snapshots deny acquisition.
+Private mode, active timed pause, suspend, disabled native sources, battery-aware
+screen suppression, and excluded apps/windows are rechecked immediately before
+the corresponding native API or Praxis-owned buffer. Denied content does not
+enter the clip/audio buffers or NDJSON stdout. The existing Node ingest policy
+remains a second, independent fence.
+
+`sources.screen_video` is the local screenshot acquisition control.
+`cloudScreenshotEgressConsent` in the projection reflects the existing
+cloud-observer image consent and is informational to native capture; it does not
+silently disable local screenshots. Cloud images remain blocked by the observer
+egress fence unless that consent is true.
+
+Standalone native development without a Node publisher requires the explicit
+`--dev-policy-compat` flag or `PRAXIS_NATIVE_POLICY_MODE=development`. That mode
+permits a missing/invalid snapshot and must never be set by packaged builds.

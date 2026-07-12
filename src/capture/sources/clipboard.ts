@@ -19,22 +19,31 @@ export class ClipboardSource implements CaptureSource {
   #last = "";
   #intervalMs: number;
   #frontApp: () => { app: string; window: string };
+  #canAcquire: (front: { app: string; window: string }) => boolean;
+  #readClipboard: () => Promise<string>;
 
   constructor(opts: {
     intervalMs?: number;
     frontApp?: () => { app: string; window: string };
+    /** Pre-acquisition privacy fence. Called before pbpaste is executed. */
+    canAcquire?: (front: { app: string; window: string }) => boolean;
+    /** Injection seam proving a denied policy never executes pbpaste. */
+    readClipboard?: () => Promise<string>;
   } = {}) {
     this.#intervalMs = opts.intervalMs ?? 1000;
     this.#frontApp = opts.frontApp ?? (() => ({ app: "unknown", window: "" }));
+    this.#canAcquire = opts.canAcquire ?? (() => true);
+    this.#readClipboard = opts.readClipboard ?? (async () => (await exec("pbpaste")).stdout);
   }
 
   start(sink: EventSink): void {
     this.#timer = setInterval(async () => {
       try {
-        const { stdout } = await exec("pbpaste");
+        const front = this.#frontApp();
+        if (!this.#canAcquire(front)) return;
+        const stdout = await this.#readClipboard();
         if (stdout && stdout !== this.#last) {
           this.#last = stdout;
-          const front = this.#frontApp();
           const big = stdout.length > 256;
           sink({
             source: "clipboard",

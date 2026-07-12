@@ -39,15 +39,27 @@ public struct PermissionState {
 /// as a child process never sees the permissions.
 public final class CaptureRunner {
     private let opts: CaptureOptions
+    private let policy: NativePolicyChecking
     private var focus: FocusTimeline?
     private var input: InputTap?
     private var screen: ScreenCapture?
     private var audio: AudioCapture?
+    private var clipboard: ClipboardCapture?
     private var axTimer: Timer?
     private var frameTimer: Timer?
+    private var policyTimer: Timer?
+    private var clipboardTimer: Timer?
+    private var requestedAudioSystem = false
+    private var requestedAudioMic = false
 
-    public init(options: CaptureOptions = CaptureOptions()) {
+    public init(
+        options: CaptureOptions = CaptureOptions(),
+        policy: NativePolicyChecking = NativePolicyGate.fromEnvironment()
+    ) {
         self.opts = options
+        self.policy = policy
+        self.requestedAudioSystem = options.audioSystem
+        self.requestedAudioMic = options.audioMic
     }
 
     /// Start the taps on the CURRENT run loop, emitting NDJSON to `output`.
@@ -67,9 +79,10 @@ public final class CaptureRunner {
             log("Screen Recording not granted — frames disabled until granted.")
         }
 
-        let f = FocusTimeline(); f.start(); focus = f
-        let i = InputTap(); i.start(); input = i
-        let s = ScreenCapture(); screen = s
+        let f = FocusTimeline(policy: policy); f.start(); focus = f
+        let i = InputTap(policy: policy); i.start(); input = i
+        let s = ScreenCapture(policy: policy); screen = s
+        let c = ClipboardCapture(policy: policy); clipboard = c
         // Opt-in rolling clip ring (default OFF): only holds JPEG frames in a
         // bounded buffer; nothing is persisted until persistClip is called.
         if ProcessInfo.processInfo.environment["PRAXIS_CLIP_BUFFER"] == "1" { s.clipBuffer = ClipBuffer() }
@@ -79,11 +92,19 @@ public final class CaptureRunner {
 
         let scrape = opts.scrape
         axTimer = Timer.scheduledTimer(withTimeInterval: opts.axInterval, repeats: true) { _ in
-            AXSnapshot.snapshotFocused()
-            if scrape { ConversationScrape.scan() }
+            AXSnapshot.snapshotFocused(policy: self.policy)
+            if scrape { ConversationScrape.scan(policy: self.policy) }
         }
         frameTimer = Timer.scheduledTimer(withTimeInterval: opts.frameInterval, repeats: true) { _ in
             if Permissions.screenRecordingAllowed() { s.captureOnce() }
+        }
+        // Reconcile long-lived audio taps and clip memory promptly after an
+        // atomic policy transition, independent of the slower frame cadence.
+        policyTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            self.reconcilePolicy()
+        }
+        clipboardTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            c.poll()
         }
 
         return PermissionState(accessibility: axOk, screenRecording: screenOk)
@@ -92,9 +113,12 @@ public final class CaptureRunner {
     public func stop() {
         axTimer?.invalidate(); axTimer = nil
         frameTimer?.invalidate(); frameTimer = nil
+        policyTimer?.invalidate(); policyTimer = nil
+        clipboardTimer?.invalidate(); clipboardTimer = nil
         input?.stop(); input = nil
         focus?.stop(); focus = nil
         audio?.stop(); audio = nil
+        clipboard = nil
         screen = nil
     }
 
@@ -102,10 +126,19 @@ public final class CaptureRunner {
     /// restarting capture). System audio rides the Screen Recording grant; the
     /// mic path requests its own permissions on first enable.
     public func setAudio(system: Bool, mic: Bool) {
+        requestedAudioSystem = system
+        requestedAudioMic = mic
         if system || mic {
-            if audio == nil { audio = AudioCapture() }
-            AudioCapture.requestPermissions(mic: mic) { ok in
-                if !ok { log("audio: speech/mic permission incomplete — transcripts may be unavailable") }
+            let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+            guard policy.decision(source: .audio, app: app, window: nil, at: Date()).allowed else {
+                audio?.stop()
+                return
+            }
+            if audio == nil {
+                audio = AudioCapture(policy: policy)
+                AudioCapture.requestPermissions(mic: mic) { ok in
+                    if !ok { log("audio: speech/mic permission incomplete — transcripts may be unavailable") }
+                }
             }
             audio?.set(system: system && Permissions.screenRecordingAllowed(), mic: mic)
         } else {
@@ -117,7 +150,18 @@ public final class CaptureRunner {
     /// No-op unless PRAXIS_CLIP_BUFFER=1 armed the buffer. Fire-and-forget:
     /// future trigger surfaces (hotkey, error rules, boardroom raise) call this.
     public func persistClip(reason: String) {
-        Task { [weak self] in await self?.screen?.clipBuffer?.persistClip(reason: reason) }
+        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        guard policy.decision(source: .screenVideo, app: app, window: nil, at: Date()).allowed else {
+            Task { [weak self] in await self?.screen?.clipBuffer?.clear() }
+            return
+        }
+        Task { [weak self] in
+            guard let self,
+                  self.policy.decision(
+                    source: .screenVideo, app: app, window: nil, at: Date()
+                  ).allowed else { return }
+            await self.screen?.clipBuffer?.persistClip(reason: reason)
+        }
     }
 
     /// One-shot snapshot (smoke testing without a long-running loop).
@@ -125,11 +169,22 @@ public final class CaptureRunner {
         Emitter.shared.output = output
         let screenOk = Permissions.screenRecordingAllowed()
         log("one-shot (accessibility=\(Permissions.accessibilityTrusted()), screenRecording=\(screenOk))")
-        AXSnapshot.snapshotFocused()
-        if opts.scrape { ConversationScrape.scan() }
-        if screenOk { ScreenCapture().captureOnce() }
+        AXSnapshot.snapshotFocused(policy: policy)
+        if opts.scrape { ConversationScrape.scan(policy: policy) }
+        if screenOk { ScreenCapture(policy: policy).captureOnce() }
         RunLoop.main.run(until: Date().addingTimeInterval(1.5))
     }
+
+    private func reconcilePolicy() {
+        if requestedAudioSystem || requestedAudioMic {
+            setAudio(system: requestedAudioSystem, mic: requestedAudioMic)
+        }
+        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        if !policy.decision(source: .screenVideo, app: app, window: nil, at: Date()).allowed {
+            Task { [weak self] in await self?.screen?.clipBuffer?.clear() }
+        }
+    }
+
 
     /// Verify the Vision OCR path on a rendered image — needs no permissions.
     /// Returns true if text was recognized.

@@ -154,6 +154,12 @@ public actor ClipBuffer {
     public var frameCount: Int { ring.count }
     public var bufferedSeconds: Double { ring.durationSeconds }
 
+    /// Drop buffered pixels immediately when acquisition becomes disallowed.
+    public func clear() {
+        ring.removeAll()
+        lastAccepted = -.infinity
+    }
+
     // MARK: Feeding
 
     /// Feed a frame from the existing screenshot path (ScreenCapture already

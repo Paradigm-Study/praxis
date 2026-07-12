@@ -468,8 +468,12 @@ final class PraxisBar: NSObject, NSApplicationDelegate, NSMenuDelegate,
         capturePipeline = pipeline
 
         // Taps run here, in the granted app, emitting into the node pipeline.
+        let policy = NativePolicyGate(
+            path: home + "/data/native-acquisition-policy.json",
+            mode: .required
+        )
         let runner = CaptureRunner(options: CaptureOptions(
-            audioSystem: audioSystem, audioMic: audioMic))
+            audioSystem: audioSystem, audioMic: audioMic), policy: policy)
         let state = runner.start(output: bridge.fileHandleForWriting)
         captureRunner = runner
 

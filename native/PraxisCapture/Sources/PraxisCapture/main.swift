@@ -11,6 +11,31 @@ func argValue(_ name: String, _ def: Double) -> Double {
     return def
 }
 
+func printPermissionStatus() {
+    let value: [String: Bool] = [
+        "screenRecording": Permissions.screenRecordingAllowed(),
+        "accessibility": Permissions.accessibilityTrusted(),
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data([0x0a]))
+}
+
+if CommandLine.arguments.contains("--permission-status") {
+    printPermissionStatus()
+    exit(0)
+}
+if CommandLine.arguments.contains("--request-screen-recording") {
+    Permissions.requestScreenRecording()
+    printPermissionStatus()
+    exit(0)
+}
+if CommandLine.arguments.contains("--request-accessibility") {
+    Permissions.requestAccessibility()
+    printPermissionStatus()
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--selftest-ocr") {
     exit(CaptureRunner.selftestOCR() ? 0 : 1)
 }
@@ -23,7 +48,10 @@ let opts = CaptureOptions(
     audioSystem: CommandLine.arguments.contains("--audio-system"),
     audioMic: CommandLine.arguments.contains("--audio-mic")
 )
-let runner = CaptureRunner(options: opts)
+let policy = NativePolicyGate.fromEnvironment(
+    developmentCompatibility: CommandLine.arguments.contains("--dev-policy-compat")
+)
+let runner = CaptureRunner(options: opts, policy: policy)
 
 if CommandLine.arguments.contains("--once") {
     runner.runOnce()

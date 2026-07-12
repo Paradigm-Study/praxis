@@ -150,7 +150,15 @@ async function fetchMeshBrief(
   try {
     const endpoint = `${url.replace(/\/+$/, "")}/brief?${params}`;
     const res = await fetchFn(endpoint, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(process.env.PRAXIS_MESH_TEAM_ID && {
+          "x-mesh-team-id": process.env.PRAXIS_MESH_TEAM_ID,
+        }),
+        ...(process.env.PRAXIS_MESH_DEVICE_ID && {
+          "x-mesh-device-id": process.env.PRAXIS_MESH_DEVICE_ID,
+        }),
+      },
       signal: AbortSignal.timeout(2000),
     });
     if (!res.ok) {

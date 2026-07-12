@@ -18,6 +18,8 @@ interface RequestRecord {
   method: string | undefined;
   path: string | undefined;
   authorization: string | undefined;
+  teamId: string | undefined;
+  deviceId: string | undefined;
   body: string;
 }
 
@@ -86,6 +88,8 @@ function fetchRequestRecord(
     method: init?.method,
     path: url.pathname,
     authorization: headers.get("authorization") ?? undefined,
+    teamId: headers.get("x-mesh-team-id") ?? undefined,
+    deviceId: headers.get("x-mesh-device-id") ?? undefined,
     body: typeof init?.body === "string" ? init.body : "",
   };
 }
@@ -158,6 +162,12 @@ test("publish posts a frame with the relay path and bearer token", async () => {
       authorization: typeof req.headers.authorization === "string"
         ? req.headers.authorization
         : undefined,
+      teamId: typeof req.headers["x-mesh-team-id"] === "string"
+        ? req.headers["x-mesh-team-id"]
+        : undefined,
+      deviceId: typeof req.headers["x-mesh-device-id"] === "string"
+        ? req.headers["x-mesh-device-id"]
+        : undefined,
       body,
     });
     res.writeHead(200, { "content-type": "application/json" });
@@ -170,6 +180,8 @@ test("publish posts a frame with the relay path and bearer token", async () => {
       url: `${relay.url}/`,
       token: "secret-token",
       person: "alice",
+      teamId: "team-praxis",
+      device: "device-praxis",
       fetchFn: relay.fetchFn,
       configPath: paths.configPath,
       spoolPath: paths.spoolPath,
@@ -181,7 +193,12 @@ test("publish posts a frame with the relay path and bearer token", async () => {
     assert.equal(requests[0]!.method, "POST");
     assert.equal(requests[0]!.path, "/outbox/alice");
     assert.equal(requests[0]!.authorization, "Bearer secret-token");
-    assert.deepEqual(JSON.parse(requests[0]!.body), sent);
+    assert.equal(requests[0]!.teamId, "team-praxis");
+    assert.equal(requests[0]!.deviceId, "device-praxis");
+    assert.deepEqual(JSON.parse(requests[0]!.body), {
+      ...sent,
+      device: "device-praxis",
+    });
   } finally {
     await close(server, relay.bound);
     rmSync(paths.dir, { recursive: true, force: true });
@@ -280,6 +297,7 @@ test("network failures spool frames and a later publish flushes them first", asy
       url: "http://127.0.0.1:1",
       token: "token",
       person: "alice",
+      device: "laptop",
       fetchFn: rejectingFetch,
       configPath: paths.configPath,
       spoolPath: paths.spoolPath,
@@ -313,6 +331,7 @@ test("network failures spool frames and a later publish flushes them first", asy
         url: relay.url,
         token: "token",
         person: "alice",
+        device: "laptop",
         fetchFn: relay.fetchFn,
         configPath: paths.configPath,
         spoolPath: paths.spoolPath,
@@ -570,5 +589,34 @@ test("consent config supplies device and allowlist while explicit options win", 
   } finally {
     await close(server, relay.bound);
     rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("fromEnv binds hosted team and device identity", () => {
+  const keys = [
+    "PRAXIS_MESH_URL",
+    "PRAXIS_MESH_TOKEN",
+    "PRAXIS_PERSON",
+    "PRAXIS_MESH_TEAM_ID",
+    "PRAXIS_MESH_DEVICE_ID",
+  ] as const;
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.PRAXIS_MESH_URL = "https://mesh.example.test";
+    process.env.PRAXIS_MESH_TOKEN = "hosted-token";
+    process.env.PRAXIS_PERSON = "alice";
+    process.env.PRAXIS_MESH_TEAM_ID = "team-praxis";
+    process.env.PRAXIS_MESH_DEVICE_ID = "device-praxis";
+
+    const publisher = MeshPublisher.fromEnv();
+    assert.ok(publisher);
+    assert.equal(publisher.teamId, "team-praxis");
+    assert.equal(publisher.device, "device-praxis");
+  } finally {
+    for (const key of keys) {
+      const value = previous.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });

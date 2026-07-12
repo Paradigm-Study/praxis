@@ -16,7 +16,22 @@ enum AXSnapshot {
         return copyString(w as! AXUIElement, kAXTitleAttribute)
     }
 
-    static func snapshotFocused() {
+    static func snapshotFocused(policy: NativePolicyChecking) {
+        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+        // Global/source/app policy is checked before the first AX read.
+        guard policy.decision(source: .accessibility, app: app, window: nil, at: Date()).allowed else {
+            return
+        }
+        let window = NSWorkspace.shared.frontmostApplication
+            .flatMap { frontWindowTitle(pid: $0.processIdentifier) } ?? app
+        AcquisitionFence.perform(
+            policy: policy, source: .accessibility, app: app, window: window
+        ) {
+            snapshotAllowed(app: app, window: window)
+        }
+    }
+
+    private static func snapshotAllowed(app: String, window: String) {
         let sys = AXUIElementCreateSystemWide()
         var focused: AnyObject?
         guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
@@ -29,10 +44,6 @@ enum AXSnapshot {
         // An empty field often reports its placeholder as the value — skip those
         // so the reconstructor doesn't treat "Type / for commands" as user input.
         let placeholder = copyString(element, kAXPlaceholderValueAttribute)
-        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-        let window = NSWorkspace.shared.frontmostApplication
-            .flatMap { frontWindowTitle(pid: $0.processIdentifier) } ?? app
-
         if role == "AXTextField" || role == "AXTextArea" || role == "AXComboBox" {
             guard let v = value, v != lastValue else { return }
             let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)

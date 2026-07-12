@@ -15,12 +15,16 @@ import Speech
 ///   - Transcription is forced on-device (`requiresOnDeviceRecognition`) — no
 ///     audio or text leaves the machine through this path.
 public final class AudioCapture: NSObject {
+    private let policy: NativePolicyChecking
     private var systemTap: SystemAudioTap?
     private var micTap: MicTap?
-    private let systemChunker = SpeechChunker(channel: "system")
-    private let micChunker = SpeechChunker(channel: "mic")
+    private let systemChunker: SpeechChunker
+    private let micChunker: SpeechChunker
 
-    public override init() {
+    public init(policy: NativePolicyChecking) {
+        self.policy = policy
+        self.systemChunker = SpeechChunker(channel: "system", policy: policy)
+        self.micChunker = SpeechChunker(channel: "mic", policy: policy)
         super.init()
         // Warm the tracker from the main thread NOW — its first lazy touch
         // otherwise happens on the audio queue at speech onset, and the async
@@ -30,18 +34,34 @@ public final class AudioCapture: NSObject {
 
     /// Idempotently reconcile the running taps with the requested state.
     public func set(system: Bool, mic: Bool) {
-        if system, systemTap == nil {
-            let tap = SystemAudioTap(chunker: systemChunker)
+        FrontmostTracker.shared.refresh()
+        let front = FrontmostTracker.shared.context
+        let allowed = policy.decision(
+            source: .audio, app: front.app, window: front.window, at: Date()
+        ).allowed
+        // SCStream has no audio-only mode and necessarily produces a discarded
+        // 2x2 video stream. Respect the local screen acquisition control too.
+        let screenAllowed = policy.decision(
+            source: .screenVideo, app: front.app, window: front.window, at: Date()
+        ).allowed
+        let enableSystem = system && allowed && screenAllowed
+        let enableMic = mic && allowed
+        if !allowed {
+            systemChunker.discard()
+            micChunker.discard()
+        }
+        if enableSystem, systemTap == nil {
+            let tap = SystemAudioTap(chunker: systemChunker, policy: policy)
             systemTap = tap
             tap.start()
-        } else if !system, let tap = systemTap {
+        } else if !enableSystem, let tap = systemTap {
             tap.stop(); systemTap = nil
         }
-        if mic, micTap == nil {
-            let tap = MicTap(chunker: micChunker)
+        if enableMic, micTap == nil {
+            let tap = MicTap(chunker: micChunker, policy: policy)
             micTap = tap
             tap.start()
-        } else if !mic, let tap = micTap {
+        } else if !enableMic, let tap = micTap {
             tap.stop(); micTap = nil
         }
     }
@@ -76,6 +96,7 @@ final class FrontmostTracker {
     static let shared = FrontmostTracker()
     private let lock = NSLock()
     private var name = "unknown"
+    private var window = "unknown"
 
     private init() {
         if Thread.isMainThread {
@@ -90,13 +111,25 @@ final class FrontmostTracker {
     }
 
     private func update() {
-        let n = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-        lock.lock(); name = n; lock.unlock()
+        let app = NSWorkspace.shared.frontmostApplication
+        let n = app?.localizedName ?? "unknown"
+        let w = app.flatMap { AXSnapshot.frontWindowTitle(pid: $0.processIdentifier) } ?? n
+        lock.lock(); name = n; window = w; lock.unlock()
+    }
+
+    func refresh() {
+        if Thread.isMainThread { update() }
+        else { DispatchQueue.main.async { self.update() } }
     }
 
     var current: String {
         lock.lock(); defer { lock.unlock() }
         return name
+    }
+
+    var context: (app: String, window: String) {
+        lock.lock(); defer { lock.unlock() }
+        return (name, window)
     }
 }
 
@@ -108,6 +141,7 @@ final class FrontmostTracker {
 /// recognizer runs only when something was actually said — zero idle cost.
 final class SpeechChunker {
     let channel: String
+    private let policy: NativePolicyChecking
     private let queue: DispatchQueue
     /// RMS below this is silence. Tuned for normalized float PCM.
     private let silenceRMS: Float = 0.012
@@ -118,10 +152,12 @@ final class SpeechChunker {
     private var spanSec = 0.0
     private var silentSec = 0.0
     private var spanApp = "unknown"
+    private var spanWindow = "unknown"
     private var emittedPlaying = false
 
-    init(channel: String) {
+    init(channel: String, policy: NativePolicyChecking) {
         self.channel = channel
+        self.policy = policy
         self.queue = DispatchQueue(label: "praxis.audio.\(channel)")
     }
 
@@ -129,7 +165,23 @@ final class SpeechChunker {
         queue.async { self.appendLocked(buffer) }
     }
 
+    func discard() {
+        queue.async {
+            self.buffers = []
+            self.spanSec = 0
+            self.silentSec = 0
+            self.emittedPlaying = false
+        }
+    }
+
     private func appendLocked(_ buffer: AVAudioPCMBuffer) {
+        let front = FrontmostTracker.shared.context
+        guard policy.decision(
+            source: .audio, app: front.app, window: front.window, at: Date()
+        ).allowed else {
+            buffers = []; spanSec = 0; silentSec = 0; emittedPlaying = false
+            return
+        }
         let dur = Double(buffer.frameLength) / buffer.format.sampleRate
         let rms = AudioCaptureMath.rms(buffer)
         let audible = rms > silenceRMS
@@ -144,7 +196,11 @@ final class SpeechChunker {
         }
 
         if audible {
-            if buffers.isEmpty { spanApp = FrontmostTracker.shared.current }
+            if buffers.isEmpty {
+                let front = FrontmostTracker.shared.context
+                spanApp = front.app
+                spanWindow = front.window
+            }
             buffers.append(buffer)
             spanSec += dur
             silentSec = 0
@@ -164,8 +220,12 @@ final class SpeechChunker {
     }
 
     private func emitPlayback(_ playing: Bool, level: Float) {
+        let front = FrontmostTracker.shared.context
+        guard policy.decision(
+            source: .audio, app: front.app, window: front.window, at: Date()
+        ).allowed else { return }
         Emitter.shared.emit(
-            source: "audio", app: FrontmostTracker.shared.current,
+            source: "audio", app: front.app,
             window: channel, type: "playback_state",
             payload: ["channel": channel, "playing": playing,
                       "level": Double(round(level * 1000) / 1000)]
@@ -175,10 +235,14 @@ final class SpeechChunker {
     private func flushLocked() {
         let chunk = buffers
         let app = spanApp
+        let window = spanWindow
         buffers = []; spanSec = 0; silentSec = 0
         guard !chunk.isEmpty else { return }
         Transcriber.shared.transcribe(chunk) { [channel] text, confidence, lang in
             guard let text, !text.isEmpty else { return }
+            guard self.policy.decision(
+                source: .audio, app: app, window: window, at: Date()
+            ).allowed else { return }
             Emitter.shared.emit(
                 source: "audio", app: app, window: channel,
                 type: "transcript_segment",
@@ -288,15 +352,24 @@ final class Transcriber {
 /// to the minimum the API allows and its frames are discarded unread.
 final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
     private let chunker: SpeechChunker
+    private let policy: NativePolicyChecking
     private var stream: SCStream?
     private let queue = DispatchQueue(label: "praxis.audio.scstream")
 
-    init(chunker: SpeechChunker) {
+    init(chunker: SpeechChunker, policy: NativePolicyChecking) {
         self.chunker = chunker
+        self.policy = policy
         super.init()
     }
 
     func start() {
+        let front = FrontmostTracker.shared.context
+        guard policy.decision(
+            source: .audio, app: front.app, window: front.window, at: Date()
+        ).allowed,
+        policy.decision(
+            source: .screenVideo, app: front.app, window: front.window, at: Date()
+        ).allowed else { return }
         Task {
             do {
                 let content = try await SCShareableContent.current
@@ -320,6 +393,13 @@ final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
                 // output it logs a dropped-frame error PER FRAME. Register one
                 // and discard its frames.
                 try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+                let current = FrontmostTracker.shared.context
+                guard self.policy.decision(
+                    source: .audio, app: current.app, window: current.window, at: Date()
+                ).allowed,
+                self.policy.decision(
+                    source: .screenVideo, app: current.app, window: current.window, at: Date()
+                ).allowed else { return }
                 try await s.startCapture()
                 stream = s
                 log("audio: system-output tap started")
@@ -338,7 +418,11 @@ final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        guard type == .audio, sampleBuffer.isValid,
+        let front = FrontmostTracker.shared.context
+        guard policy.decision(
+                source: .audio, app: front.app, window: front.window, at: Date()
+              ).allowed,
+              type == .audio, sampleBuffer.isValid,
               let pcm = AudioCaptureMath.pcmBuffer(from: sampleBuffer) else { return }
         chunker.append(pcm)
     }
@@ -353,10 +437,12 @@ final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
 
 final class MicTap {
     private let chunker: SpeechChunker
+    private let policy: NativePolicyChecking
     private var engine: AVAudioEngine?
 
-    init(chunker: SpeechChunker) {
+    init(chunker: SpeechChunker, policy: NativePolicyChecking) {
         self.chunker = chunker
+        self.policy = policy
     }
 
     func start() {
@@ -367,6 +453,10 @@ final class MicTap {
     }
 
     private func startEngine() {
+        let front = FrontmostTracker.shared.context
+        guard policy.decision(
+            source: .audio, app: front.app, window: front.window, at: Date()
+        ).allowed else { return }
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -376,8 +466,13 @@ final class MicTap {
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             // The engine reuses the tap buffer after the block returns; copy
             // before the chunker holds it across its async queue.
+            guard let self else { return }
+            let front = FrontmostTracker.shared.context
+            guard self.policy.decision(
+                source: .audio, app: front.app, window: front.window, at: Date()
+            ).allowed else { return }
             guard let copy = AudioCaptureMath.copy(buffer) else { return }
-            self?.chunker.append(copy)
+            self.chunker.append(copy)
         }
         do {
             try engine.start()

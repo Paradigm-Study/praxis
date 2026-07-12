@@ -42,8 +42,10 @@ export class NativeCaptureSource implements CaptureSource {
       command?: string;
       args?: string[];
       packagePath?: string;
+      policyPath?: string;
     } = {},
   ) {
+    this.#policyPath = opts.policyPath;
     const pkg = opts.packagePath ?? "native/PraxisCapture";
     if (opts.command) {
       this.#cmd = opts.command;
@@ -71,9 +73,22 @@ export class NativeCaptureSource implements CaptureSource {
     this.#args = opts.args ?? ["run", "--package-path", pkg, "praxis-capture"];
   }
 
+  #policyPath: string | undefined;
+
   start(sink: EventSink): void {
     log.info(`spawning native client: ${this.#cmd} ${this.#args.join(" ")}`);
-    const proc = spawn(this.#cmd, this.#args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(this.#cmd, this.#args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ...(this.#policyPath
+          ? {
+              PRAXIS_NATIVE_POLICY_PATH: this.#policyPath,
+              PRAXIS_NATIVE_POLICY_MODE: "required",
+            }
+          : {}),
+      },
+    });
     this.#proc = proc;
 
     if (proc.stdout) {

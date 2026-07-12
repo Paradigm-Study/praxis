@@ -15,7 +15,13 @@ import type { Store } from "../src/storage/index.ts";
 // from the relay and MUST fail open to empty on any problem.
 // ---------------------------------------------------------------------------
 
-const MESH_ENV = ["PRAXIS_MESH_URL", "PRAXIS_MESH_TOKEN", "PRAXIS_PERSON"] as const;
+const MESH_ENV = [
+  "PRAXIS_MESH_URL",
+  "PRAXIS_MESH_TOKEN",
+  "PRAXIS_PERSON",
+  "PRAXIS_MESH_TEAM_ID",
+  "PRAXIS_MESH_DEVICE_ID",
+] as const;
 const savedEnv = new Map<string, string | undefined>();
 
 beforeEach(() => {
@@ -165,12 +171,19 @@ describe("buildBrief — mesh half (relay, fail open)", () => {
     process.env.PRAXIS_MESH_URL = "http://127.0.0.1:4600/"; // trailing slash on purpose
     process.env.PRAXIS_MESH_TOKEN = "tok-alex";
     process.env.PRAXIS_PERSON = "alex";
+    process.env.PRAXIS_MESH_TEAM_ID = "team-praxis";
+    process.env.PRAXIS_MESH_DEVICE_ID = "device-praxis";
 
     let url = "";
     let auth = "";
+    let teamId = "";
+    let deviceId = "";
     const fetchFn: typeof fetch = async (input, init) => {
       url = String(input);
-      auth = String(new Headers(init?.headers).get("authorization"));
+      const headers = new Headers(init?.headers);
+      auth = String(headers.get("authorization"));
+      teamId = String(headers.get("x-mesh-team-id"));
+      deviceId = String(headers.get("x-mesh-device-id"));
       return new Response(JSON.stringify(RELAY_BRIEF));
     };
 
@@ -185,6 +198,8 @@ describe("buildBrief — mesh half (relay, fail open)", () => {
       "the absolute cwd must never leave the machine (username/home-layout leak)",
     );
     assert.equal(auth, "Bearer tok-alex");
+    assert.equal(teamId, "team-praxis");
+    assert.equal(deviceId, "device-praxis");
     assert.equal(brief.teammates.length, 1);
     assert.equal(brief.teammates[0]!.person, "kim");
   });
