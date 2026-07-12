@@ -2,6 +2,13 @@
 -- Pragmas (WAL etc.) are applied in db.ts; this file is pure DDL so it can also
 -- run against an in-memory database during tests.
 
+-- Storage/migration metadata. `PRAGMA user_version` versions SQL shape; this
+-- table tracks orthogonal content migrations such as encryption key versions.
+CREATE TABLE IF NOT EXISTS praxis_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 -- Layer 1/2 — the raw event ledger. This is the source of truth.
 CREATE TABLE IF NOT EXISTS raw_events (
   id           TEXT PRIMARY KEY,

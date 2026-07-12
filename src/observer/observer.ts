@@ -4,6 +4,10 @@ import { nowIso } from "../core/time.ts";
 import { renderBundle } from "./bundle.ts";
 import { GeminiObserver } from "./gemini.ts";
 import { logger } from "../core/log.ts";
+import type { Store } from "../storage/index.ts";
+import { PrivacyControlStore } from "../privacy/control.ts";
+import { EgressAuditor } from "../privacy/egress.ts";
+import { sha256 } from "../core/hash.ts";
 
 const log = logger("observer");
 
@@ -21,6 +25,7 @@ export interface ObserveOptions {
  */
 export interface Observer {
   readonly model: string;
+  readonly remote?: boolean;
   /** True if this observer should be given base64 frame images in the bundle. */
   readonly wantsImages?: boolean;
   observe(bundle: ContextBundle, opts?: ObserveOptions): Promise<Observation>;
@@ -172,13 +177,22 @@ const OBSERVE_TOOL = {
 } as const;
 
 export class AnthropicObserver implements Observer {
+  readonly remote = true;
   readonly model: string;
-  readonly wantsImages = true;
+  readonly wantsImages: boolean;
   #apiKey: string;
+  #auditor: EgressAuditor;
 
-  constructor(opts: { apiKey: string; model?: string }) {
+  constructor(opts: {
+    apiKey: string;
+    model?: string;
+    auditor?: EgressAuditor;
+    includeImages?: boolean;
+  }) {
     this.#apiKey = opts.apiKey;
     this.model = opts.model ?? "claude-opus-4-8";
+    this.#auditor = opts.auditor ?? EgressAuditor.forStore();
+    this.wantsImages = opts.includeImages ?? true;
   }
 
   async observe(bundle: ContextBundle, opts: ObserveOptions = {}): Promise<Observation> {
@@ -209,25 +223,34 @@ export class AnthropicObserver implements Observer {
     }));
     content.push({ type: "text", text: userText });
 
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const requestBody = JSON.stringify({
+      model: this.model,
+      max_tokens: 1024,
+      system,
+      tools: [OBSERVE_TOOL],
+      tool_choice: { type: "tool", name: OBSERVE_TOOL.name },
+      messages: [{ role: "user", content }],
+    });
+    let res: Response;
+    try {
+      res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-api-key": this.#apiKey,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({
-        model: this.model,
-        max_tokens: 1024,
-        system,
-        tools: [OBSERVE_TOOL],
-        tool_choice: { type: "tool", name: OBSERVE_TOOL.name },
-        messages: [{ role: "user", content }],
-      }),
-    });
+        body: requestBody,
+      });
+    } catch (error) {
+      this.#audit(requestBody, bundle, "failed", undefined, String(error));
+      throw error;
+    }
     if (!res.ok) {
+      this.#audit(requestBody, bundle, "failed", res.status, res.statusText);
       throw new Error(`Anthropic API ${res.status}: ${await res.text()}`);
     }
+    this.#audit(requestBody, bundle, "succeeded", res.status);
     const data = (await res.json()) as {
       content: Array<{ type: string; input?: Record<string, unknown> }>;
     };
@@ -258,6 +281,32 @@ export class AnthropicObserver implements Observer {
       createdTs: opts.now ?? nowIso(),
     };
   }
+
+  #audit(
+    body: string,
+    bundle: ContextBundle,
+    outcome: "succeeded" | "failed",
+    status?: number,
+    error?: string,
+  ): void {
+    this.#auditor.record({
+      destination: "https://api.anthropic.com",
+      purpose: "remote_observer",
+      categories: [
+        "reconstructed_actions",
+        "screen_ocr",
+        "accessibility_text",
+        "terminal_context",
+        "audio_transcript",
+        ...(bundle.frameImages?.length ? ["screenshots"] : []),
+      ],
+      bytes: Buffer.byteLength(body),
+      digest: sha256(body),
+      outcome,
+      ...(status !== undefined ? { status } : {}),
+      ...(error ? { error } : {}),
+    });
+  }
 }
 
 function str(v: unknown): string | undefined {
@@ -273,23 +322,48 @@ function arr(v: unknown): string[] {
  * PRAXIS_OBSERVER_MODEL picks the model. Gemini is OPT-IN only — it sends the
  * bounded screen context to Google instead of Anthropic.
  */
-export function defaultObserver(): Observer {
+export function defaultObserver(store?: Store): Observer {
   const apiKey =
     process.env.PRAXIS_ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY;
   const pref = process.env.PRAXIS_OBSERVER;
+  const privacy = store ? PrivacyControlStore.forStore(store).read() : undefined;
+  const cloudAllowed = privacy?.cloudObserverConsent === true;
+  const auditor = EgressAuditor.forStore(store);
+  if ((pref === "anthropic" || pref === "gemini" || apiKey) && !cloudAllowed) {
+    log.warn("remote observer available but privacy consent is off — using offline mock");
+    auditor.record({
+      destination: pref === "gemini" ? "https://generativelanguage.googleapis.com" : "https://api.anthropic.com",
+      purpose: "remote_observer",
+      categories: ["reconstructed_actions", "screen_context"],
+      bytes: 0,
+      outcome: "blocked",
+      error: "cloudObserverConsent is false",
+    });
+    return new MockObserver();
+  }
   if (pref === "gemini") {
     const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
     if (geminiKey) {
       const model = process.env.PRAXIS_GEMINI_MODEL;
       log.info(`using Gemini observer${model ? ` (${model})` : ""}`);
-      return new GeminiObserver({ apiKey: geminiKey, ...(model ? { model } : {}) });
+      return new GeminiObserver({
+        apiKey: geminiKey,
+        ...(model ? { model } : {}),
+        auditor,
+        includeImages: privacy?.screenshotConsent === true,
+      });
     }
     log.warn("PRAXIS_OBSERVER=gemini but no GEMINI_API_KEY found — falling through");
   }
   if (pref !== "mock" && apiKey) {
     const model = process.env.PRAXIS_OBSERVER_MODEL;
     log.info(`using Anthropic observer${model ? ` (${model})` : ""}`);
-    return new AnthropicObserver({ apiKey, ...(model ? { model } : {}) });
+    return new AnthropicObserver({
+      apiKey,
+      ...(model ? { model } : {}),
+      auditor,
+      includeImages: privacy?.screenshotConsent === true,
+    });
   }
   if (pref === "anthropic" && !apiKey) {
     log.warn("PRAXIS_OBSERVER=anthropic but no API key found — using mock");

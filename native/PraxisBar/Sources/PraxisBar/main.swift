@@ -223,6 +223,9 @@ final class PraxisBar: NSObject, NSApplicationDelegate, NSMenuDelegate,
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "content-type")
+            if let token = ProcessInfo.processInfo.environment["PRAXIS_LOCAL_TOKEN"] {
+                req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
             URLSession.shared.dataTask(with: req) { _, resp, _ in
                 let ok = (resp as? HTTPURLResponse)?.statusCode == 200
@@ -361,6 +364,9 @@ final class PraxisBar: NSObject, NSApplicationDelegate, NSMenuDelegate,
         let probe = URL(string: "http://localhost:\(studioPort)/api/status")!
         var req = URLRequest(url: probe)
         req.timeoutInterval = 0.5
+        if let token = ProcessInfo.processInfo.environment["PRAXIS_LOCAL_TOKEN"] {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        }
         URLSession.shared.dataTask(with: req) { [weak self] _, resp, _ in
             guard let self else { return }
             let ready = (resp as? HTTPURLResponse)?.statusCode == 200
@@ -378,7 +384,7 @@ final class PraxisBar: NSObject, NSApplicationDelegate, NSMenuDelegate,
 
     @objc private func toggleProxy() {
         if running(proxy) { stop(&proxy) }
-        else { proxy = node("proxy", ["--port=\(proxyPort)"], log: "proxy") }
+        else { proxy = node("proxy", ["--enable", "--port=\(proxyPort)"], log: "proxy") }
         rebuildMenu()
     }
 

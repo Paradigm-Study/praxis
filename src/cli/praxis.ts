@@ -27,6 +27,11 @@ import { bold, conf, cyan, dim, gray, green, header, red, yellow } from "./rende
 import { consolidate, evidenceCoverage, applyCorrections } from "../memory/consolidate.ts";
 import { renderSkill, skillStats } from "../transfer/skill.ts";
 import { nowIso } from "../core/time.ts";
+import { EgressAuditor } from "../privacy/egress.ts";
+import { PrivacyControlStore } from "../privacy/control.ts";
+import { createBackup, restoreBackup, verifyBackup } from "../storage/backup.ts";
+import { doctorStore } from "../storage/doctor.ts";
+import { rotateMasterKey } from "../storage/crypto.ts";
 
 // Load <project>/.env (e.g. ANTHROPIC_API_KEY for the model-backed observer).
 loadEnvFile(join(import.meta.dirname, "..", "..", ".env"));
@@ -71,6 +76,14 @@ async function main(): Promise<void> {
       return cmdStatus();
     case "reset":
       return cmdReset();
+    case "doctor":
+      return cmdDoctor();
+    case "backup":
+      return cmdBackup();
+    case "restore":
+      return cmdRestore();
+    case "rotate-key":
+      return cmdRotateKey();
     case "hook":
       process.stdout.write(ZSH_HOOK + "\n");
       return;
@@ -96,13 +109,80 @@ function usage(): void {
       `  ${green("ab")}           A/B two observers on the same real windows  [--rounds=3 --judge --step=15]\n` +
       `  ${green("status")}       Show ledger counts\n` +
       `  ${green("reset")}        Clear derived data (or everything with --all) + vacuum\n` +
+      `  ${green("doctor")}       Check DB/WAL/blobs/permissions/spools  [--repair]\n` +
+      `  ${green("backup")}       Create and verify an encrypted store backup  [--out=PATH]\n` +
+      `  ${green("restore")}      Verify + restore a backup with rollback  --from=PATH\n` +
+      `  ${green("rotate-key")}   Rotate the local master key and re-encrypt stored content\n` +
       `  ${green("profile")}      Show your consolidated profile  [--all]\n` +
       `  ${green("export-skill")} Export your profile as a portable SKILL.md  [--out=PATH --name= --title= --durable-only]\n` +
       `  ${green("studio")}       Launch Praxis Studio (web UI)  [--port=4319]\n` +
-      `  ${green("proxy")}        Run the AI proxy that records prompts/responses  [--port=4318 --upstream=...]\n` +
+      `  ${green("proxy")}        Run the AI proxy that records prompts/responses  [--enable --port=4318 --upstream=...]\n` +
       `  ${green("hook")}         Print the zsh hook for terminal capture\n\n` +
       `${dim("Data dir: $PRAXIS_DATA_DIR or ./data")}\n`,
   );
+}
+
+function dataDirFlag(): string {
+  return flagVal("--data") ?? defaultDataDir();
+}
+
+function cmdDoctor(): void {
+  const store = openStore({ dir: dataDirFlag() });
+  try {
+    const report = doctorStore(store, { repair: has("--repair") });
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.ok) process.exitCode = 1;
+  } finally {
+    store.close();
+  }
+}
+
+function cmdBackup(): void {
+  const store = openStore({ dir: dataDirFlag() });
+  try {
+    const path = createBackup(store, flagVal("--out"));
+    const verification = verifyBackup(path);
+    if (!verification.ok) throw new Error(verification.errors.join("; "));
+    process.stdout.write(`${green("✓")} backup verified: ${path}\n`);
+  } finally {
+    store.close();
+  }
+}
+
+function cmdRestore(): void {
+  const source = flagVal("--from");
+  if (!source) {
+    process.stderr.write(`${red("✗")} restore requires --from=PATH\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const dir = dataDirFlag();
+  const result = restoreBackup(source, dir);
+  const verification = openStore({ dir });
+  try {
+    const report = doctorStore(verification);
+    if (!report.ok) throw new Error("restored store failed doctor checks");
+  } finally {
+    verification.close();
+  }
+  process.stdout.write(
+    `${green("✓")} restored ${source}; pre-restore backup: ${result.preRestoreBackup}\n`,
+  );
+}
+
+function cmdRotateKey(): void {
+  const dir = dataDirFlag();
+  const before = openStore({ dir });
+  before.close();
+  const keyring = rotateMasterKey(dir);
+  const rotated = openStore({ dir }); // startup content migration performs rotation
+  try {
+    const report = doctorStore(rotated);
+    if (!report.ok) throw new Error("rotated store failed doctor checks");
+    process.stdout.write(`${green("✓")} active master key is now v${keyring.activeVersion}\n`);
+  } finally {
+    rotated.close();
+  }
 }
 
 async function cmdDemo(): Promise<void> {
@@ -176,7 +256,7 @@ function runStage(stage: "reconstruct" | "fuse" | "graph"): void {
 
 async function cmdObserve(): Promise<void> {
   const store = openStore();
-  const observer = defaultObserver();
+  const observer = defaultObserver(store);
   const bundle = buildBundle(store, {
     windowSeconds: Number(flagVal("--window") ?? 120),
     includeImages: observer.wantsImages,
@@ -250,7 +330,7 @@ async function cmdCapture(): Promise<void> {
     const useModel = flagVal("--observer") === "anthropic";
     const loop = new AgentLoop(store, {
       learnerMode: has("--learner"),
-      observer: useModel ? defaultObserver() : new MockObserver(),
+      observer: useModel ? defaultObserver(store) : new MockObserver(),
       // Speak up proactively, but only when it matters (≤1 every 5 min). The
       // menu-bar app tails this file and posts the native notification with the
       // candidate answers as buttons + a free-text box.
@@ -305,10 +385,28 @@ async function cmdAb(): Promise<void> {
   }
 
   const store = openStore(flagVal("--data") ? { dir: flagVal("--data")! } : {});
+  const privacy = PrivacyControlStore.forStore(store).read();
+  if (!privacy.cloudObserverConsent) {
+    process.stderr.write(`${red("✗")} ab requires cloud observer consent in Praxis privacy settings\n`);
+    store.close();
+    process.exitCode = 1;
+    return;
+  }
   const claudeModel = process.env.PRAXIS_OBSERVER_MODEL ?? "claude-haiku-4-5";
   const geminiModel = process.env.PRAXIS_GEMINI_MODEL ?? "gemini-3.5-flash";
-  const a = new AnthropicObserver({ apiKey: anthropicKey, model: claudeModel });
-  const b = new GeminiObserver({ apiKey: geminiKey, model: geminiModel });
+  const auditor = EgressAuditor.forStore(store);
+  const a = new AnthropicObserver({
+    apiKey: anthropicKey,
+    model: claudeModel,
+    auditor,
+    includeImages: privacy.screenshotConsent,
+  });
+  const b = new GeminiObserver({
+    apiKey: geminiKey,
+    model: geminiModel,
+    auditor,
+    includeImages: privacy.screenshotConsent,
+  });
 
   // Published per-1M-token prices, verified 2026-06-11 (ai.google.dev/pricing,
   // platform.claude.com). Image tokens ≈ one 864×558 frame: Anthropic w*h/750;
@@ -509,6 +607,13 @@ function cmdExportSkill(): void {
 }
 
 async function cmdProxy(): Promise<void> {
+  if (!has("--enable") && process.env.PRAXIS_PROXY_ENABLED !== "1") {
+    process.stderr.write(
+      `${red("✗")} proxy is disabled by default; pass --enable or set PRAXIS_PROXY_ENABLED=1\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
   const store = openStore(flagVal("--data") ? { dir: flagVal("--data")! } : {});
   const source = new AiProxySource();
   const ingest = makeIngest(store);

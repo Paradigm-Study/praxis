@@ -15,6 +15,7 @@ import { maybeDispatch } from "./dispatch.ts";
 import { MeshPublisher } from "../mesh/publisher.ts";
 import type { AskHandler } from "./notify.ts";
 import { logger } from "../core/log.ts";
+import { RuntimeStatusStore } from "../capture/runtimeStatus.ts";
 
 const log = logger("agent");
 
@@ -80,10 +81,12 @@ export class AgentLoop {
   #publishedEpisodes = new Set<string>();
   /** Episode ids announced as active while still open. */
   #announcedEpisodes = new Set<string>();
+  #runtime: RuntimeStatusStore;
 
   constructor(store: Store, opts: AgentLoopOptions = {}) {
     this.#store = store;
-    this.#observer = opts.observer ?? defaultObserver();
+    this.#runtime = RuntimeStatusStore.forStore(store);
+    this.#observer = opts.observer ?? defaultObserver(store);
     this.#newId = opts.newId ?? defaultNewId;
     this.#learnerMode = opts.learnerMode ?? false;
     this.#onDecision = opts.onDecision;
@@ -151,6 +154,13 @@ export class AgentLoop {
 
     const latest = episodes[episodes.length - 1];
     if (!latest || !this.#shouldObserve(latest, Date.now())) return undefined;
+    const resources = this.#runtime.read().resources;
+    if (
+      this.#observer.remote &&
+      (resources.suspended || (resources.batteryAware && resources.powerSource === "battery"))
+    ) {
+      return undefined;
+    }
     this.#lastObserveTs = Date.now();
     this.#observed.set(latest.id, latest.actions.length);
 

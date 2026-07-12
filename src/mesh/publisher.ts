@@ -12,9 +12,12 @@ import { basename, dirname, join } from "node:path";
 import type { Episode } from "../core/types.ts";
 import { logger } from "../core/log.ts";
 import { defaultDataDir, type Store } from "../storage/index.ts";
-import { redactWorkFrame } from "./redact.ts";
+import { redactMeshFrame } from "./redact.ts";
 import type { MeshFrame, WorkFrame, WorkFrameStatus } from "./types.ts";
 import { episodeToWorkFrame, normalizeRepoUrl } from "./workframe.ts";
+import { EgressAuditor } from "../privacy/egress.ts";
+import { PrivacyControlStore } from "../privacy/control.ts";
+import { sha256 } from "../core/hash.ts";
 
 const log = logger("mesh");
 
@@ -47,6 +50,8 @@ export interface MeshPublisherOptions {
   configPath?: string;
   /** Defaults to the Praxis data directory's mesh outbox spool. */
   spoolPath?: string;
+  /** Metadata-only egress audit. */
+  auditor?: EgressAuditor;
 }
 
 export interface PublishResult {
@@ -109,6 +114,7 @@ export class MeshPublisher {
   protected fetchFn: typeof fetch;
   protected projects: string[] | undefined;
   protected spoolPath: string;
+  protected auditor: EgressAuditor;
   /**
    * Serializes publish()/flushSpool() runs. Concurrent publishes (the agent
    * loop fire-and-forgets several per tick) would otherwise both read the same
@@ -136,6 +142,7 @@ export class MeshPublisher {
         : [...config.projects];
     this.spoolPath = opts.spoolPath
       ?? join(defaultDataDir(), "mesh-outbox-spool.ndjson");
+    this.auditor = opts.auditor ?? EgressAuditor.forStore(opts.store);
   }
 
   /**
@@ -147,7 +154,10 @@ export class MeshPublisher {
     const token = process.env.PRAXIS_MESH_TOKEN;
     const person = process.env.PRAXIS_PERSON;
     if (!url || !token || !person) return undefined;
-    return new MeshPublisher({ url, token, person, store });
+    const projects = store ? PrivacyControlStore.forStore(store).read().meshProjects : [];
+    // Environment credentials alone no longer grant every project: the
+    // versioned privacy control carries affirmative per-project consent.
+    return new MeshPublisher({ url, token, person, store, projects });
   }
 
   /**
@@ -217,6 +227,7 @@ export class MeshPublisher {
 
   private async publishNow(frame: MeshFrame): Promise<PublishResult> {
     try {
+      const outbound = redactMeshFrame(frame);
       try {
         await this.flushSpool();
       } catch (error) {
@@ -225,10 +236,12 @@ export class MeshPublisher {
         log.warn("mesh spool flush failed open", errorMessage(error));
       }
 
-      const attempt = await this.postFrame(frame);
+      const attempt = await this.postFrame(outbound);
       if (!attempt.ok && attempt.networkFailure) {
         try {
-          this.appendToSpool(frame);
+          // Persist the exact redacted wire projection, never the richer caller
+          // object. Retry storage is itself a privacy boundary.
+          this.appendToSpool(outbound);
         } catch (error) {
           log.warn("mesh frame could not be written to spool", errorMessage(error));
         }
@@ -289,8 +302,20 @@ export class MeshPublisher {
     // The wire boundary IS a redaction boundary: whatever frame a caller hands
     // publish(), workframes re-pass the redactor (whitelist projection — extra
     // fields and secret-shaped strings never serialize).
-    const outbound: MeshFrame =
-      frame.kind === "workframe" ? redactWorkFrame(frame) : frame;
+    const outbound = redactMeshFrame(frame);
+    const body = JSON.stringify(outbound);
+    const audit = (outcome: "succeeded" | "failed", status?: number, error?: string) =>
+      this.auditor.record({
+        destination: this.url,
+        purpose: "mesh_publish",
+        categories: ["work_metadata", "artifact_paths", "evidence_hashes"],
+        bytes: Buffer.byteLength(body),
+        digest: sha256(body),
+        redaction: "mesh-v0",
+        outcome,
+        ...(status !== undefined ? { status } : {}),
+        ...(error ? { error } : {}),
+      });
     let response: Response;
     try {
       response = await this.fetchFn(`${this.url}/outbox/${this.person}`, {
@@ -299,9 +324,10 @@ export class MeshPublisher {
           "content-type": "application/json",
           authorization: `Bearer ${this.token}`,
         },
-        body: JSON.stringify(outbound),
+        body,
       });
     } catch (error) {
+      audit("failed", undefined, errorMessage(error));
       return {
         ok: false,
         error: errorMessage(error),
@@ -313,6 +339,7 @@ export class MeshPublisher {
     try {
       text = await response.text();
     } catch (error) {
+      audit("failed", response.status, `response read: ${errorMessage(error)}`);
       return {
         ok: false,
         error: `relay response read failed: ${errorMessage(error)}`,
@@ -322,6 +349,7 @@ export class MeshPublisher {
 
     if (!response.ok) {
       const detail = text.trim() || response.statusText || "request failed";
+      audit("failed", response.status, detail);
       return {
         ok: false,
         error: `http ${response.status}: ${detail}`,
@@ -337,18 +365,21 @@ export class MeshPublisher {
         && (payload as Record<string, unknown>).ok === true
         && typeof (payload as Record<string, unknown>).seq === "number"
       ) {
+        audit("succeeded", response.status);
         return {
           ok: true,
           seq: (payload as Record<string, number>).seq,
           networkFailure: false,
         };
       }
+      audit("failed", response.status, "invalid relay response");
       return {
         ok: false,
         error: "invalid relay response",
         networkFailure: false,
       };
     } catch (error) {
+      audit("failed", response.status, errorMessage(error));
       return {
         ok: false,
         error: `invalid relay response: ${errorMessage(error)}`,

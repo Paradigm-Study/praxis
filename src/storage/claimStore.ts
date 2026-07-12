@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Claim, ClaimKind } from "../core/types.ts";
-import { fromJsonArray, toJson } from "./rows.ts";
+import { fromJsonArray, sensitiveText, toJson } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface ClaimStore {
   put(c: Claim): void;
@@ -12,11 +13,11 @@ export interface ClaimStore {
   count(): number;
 }
 
-function rowToClaim(row: Record<string, unknown>): Claim {
+function rowToClaim(row: Record<string, unknown>, cipher?: StorageCipher): Claim {
   return {
     id: row.id as string,
     kind: row.kind as ClaimKind,
-    text: row.text as string,
+    text: cipher?.decryptText(row.text, "claims.text") ?? (row.text as string),
     confidence: Number(row.confidence),
     evidenceEpisodes: fromJsonArray(row.evidence_episode_ids),
     createdTs: row.created_ts as string,
@@ -24,7 +25,7 @@ function rowToClaim(row: Record<string, unknown>): Claim {
   };
 }
 
-export function makeClaimStore(db: DatabaseSync): ClaimStore {
+export function makeClaimStore(db: DatabaseSync, cipher?: StorageCipher): ClaimStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO claims
        (id, kind, text, confidence, evidence_episode_ids, created_ts, updated_ts)
@@ -41,7 +42,7 @@ export function makeClaimStore(db: DatabaseSync): ClaimStore {
       insert.run(
         c.id,
         c.kind,
-        c.text,
+        sensitiveText(c.text, cipher, "claims.text"),
         c.confidence,
         toJson(c.evidenceEpisodes),
         c.createdTs,
@@ -50,23 +51,23 @@ export function makeClaimStore(db: DatabaseSync): ClaimStore {
     },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
-      return row ? rowToClaim(row) : undefined;
+      return row ? rowToClaim(row, cipher) : undefined;
     },
     all() {
       const rows = db
         .prepare(`SELECT * FROM claims ORDER BY confidence DESC`)
         .all() as Record<string, unknown>[];
-      return rows.map(rowToClaim);
+      return rows.map((row) => rowToClaim(row, cipher));
     },
     byKind(kind) {
       const rows = db
         .prepare(`SELECT * FROM claims WHERE kind = ? ORDER BY confidence DESC`)
         .all(kind) as Record<string, unknown>[];
-      return rows.map(rowToClaim);
+      return rows.map((row) => rowToClaim(row, cipher));
     },
     findByText(kind, text) {
-      const row = byText.get(kind, text) as Record<string, unknown> | undefined;
-      return row ? rowToClaim(row) : undefined;
+      const row = byText.get(kind, sensitiveText(text, cipher, "claims.text")) as Record<string, unknown> | undefined;
+      return row ? rowToClaim(row, cipher) : undefined;
     },
     count() {
       return (counter.get() as { n: number }).n;

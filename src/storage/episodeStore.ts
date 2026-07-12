@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { BoundaryReason, Episode } from "../core/types.ts";
-import { fromJsonArray, fromJsonObject, strOrUndef, toJson } from "./rows.ts";
+import { fromJsonArray, fromJsonObject, sensitiveText, strOrUndef, toJson } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface EpisodeStore {
   put(e: Episode): void;
@@ -12,25 +13,25 @@ export interface EpisodeStore {
   count(): number;
 }
 
-function rowToEpisode(row: Record<string, unknown>): Episode {
+function rowToEpisode(row: Record<string, unknown>, cipher?: StorageCipher): Episode {
   return {
     id: row.id as string,
     type: "context_episode",
     startTs: row.start_ts as string,
     endTs: row.end_ts as string,
-    summary: row.summary as string,
-    goal: strOrUndef(row.goal),
+    summary: cipher?.decryptText(row.summary, "episodes.summary") ?? (row.summary as string),
+    goal: strOrUndef(row.goal, cipher, "episodes.goal"),
     actions: fromJsonArray(row.evidence_action_ids),
-    artifacts: fromJsonArray(row.artifacts),
-    decisionPoints: fromJsonArray(row.decision_points),
-    rejectedPaths: fromJsonArray(row.rejected_paths),
-    uncertainty: fromJsonArray(row.uncertainty),
+    artifacts: fromJsonArray(row.artifacts, cipher, "episodes.artifacts"),
+    decisionPoints: fromJsonArray(row.decision_points, cipher, "episodes.decision_points"),
+    rejectedPaths: fromJsonArray(row.rejected_paths, cipher, "episodes.rejected_paths"),
+    uncertainty: fromJsonArray(row.uncertainty, cipher, "episodes.uncertainty"),
     boundaryReason: strOrUndef(row.boundary_reason) as BoundaryReason | undefined,
-    payload: fromJsonObject(row.payload_json),
+    payload: fromJsonObject(row.payload_json, cipher, "episodes.payload_json"),
   };
 }
 
-export function makeEpisodeStore(db: DatabaseSync): EpisodeStore {
+export function makeEpisodeStore(db: DatabaseSync, cipher?: StorageCipher): EpisodeStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO episodes
        (id, start_ts, end_ts, summary, goal, evidence_action_ids, artifacts,
@@ -45,15 +46,15 @@ export function makeEpisodeStore(db: DatabaseSync): EpisodeStore {
       e.id,
       e.startTs,
       e.endTs,
-      e.summary,
-      e.goal ?? null,
+      sensitiveText(e.summary, cipher, "episodes.summary"),
+      sensitiveText(e.goal, cipher, "episodes.goal"),
       toJson(e.actions),
-      toJson(e.artifacts),
-      toJson(e.decisionPoints),
-      toJson(e.rejectedPaths),
-      toJson(e.uncertainty),
+      toJson(e.artifacts, cipher, "episodes.artifacts"),
+      toJson(e.decisionPoints, cipher, "episodes.decision_points"),
+      toJson(e.rejectedPaths, cipher, "episodes.rejected_paths"),
+      toJson(e.uncertainty, cipher, "episodes.uncertainty"),
       e.boundaryReason ?? null,
-      e.payload ? toJson(e.payload) : null,
+      e.payload ? toJson(e.payload, cipher, "episodes.payload_json") : null,
     );
   }
 
@@ -71,26 +72,26 @@ export function makeEpisodeStore(db: DatabaseSync): EpisodeStore {
     },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
-      return row ? rowToEpisode(row) : undefined;
+      return row ? rowToEpisode(row, cipher) : undefined;
     },
     all() {
       const rows = db
         .prepare(`SELECT * FROM episodes ORDER BY start_ts ASC`)
         .all() as Record<string, unknown>[];
-      return rows.map(rowToEpisode);
+      return rows.map((row) => rowToEpisode(row, cipher));
     },
     byIds(ids) {
       if (ids.length === 0) return [];
       const rows = db
         .prepare(`SELECT * FROM episodes WHERE id IN (${ids.map(() => "?").join(",")})`)
         .all(...ids) as Record<string, unknown>[];
-      return rows.map(rowToEpisode);
+      return rows.map((row) => rowToEpisode(row, cipher));
     },
     latest(n = 10) {
       const rows = db
         .prepare(`SELECT * FROM episodes ORDER BY start_ts DESC LIMIT ?`)
         .all(Math.floor(n)) as Record<string, unknown>[];
-      return rows.map(rowToEpisode).reverse();
+      return rows.map((row) => rowToEpisode(row, cipher)).reverse();
     },
     count() {
       return (counter.get() as { n: number }).n;

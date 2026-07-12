@@ -5,6 +5,7 @@ import type { BriefPayload } from "../mesh/types.ts";
 import { retrieveForTask } from "../agent/retrieveForTask.ts";
 import { redactText } from "../mesh/redact.ts";
 import { logger } from "../core/log.ts";
+import { EgressAuditor } from "../privacy/egress.ts";
 
 const log = logger("brief");
 
@@ -72,7 +73,7 @@ export async function buildBrief(
 ): Promise<StudioBrief> {
   const episodeGoal = latestEpisodeGoal(store);
   return {
-    ...(await fetchMeshBrief(opts)),
+    ...(await fetchMeshBrief(opts, EgressAuditor.forStore(store))),
     episodeGoal,
     topClaims: relevantClaims(store, episodeGoal, opts.cwd),
     openQuestions: undeliveredQuestions(store),
@@ -129,7 +130,10 @@ function undeliveredQuestions(store: Store): BriefOpenQuestion[] {
  * payload unless PRAXIS_MESH_URL + PRAXIS_MESH_TOKEN + a person are all
  * present, and on ANY failure — this must never surface an error.
  */
-async function fetchMeshBrief(opts: BriefOptions): Promise<BriefPayload> {
+async function fetchMeshBrief(
+  opts: BriefOptions,
+  auditor: EgressAuditor,
+): Promise<BriefPayload> {
   const url = process.env.PRAXIS_MESH_URL;
   const token = process.env.PRAXIS_MESH_TOKEN;
   const person = opts.person ?? process.env.PRAXIS_PERSON;
@@ -144,14 +148,31 @@ async function fetchMeshBrief(opts: BriefOptions): Promise<BriefPayload> {
 
   const fetchFn = opts.fetchFn ?? fetch;
   try {
-    const res = await fetchFn(`${url.replace(/\/+$/, "")}/brief?${params}`, {
+    const endpoint = `${url.replace(/\/+$/, "")}/brief?${params}`;
+    const res = await fetchFn(endpoint, {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(2000),
     });
     if (!res.ok) {
+      auditor.record({
+        destination: url,
+        purpose: "mesh_brief",
+        categories: ["person", "project"],
+        bytes: Buffer.byteLength(params.toString()),
+        outcome: "failed",
+        status: res.status,
+      });
       log.debug(`relay /brief ${res.status} — serving local-only brief`);
       return EMPTY_MESH;
     }
+    auditor.record({
+      destination: url,
+      purpose: "mesh_brief",
+      categories: ["person", "project"],
+      bytes: Buffer.byteLength(params.toString()),
+      outcome: "succeeded",
+      status: res.status,
+    });
     const body = (await res.json()) as Partial<BriefPayload> | null;
     return {
       teammates: Array.isArray(body?.teammates) ? body.teammates : [],
@@ -159,6 +180,14 @@ async function fetchMeshBrief(opts: BriefOptions): Promise<BriefPayload> {
       recentDecisions: Array.isArray(body?.recentDecisions) ? body.recentDecisions : [],
     };
   } catch (err) {
+    auditor.record({
+      destination: url,
+      purpose: "mesh_brief",
+      categories: ["person", "project"],
+      bytes: Buffer.byteLength(params.toString()),
+      outcome: "failed",
+      error: String(err),
+    });
     log.debug(`relay /brief unreachable (${String(err)}) — serving local-only brief`);
     return EMPTY_MESH;
   }

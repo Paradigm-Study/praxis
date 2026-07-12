@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { GraphEdge, GraphNode } from "../core/types.ts";
-import { fromJsonObject, strOrUndef, toJson } from "./rows.ts";
+import { fromJsonObject, sensitiveText, strOrUndef, toJson } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface GraphStore {
   putNode(n: GraphNode): void;
@@ -15,31 +16,31 @@ export interface GraphStore {
   counts(): { nodes: number; edges: number };
 }
 
-function rowToNode(row: Record<string, unknown>): GraphNode {
+function rowToNode(row: Record<string, unknown>, cipher?: StorageCipher): GraphNode {
   return {
     id: row.id as string,
     kind: row.kind as string,
-    label: row.label as string,
+    label: cipher?.decryptText(row.label, "graph_nodes.label") ?? (row.label as string),
     confidence: Number(row.confidence),
     claimId: strOrUndef(row.claim_id),
-    data: fromJsonObject(row.data_json),
+    data: fromJsonObject(row.data_json, cipher, "graph_nodes.data_json"),
     createdTs: row.created_ts as string,
     updatedTs: row.updated_ts as string,
   };
 }
 
-function rowToEdge(row: Record<string, unknown>): GraphEdge {
+function rowToEdge(row: Record<string, unknown>, cipher?: StorageCipher): GraphEdge {
   return {
     id: row.id as string,
     from: row.from_id as string,
     to: row.to_id as string,
     kind: row.kind as string,
-    data: fromJsonObject(row.data_json),
+    data: fromJsonObject(row.data_json, cipher, "graph_edges.data_json"),
     createdTs: row.created_ts as string,
   };
 }
 
-export function makeGraphStore(db: DatabaseSync): GraphStore {
+export function makeGraphStore(db: DatabaseSync, cipher?: StorageCipher): GraphStore {
   const insertNode = db.prepare(
     `INSERT OR REPLACE INTO graph_nodes
        (id, kind, label, confidence, claim_id, data_json, created_ts, updated_ts)
@@ -63,10 +64,10 @@ export function makeGraphStore(db: DatabaseSync): GraphStore {
       insertNode.run(
         n.id,
         n.kind,
-        n.label,
+        sensitiveText(n.label, cipher, "graph_nodes.label"),
         n.confidence,
         n.claimId ?? null,
-        n.data ? toJson(n.data) : null,
+        n.data ? toJson(n.data, cipher, "graph_nodes.data_json") : null,
         n.createdTs,
         n.updatedTs,
       );
@@ -77,37 +78,37 @@ export function makeGraphStore(db: DatabaseSync): GraphStore {
         e.from,
         e.to,
         e.kind,
-        e.data ? toJson(e.data) : null,
+        e.data ? toJson(e.data, cipher, "graph_edges.data_json") : null,
         e.createdTs,
       );
     },
     getNode(id) {
       const row = nodeById.get(id) as Record<string, unknown> | undefined;
-      return row ? rowToNode(row) : undefined;
+      return row ? rowToNode(row, cipher) : undefined;
     },
     findNode(kind, label) {
-      const row = nodeByLabel.get(kind, label) as
+      const row = nodeByLabel.get(kind, sensitiveText(label, cipher, "graph_nodes.label")) as
         | Record<string, unknown>
         | undefined;
-      return row ? rowToNode(row) : undefined;
+      return row ? rowToNode(row, cipher) : undefined;
     },
     nodes() {
       const rows = db
         .prepare(`SELECT * FROM graph_nodes ORDER BY confidence DESC`)
         .all() as Record<string, unknown>[];
-      return rows.map(rowToNode);
+      return rows.map((row) => rowToNode(row, cipher));
     },
     edges() {
       const rows = db
         .prepare(`SELECT * FROM graph_edges`)
         .all() as Record<string, unknown>[];
-      return rows.map(rowToEdge);
+      return rows.map((row) => rowToEdge(row, cipher));
     },
     incident(nodeId) {
       const rows = db
         .prepare(`SELECT * FROM graph_edges WHERE from_id = ? OR to_id = ?`)
         .all(nodeId, nodeId) as Record<string, unknown>[];
-      return rows.map(rowToEdge);
+      return rows.map((row) => rowToEdge(row, cipher));
     },
     hasEdge(from, to, kind) {
       return edgeDup.get(from, to, kind) !== undefined;

@@ -487,6 +487,34 @@ test("publish is a redaction boundary: extra fields and secrets never serialize"
   }
 });
 
+test("network retry spool stores the redacted wire frame, not the caller object", async () => {
+  const paths = tempPaths();
+  const rejectingFetch = (async () => {
+    throw new Error("offline");
+  }) as typeof fetch;
+  try {
+    const publisher = new MeshPublisher({
+      url: "http://127.0.0.1:1",
+      token: "token",
+      person: "alice",
+      fetchFn: rejectingFetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    const unsafe = {
+      ...frame("frame_spool_redaction"),
+      intent: "use sk-abcdefghijklmnop",
+      promptBody: "must never be spooled",
+    } as WorkFrame;
+    await publisher.publish(unsafe);
+    const spooled = JSON.parse(readFileSync(paths.spoolPath, "utf8")) as Record<string, unknown>;
+    assert.equal(spooled.intent, "use [redacted]");
+    assert.ok(!("promptBody" in spooled));
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
 test("consent config supplies device and allowlist while explicit options win", async () => {
   const paths = tempPaths();
   const configPath = join(paths.dir, "mesh.json");

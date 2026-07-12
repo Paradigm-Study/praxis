@@ -6,7 +6,7 @@
  * the second fence, not the first.
  */
 
-import type { WorkFrame } from "./types.ts";
+import type { MeshFrame, WorkFrame } from "./types.ts";
 
 export interface RedactOptions {
   /** Hard cap on output length (redactor may truncate). */
@@ -88,6 +88,30 @@ export function redactWorkFrame(frame: WorkFrame): WorkFrame {
     claimsTouched: [...frame.claimsTouched],
     evidenceRefs: [...frame.evidenceRefs],
     ...(frame.sessionKey !== undefined ? { sessionKey: frame.sessionKey } : {}),
+  };
+}
+
+/** Whitelist and redact either v0 relay frame before network OR retry disk. */
+export function redactMeshFrame(frame: MeshFrame): MeshFrame {
+  if (frame.kind === "workframe") return redactWorkFrame(frame);
+  return {
+    v: 0,
+    kind: "card_event",
+    person: frame.person,
+    device: frame.device,
+    project: frame.project,
+    ts: frame.ts,
+    cardId: frame.cardId,
+    stage: frame.stage,
+    event: frame.event,
+    ...(frame.verdict !== undefined ? { verdict: redactText(frame.verdict) } : {}),
+    artifacts: frame.artifacts
+      .filter((artifact) => !isSecretArtifactPath(artifact.path))
+      .map((artifact) => ({ repo: artifact.repo, path: artifact.path })),
+    specCriteria: frame.specCriteria.map((criterion) => ({
+      id: criterion.id,
+      behavior: redactText(criterion.behavior),
+    })),
   };
 }
 

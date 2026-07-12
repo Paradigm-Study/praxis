@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { logger } from "../core/log.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 const log = logger("analytics");
 
@@ -35,7 +36,11 @@ export async function attachDuckDB(): Promise<boolean> {
   }
 }
 
-export function makeAnalytics(db: DatabaseSync, duckdbAvailable = false): Analytics {
+export function makeAnalytics(
+  db: DatabaseSync,
+  duckdbAvailable = false,
+  cipher?: StorageCipher,
+): Analytics {
   return {
     duckdbAvailable,
     eventsPerDay() {
@@ -47,12 +52,16 @@ export function makeAnalytics(db: DatabaseSync, duckdbAvailable = false): Analyt
         .all() as Array<{ day: string; count: number }>;
     },
     timePerApp() {
-      return db
+      const rows = db
         .prepare(
           `SELECT app, COUNT(*) AS events
              FROM raw_events GROUP BY app ORDER BY events DESC`,
         )
         .all() as Array<{ app: string; events: number }>;
+      return rows.map((row) => ({
+        ...row,
+        app: cipher?.decryptText(row.app, "raw_events.app") ?? row.app,
+      }));
     },
     actionTypeDistribution() {
       return db

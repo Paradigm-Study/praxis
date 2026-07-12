@@ -19,7 +19,9 @@ cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
 enc() { printf '%s' "$1" | jq -sRr '@uri' 2>/dev/null; }
 
 # One 2s shot, no retries — a cold/down studio must cost at most 2 seconds.
-brief=$(curl -s -m 2 "${base%/}/api/brief?cwd=$(enc "$cwd")" 2>/dev/null) || brief=""
+auth=()
+[ -n "${PRAXIS_LOCAL_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${PRAXIS_LOCAL_TOKEN}")
+brief=$(curl -s -m 2 "${auth[@]}" "${base%/}/api/brief?cwd=$(enc "$cwd")" 2>/dev/null) || brief=""
 [ -z "$brief" ] && exit 0
 
 # Digest the JSON into markdown. jq -e exits non-zero when the program yields

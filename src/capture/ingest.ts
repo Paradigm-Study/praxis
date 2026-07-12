@@ -4,6 +4,11 @@ import type { RawEventInput } from "./source.ts";
 import { newId } from "../core/ids.ts";
 import { hashEventContent } from "../core/hash.ts";
 import { nowIso } from "../core/time.ts";
+import {
+  capturePolicyDecision,
+  PrivacyControlStore,
+} from "../privacy/control.ts";
+import { resourceCaptureDecision, RuntimeStatusStore } from "./runtimeStatus.ts";
 
 /**
  * The single normalizing entry point for the ledger. Every capture source goes
@@ -19,11 +24,46 @@ export interface Ingest {
   subscribe: (fn: (e: RawEvent) => void) => () => void;
 }
 
-export function makeIngest(store: Store): Ingest {
+export interface IngestOptions {
+  privacy?: PrivacyControlStore;
+  runtime?: RuntimeStatusStore;
+}
+
+export function makeIngest(store: Store, opts: IngestOptions = {}): Ingest {
   const subscribers = new Set<(e: RawEvent) => void>();
+  const privacy = opts.privacy ?? PrivacyControlStore.forStore(store);
+  const runtime = opts.runtime ?? RuntimeStatusStore.forStore(store);
 
   function ingest(input: RawEventInput): RawEvent {
     const ts = input.ts ?? nowIso();
+    const decision = capturePolicyDecision(privacy.read(), input);
+    const resourceDecision = resourceCaptureDecision(runtime.read().resources, input.source);
+    if (!decision.allowed || !resourceDecision.allowed) {
+      // Preserve the long-standing EventSink return contract while ensuring
+      // blocked data (especially inline blobs) never touches persistent state.
+      const payload = input.payload ?? {};
+      const blobRefs = [...(input.blobRefs ?? [])];
+      const hash = hashEventContent({
+        ts,
+        source: input.source,
+        app: input.app,
+        window: input.window,
+        type: input.type,
+        payload,
+        blobRefs,
+      });
+      return {
+        id: newId("suppressed"),
+        ts,
+        source: input.source,
+        app: input.app,
+        window: input.window,
+        type: input.type,
+        payload,
+        blobRefs,
+        hash,
+      };
+    }
     const blobRefs = [...(input.blobRefs ?? [])];
 
     // Offload inline large data to the content-addressed blob store.

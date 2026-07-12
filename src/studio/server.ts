@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
 import type { Store } from "../storage/index.ts";
@@ -12,6 +12,16 @@ import { createMcpRouter } from "../mcp/router.ts";
 import { isAllowedOrigin } from "../mcp/protocol.ts";
 import { buildGraph } from "../memory/graph.ts";
 import { logger } from "../core/log.ts";
+import { PrivacyControlStore, type PrivacyControl } from "../privacy/control.ts";
+import { RuntimeStatusStore } from "../capture/runtimeStatus.ts";
+import { EgressAuditor } from "../privacy/egress.ts";
+import {
+  RetentionPolicyStore,
+  runMaintenance,
+  storageUsage,
+  type RetentionPolicy,
+} from "../storage/maintenance.ts";
+import { authorizeLocalRequest, validateLocalToken } from "../security/localAuth.ts";
 
 const log = logger("studio");
 
@@ -25,15 +35,25 @@ const MIME: Record<string, string> = {
 };
 
 /** Launch Praxis Studio: a JSON API over the ledger + a static web UI. */
-export function startStudio(store: Store, port = 4319): void {
+export function startStudio(store: Store, port = 4319): Server {
   const webDir = join(import.meta.dirname, "web");
   const clients = new Set<ServerResponse>();
   const mcpRouter = createMcpRouter(store);
+  const localToken = validateLocalToken(process.env.PRAXIS_LOCAL_TOKEN);
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
     const path = url.pathname;
     try {
+      if (req.method === "GET" && path === "/api/health") {
+        return json(res, 200, { ok: true });
+      }
+      if (
+        (path.startsWith("/api/") || path === "/mcp" || path.startsWith("/mcp/")) &&
+        !authorizeLocalRequest(req, res, localToken)
+      ) {
+        return;
+      }
       // MCP mount (default OFF): every /mcp request goes to the router when
       // PRAXIS_MCP=1; a false return falls through to normal handling.
       if (
@@ -55,7 +75,7 @@ export function startStudio(store: Store, port = 4319): void {
   // and push them to every connected SSE client. This is the "what it sees now".
   let cursor = store.events.maxRowid();
   let decisionCursor = store.decisions.maxRowid();
-  setInterval(() => {
+  const tailTimer = setInterval(() => {
     if (clients.size === 0) {
       cursor = store.events.maxRowid();
       decisionCursor = store.decisions.maxRowid();
@@ -84,17 +104,25 @@ export function startStudio(store: Store, port = 4319): void {
       for (const d of dec.decisions) broadcast(`event: decision\ndata: ${JSON.stringify(d)}\n\n`);
     }
   }, 750);
+  tailTimer.unref();
 
   // Heartbeat so proxies don't drop idle SSE connections.
-  setInterval(() => {
+  const heartbeatTimer = setInterval(() => {
     for (const c of clients) c.write(": ping\n\n");
   }, 15000);
+  heartbeatTimer.unref();
+  server.on("close", () => {
+    clearInterval(tailTimer);
+    clearInterval(heartbeatTimer);
+  });
 
   // A second studio racing for the port must not crash-loop: if a healthy
   // studio already serves it, defer to that one and exit cleanly.
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code !== "EADDRINUSE") throw err;
-    fetch(`http://localhost:${port}/api/status`)
+    fetch(`http://localhost:${port}/api/status`, {
+      headers: localToken ? { authorization: `Bearer ${localToken}` } : {},
+    })
       .then((r) => {
         process.stdout.write(
           r.ok
@@ -114,6 +142,7 @@ export function startStudio(store: Store, port = 4319): void {
       `\nPraxis Studio → http://localhost:${port}  (Ctrl-C to stop)\n`,
     );
   });
+  return server;
 }
 
 function handleStream(
@@ -175,7 +204,30 @@ function handleApi(
             graph: store.graph.counts(),
           },
           eventsPerDay: store.analytics.eventsPerDay(),
+          capture: captureStatus(store),
         });
+      case "/api/capture/status":
+        return json(res, 200, captureStatus(store));
+      case "/api/privacy":
+        return json(res, 200, PrivacyControlStore.forStore(store).read());
+      case "/api/egress":
+        return json(
+          res,
+          200,
+          EgressAuditor.forStore(store).recent(Number(url.searchParams.get("limit") ?? 100)),
+        );
+      case "/api/storage/status":
+        return json(res, 200, {
+          usage: storageUsage(store),
+          retention: RetentionPolicyStore.forStore(store).read(),
+          encryption: {
+            enabled: store.encryption.enabled,
+            activeVersion: store.encryption.activeVersion,
+            keyVersions: store.encryption.keyVersions,
+          },
+        });
+      case "/api/storage/retention":
+        return json(res, 200, RetentionPolicyStore.forStore(store).read());
       case "/api/feed":
         return json(res, 200, store.events.range({ limit: 300 }).reverse());
       case "/api/actions":
@@ -225,13 +277,87 @@ function handleApi(
 
   // Browser writes to loopback APIs must carry a local Origin. Non-browser
   // clients (Electron main, CLI, hooks) normally omit Origin and are allowed.
-  if (req.method === "POST" && !isAllowedOrigin(headerValue(req.headers.origin))) {
+  if (
+    (req.method === "POST" || req.method === "PUT" || req.method === "DELETE") &&
+    !isAllowedOrigin(headerValue(req.headers.origin))
+  ) {
     return json(res, 403, { error: "origin not allowed" });
+  }
+
+  // --- writes: privacy/capture control -----------------------------------
+  if (req.method === "PUT" && path === "/api/privacy") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body);
+      if (typeof data !== "object" || data === null || Array.isArray(data)) {
+        return json(res, 400, { error: "privacy control must be a JSON object" });
+      }
+      return json(
+        res,
+        200,
+        PrivacyControlStore.forStore(store).update(data as Partial<PrivacyControl>),
+      );
+    });
+  }
+  if (req.method === "PUT" && path === "/api/runtime/resources") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      if (
+        (data?.powerSource !== "ac" && data?.powerSource !== "battery") ||
+        typeof data.suspended !== "boolean" ||
+        typeof data.batteryAware !== "boolean"
+      ) {
+        return json(res, 400, {
+          error: "powerSource ('ac'|'battery'), suspended, and batteryAware are required",
+        });
+      }
+      const status = RuntimeStatusStore.forStore(store).updateResources({
+        powerSource: data.powerSource,
+        suspended: data.suspended,
+        batteryAware: data.batteryAware,
+      });
+      return json(res, 200, captureStatus(store, status));
+    });
+  }
+  if (req.method === "POST" && path === "/api/capture/pause") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      const minutes = data?.minutes === undefined ? 15 : Number(data.minutes);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) {
+        return json(res, 400, { error: "minutes must be an integer from 1 to 1440" });
+      }
+      const control = PrivacyControlStore.forStore(store);
+      return json(res, 200, control.update({
+        mode: "paused",
+        pausedUntil: new Date(Date.now() + minutes * 60_000).toISOString(),
+      }));
+    });
+  }
+  if (req.method === "POST" && path === "/api/capture/resume") {
+    const control = PrivacyControlStore.forStore(store);
+    return json(res, 200, control.update({ mode: "normal", pausedUntil: undefined }));
+  }
+
+  // --- writes: retention/quota maintenance ------------------------------
+  if (req.method === "PUT" && path === "/api/storage/retention") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body);
+      if (typeof data !== "object" || data === null || Array.isArray(data)) {
+        return json(res, 400, { error: "retention policy must be a JSON object" });
+      }
+      return json(
+        res,
+        200,
+        RetentionPolicyStore.forStore(store).update(data as Partial<RetentionPolicy>),
+      );
+    });
+  }
+  if (req.method === "POST" && path === "/api/storage/maintenance") {
+    return json(res, 200, runMaintenance(store));
   }
 
   // --- writes: real local forget -----------------------------------------
   if (req.method === "POST" && path === "/api/forget") {
-    return readBody(req, (body) => {
+    return readBody(req, res, (body) => {
       const data = safeParse(body) as Record<string, unknown> | undefined;
       const minutes = Number(data?.minutes);
       if (!Number.isInteger(minutes) || minutes < 1 || minutes > 24 * 60) {
@@ -245,7 +371,7 @@ function handleApi(
 
   // --- writes: corrections (the human-in-the-loop) ---
   if (req.method === "POST" && path === "/api/correction") {
-    return readBody(req, (body) => {
+    return readBody(req, res, (body) => {
       const data = safeParse(body) as Record<string, unknown> | undefined;
       if (!data?.targetKind || !data?.targetId || !data?.verdict) {
         return json(res, 400, { error: "targetKind, targetId, verdict required" });
@@ -267,7 +393,7 @@ function handleApi(
 
   // --- writes: answers to the agent's proactive questions ---
   if (req.method === "POST" && path === "/api/answer") {
-    return readBody(req, (body) => {
+    return readBody(req, res, (body) => {
       const data = safeParse(body) as Record<string, unknown> | undefined;
       if (!data?.questionId || data.answer == null) {
         return json(res, 400, { error: "questionId and answer required" });
@@ -292,6 +418,29 @@ function handleApi(
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function captureStatus(
+  store: Store,
+  supplied?: ReturnType<RuntimeStatusStore["read"]>,
+): unknown {
+  const runtime = supplied ?? RuntimeStatusStore.forStore(store).read();
+  const privacy = PrivacyControlStore.forStore(store).read();
+  const pauseActive =
+    privacy.mode === "paused" &&
+    (!privacy.pausedUntil || Date.parse(privacy.pausedUntil) > Date.now());
+  return {
+    ...runtime,
+    stale:
+      runtime.state === "running" &&
+      Date.now() - Date.parse(runtime.updatedAt) > 30_000,
+    effectiveState: runtime.resources.suspended ? "suspended" : runtime.state,
+    effectiveMode: privacy.mode === "private" ? "private" : pauseActive ? "paused" : "normal",
+    privacy: {
+      mode: privacy.mode,
+      ...(privacy.pausedUntil ? { pausedUntil: privacy.pausedUntil } : {}),
+    },
+  };
 }
 
 export interface ForgetResult {
@@ -483,10 +632,30 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-function readBody(req: IncomingMessage, cb: (body: string) => void): void {
-  let data = "";
-  req.on("data", (c) => (data += c));
-  req.on("end", () => cb(data));
+function readBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cb: (body: string) => void,
+  maxBytes = 64 * 1024,
+): void {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  let rejected = false;
+  req.on("data", (chunk: Buffer | string) => {
+    if (rejected) return;
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > maxBytes) {
+      rejected = true;
+      res.writeHead(413, { "content-type": "application/json", connection: "close" });
+      res.end(JSON.stringify({ error: "request body too large" }), () => req.destroy());
+      return;
+    }
+    chunks.push(buffer);
+  });
+  req.on("end", () => {
+    if (!rejected) cb(Buffer.concat(chunks, bytes).toString("utf8"));
+  });
 }
 
 function safeParse(s: string): unknown {

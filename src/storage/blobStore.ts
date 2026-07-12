@@ -1,9 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { BlobKind, BlobRecord } from "../core/types.ts";
 import { sha256 } from "../core/hash.ts";
 import { nowIso } from "../core/time.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 /**
  * Content-addressed blob store. Large payloads (screen frames, video chunks,
@@ -24,21 +25,33 @@ function shard(dir: string, hash: string): { dir: string; path: string } {
   return { dir: sub, path: join(sub, hash) };
 }
 
-export function makeBlobStore(db: DatabaseSync, blobDir: string): BlobStore {
-  mkdirSync(blobDir, { recursive: true });
+export function makeBlobStore(
+  db: DatabaseSync,
+  blobDir: string,
+  cipher?: StorageCipher,
+): BlobStore {
+  mkdirSync(blobDir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(blobDir, 0o700);
+  } catch {
+    // Best effort.
+  }
   const upsert = db.prepare(
     `INSERT OR IGNORE INTO blobs (hash, kind, path, bytes, created_at)
      VALUES (?, ?, ?, ?, ?)`,
   );
   const byHash = db.prepare(`SELECT * FROM blobs WHERE hash = ?`);
+  const root = `${resolve(blobDir)}/`;
 
   function record(hash: string): BlobRecord | undefined {
     const row = byHash.get(hash) as Record<string, unknown> | undefined;
     if (!row) return undefined;
+    const path = row.path as string;
+    if (!resolve(path).startsWith(root)) return undefined;
     return {
       hash: row.hash as string,
       kind: row.kind as BlobKind,
-      path: row.path as string,
+      path,
       bytes: Number(row.bytes),
       createdAt: row.created_at as string,
     };
@@ -51,8 +64,19 @@ export function makeBlobStore(db: DatabaseSync, blobDir: string): BlobStore {
       const { dir, path } = shard(blobDir, hash);
       const existing = record(hash);
       if (!existing) {
-        mkdirSync(dir, { recursive: true });
-        if (!existsSync(path)) writeFileSync(path, bytes);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        if (!existsSync(path)) {
+          const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+          const persisted = cipher ? cipher.encryptBytes(bytes, `blob:${hash}`) : bytes;
+          writeFileSync(tmp, persisted, { mode: 0o600 });
+          renameSync(tmp, path);
+        }
+        try {
+          chmodSync(dir, 0o700);
+          chmodSync(path, 0o600);
+        } catch {
+          // Best effort.
+        }
         upsert.run(hash, kind, path, bytes.byteLength, nowIso());
       }
       return (
@@ -68,7 +92,8 @@ export function makeBlobStore(db: DatabaseSync, blobDir: string): BlobStore {
     get(hash) {
       const rec = record(hash);
       if (!rec || !existsSync(rec.path)) return undefined;
-      return readFileSync(rec.path);
+      const persisted = readFileSync(rec.path);
+      return cipher ? cipher.decryptBytes(persisted, `blob:${hash}`) : persisted;
     },
     getText(hash) {
       const buf = this.get(hash);

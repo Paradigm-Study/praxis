@@ -150,3 +150,33 @@ test("ai_proxy forwards multibyte UTF-8 split across chunk boundaries byte-ident
   await close(upstream);
   store.close();
 });
+
+test("ai_proxy rejects an oversized request before contacting upstream", async () => {
+  let upstreamRequests = 0;
+  const upstream = createServer((_req, res) => {
+    upstreamRequests += 1;
+    res.end("{}");
+  });
+  const upstreamPort = await listen(upstream);
+  const store = openStore({ memory: true });
+  const source = new AiProxySource();
+  source.start(makeIngest(store).ingest);
+  const proxy = startAiProxy({
+    source,
+    port: 0,
+    upstreamBase: `http://localhost:${upstreamPort}`,
+    maxRequestBytes: 128,
+    store,
+  });
+  const proxyPort = await portOf(proxy);
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "x".repeat(500) }] }),
+  });
+  assert.equal(response.status, 413);
+  assert.equal(upstreamRequests, 0);
+  await close(proxy);
+  await close(upstream);
+  store.close();
+});

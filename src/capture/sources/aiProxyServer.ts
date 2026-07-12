@@ -3,6 +3,9 @@ import type { AiProxySource } from "./aiProxy.ts";
 import type { Store } from "../../storage/index.ts";
 import { buildInjectionBlock, detectBodyShape, injectIntoBody } from "./proxyInject.ts";
 import { logger } from "../../core/log.ts";
+import { EgressAuditor } from "../../privacy/egress.ts";
+import { sha256 } from "../../core/hash.ts";
+import { authorizeLocalRequest, validateLocalToken } from "../../security/localAuth.ts";
 
 const log = logger("ai_proxy");
 
@@ -13,6 +16,10 @@ export interface AiProxyServerOptions {
   port?: number;
   /** Enables context injection (with PRAXIS_PROXY_INJECT=1) — see proxyInject.ts. */
   store?: Store;
+  /** Hard request-body cap. Default 5 MiB. */
+  maxRequestBytes?: number;
+  /** Packaged proxy auth. Uses Proxy-Authorization so provider Authorization forwards unchanged. */
+  authToken?: string;
 }
 
 /**
@@ -27,9 +34,13 @@ export interface AiProxyServerOptions {
  */
 export function startAiProxy(opts: AiProxyServerOptions): Server {
   const upstream = (opts.upstreamBase ?? "https://api.anthropic.com").replace(/\/$/, "");
+  const auditor = EgressAuditor.forStore(opts.store);
+  const maxRequestBytes = opts.maxRequestBytes ?? 5 * 1024 * 1024;
+  const authToken = validateLocalToken(opts.authToken ?? process.env.PRAXIS_LOCAL_TOKEN);
 
   const server = createServer((req, res) => {
-    readBody(req, async (raw) => {
+    if (!authorizeLocalRequest(req, res, authToken, "proxy-authorization")) return;
+    readBody(req, maxRequestBytes, async (raw) => {
       const body = safeJson(raw) ?? {};
       const app = headerStr(req, "x-praxis-app") ?? "ai_proxy";
       const { model, prompt } = extractPrompt(body);
@@ -56,6 +67,15 @@ export function startAiProxy(opts: AiProxyServerOptions): Server {
           body: req.method === "GET" || req.method === "HEAD" ? undefined : forwardRaw,
         });
         const text = await upRes.text();
+        auditor.record({
+          destination: upstream,
+          purpose: "transparent_ai_proxy",
+          categories: ["ai_request", "ai_response"],
+          bytes: Buffer.byteLength(forwardRaw) + Buffer.byteLength(text),
+          digest: sha256(forwardRaw),
+          outcome: upRes.ok ? "succeeded" : "failed",
+          status: upRes.status,
+        });
         const data = safeJson(text);
         const respText = extractResponse(data);
         if (respText) {
@@ -66,10 +86,22 @@ export function startAiProxy(opts: AiProxyServerOptions): Server {
         });
         res.end(text);
       } catch (err) {
+        auditor.record({
+          destination: upstream,
+          purpose: "transparent_ai_proxy",
+          categories: ["ai_request"],
+          bytes: Buffer.byteLength(forwardRaw),
+          digest: sha256(forwardRaw),
+          outcome: "failed",
+          error: String(err),
+        });
         log.warn("upstream failed", String(err));
         res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "praxis proxy upstream failed", detail: String(err) }));
       }
+    }, () => {
+      res.writeHead(413, { "content-type": "application/json", connection: "close" });
+      res.end(JSON.stringify({ error: "request body too large" }), () => req.destroy());
     });
   });
 
@@ -148,7 +180,14 @@ function forwardHeaders(req: IncomingMessage): Record<string, string> {
 	// fetch/undici owns framing for the reconstructed request body. Forwarding
 	// the inbound Transfer-Encoding (typically "chunked") makes undici reject
 	// the request before it reaches upstream.
-	const drop = new Set(["host", "content-length", "transfer-encoding", "accept-encoding", "connection"]);
+	const drop = new Set([
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "accept-encoding",
+    "connection",
+    "proxy-authorization",
+  ]);
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (drop.has(k.toLowerCase())) continue;
@@ -162,15 +201,32 @@ function headerStr(req: IncomingMessage, name: string): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
-function readBody(req: IncomingMessage, cb: (raw: string) => void): void {
+function readBody(
+  req: IncomingMessage,
+  maxBytes: number,
+  cb: (raw: string) => void,
+  tooLarge: () => void,
+): void {
   // Collect Buffers and decode ONCE. Coercing each chunk individually would
   // corrupt any multibyte UTF-8 character split across a chunk boundary —
   // and the proxy's contract is to forward the body verbatim.
   const chunks: Buffer[] = [];
+  let bytes = 0;
+  let rejected = false;
   req.on("data", (c: Buffer | string) => {
-    chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+    if (rejected) return;
+    const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+    bytes += chunk.byteLength;
+    if (bytes > maxBytes) {
+      rejected = true;
+      tooLarge();
+      return;
+    }
+    chunks.push(chunk);
   });
-  req.on("end", () => cb(Buffer.concat(chunks).toString("utf8")));
+  req.on("end", () => {
+    if (!rejected) cb(Buffer.concat(chunks, bytes).toString("utf8"));
+  });
 }
 
 function safeJson(s: string): Body | undefined {

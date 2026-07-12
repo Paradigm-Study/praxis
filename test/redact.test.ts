@@ -1,13 +1,41 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { redactText, redactWorkFrame } from "../src/mesh/redact.ts";
-import type { WorkFrame } from "../src/mesh/types.ts";
+import { redactMeshFrame, redactText, redactWorkFrame } from "../src/mesh/redact.ts";
+import type { BoardroomLifecycle, WorkFrame } from "../src/mesh/types.ts";
 
 test("redactText removes email addresses", () => {
   assert.equal(
     redactText("Contact alice.smith+mesh@example.co.uk for access"),
     "Contact [redacted] for access",
   );
+});
+
+test("redactMeshFrame whitelists and redacts card lifecycle frames", () => {
+  const frame = {
+    v: 0,
+    kind: "card_event",
+    person: "alice",
+    device: "laptop",
+    project: "praxis",
+    ts: "2026-07-12T00:00:00.000Z",
+    cardId: "card-1",
+    stage: "spec",
+    event: "decided",
+    verdict: "ship with sk-abcdefghijklm",
+    artifacts: [
+      { repo: "praxis", path: ".env" },
+      { repo: "praxis", path: "src/index.ts" },
+    ],
+    specCriteria: [{ id: "s1", behavior: "email alice@example.com" }],
+    promptBody: "must not survive",
+  } as BoardroomLifecycle;
+  const result = redactMeshFrame(frame);
+  assert.equal(result.kind, "card_event");
+  if (result.kind !== "card_event") throw new Error("expected card event");
+  assert.equal(result.verdict, "ship with [redacted]");
+  assert.deepEqual(result.artifacts, [{ repo: "praxis", path: "src/index.ts" }]);
+  assert.equal(result.specCriteria[0]?.behavior, "email [redacted]");
+  assert.ok(!("promptBody" in result));
 });
 
 test("redactText removes supported API key and token forms", () => {

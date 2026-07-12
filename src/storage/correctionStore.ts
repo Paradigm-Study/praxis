@@ -4,7 +4,8 @@ import type {
   CorrectionTarget,
   CorrectionVerdict,
 } from "../core/types.ts";
-import { strOrUndef } from "./rows.ts";
+import { sensitiveText, strOrUndef } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface CorrectionStore {
   put(c: Correction): void;
@@ -13,19 +14,19 @@ export interface CorrectionStore {
   byTarget(targetId: string): Correction[];
 }
 
-function rowToCorrection(row: Record<string, unknown>): Correction {
+function rowToCorrection(row: Record<string, unknown>, cipher?: StorageCipher): Correction {
   return {
     id: row.id as string,
     targetKind: row.target_kind as CorrectionTarget,
     targetId: row.target_id as string,
     verdict: row.verdict as CorrectionVerdict,
-    correctedText: strOrUndef(row.corrected_text),
-    note: strOrUndef(row.note),
+    correctedText: strOrUndef(row.corrected_text, cipher, "corrections.corrected_text"),
+    note: strOrUndef(row.note, cipher, "corrections.note"),
     createdTs: row.created_ts as string,
   };
 }
 
-export function makeCorrectionStore(db: DatabaseSync): CorrectionStore {
+export function makeCorrectionStore(db: DatabaseSync, cipher?: StorageCipher): CorrectionStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO corrections
        (id, target_kind, target_id, verdict, corrected_text, note, created_ts)
@@ -43,24 +44,24 @@ export function makeCorrectionStore(db: DatabaseSync): CorrectionStore {
         c.targetKind,
         c.targetId,
         c.verdict,
-        c.correctedText ?? null,
-        c.note ?? null,
+        sensitiveText(c.correctedText, cipher, "corrections.corrected_text"),
+        sensitiveText(c.note, cipher, "corrections.note"),
         c.createdTs,
       );
     },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
-      return row ? rowToCorrection(row) : undefined;
+      return row ? rowToCorrection(row, cipher) : undefined;
     },
     all() {
       const rows = db
         .prepare(`SELECT * FROM corrections ORDER BY created_ts ASC`)
         .all() as Record<string, unknown>[];
-      return rows.map(rowToCorrection);
+      return rows.map((row) => rowToCorrection(row, cipher));
     },
     byTarget(targetId) {
       const rows = byTarget.all(targetId) as Record<string, unknown>[];
-      return rows.map(rowToCorrection);
+      return rows.map((row) => rowToCorrection(row, cipher));
     },
   };
 }

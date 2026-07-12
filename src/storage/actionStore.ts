@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { ActionEvent, ActionType } from "../core/types.ts";
-import { fromJsonArray, fromJsonObject, strOrUndef, toJson } from "./rows.ts";
+import { fromJsonArray, fromJsonObject, sensitiveText, strOrUndef, toJson } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface ActionRange {
   startTs?: string;
@@ -17,27 +18,27 @@ export interface ActionStore {
   count(): number;
 }
 
-function rowToAction(row: Record<string, unknown>): ActionEvent {
-  const uncertainty = fromJsonArray(row.uncertainty);
+function rowToAction(row: Record<string, unknown>, cipher?: StorageCipher): ActionEvent {
+  const uncertainty = fromJsonArray(row.uncertainty, cipher, "action_events.uncertainty");
   const reconstructedBy = fromJsonArray(row.reconstructed_by);
   return {
     id: row.id as string,
     type: "user_action",
     action: row.action_type as ActionType,
-    app: row.app as string,
-    window: strOrUndef(row.window),
+    app: cipher?.decryptText(row.app, "action_events.app") ?? (row.app as string),
+    window: strOrUndef(row.window, cipher, "action_events.window"),
     startTs: row.start_ts as string,
     endTs: row.end_ts as string,
-    text: strOrUndef(row.text),
+    text: strOrUndef(row.text, cipher, "action_events.text"),
     confidence: Number(row.confidence),
     evidence: fromJsonArray(row.evidence_ids),
     uncertainty: uncertainty.length ? uncertainty : undefined,
-    payload: fromJsonObject(row.payload_json),
+    payload: fromJsonObject(row.payload_json, cipher, "action_events.payload_json"),
     reconstructedBy: reconstructedBy.length ? reconstructedBy : undefined,
   };
 }
 
-export function makeActionStore(db: DatabaseSync): ActionStore {
+export function makeActionStore(db: DatabaseSync, cipher?: StorageCipher): ActionStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO action_events
        (id, start_ts, end_ts, action_type, app, window, text, confidence,
@@ -53,13 +54,13 @@ export function makeActionStore(db: DatabaseSync): ActionStore {
       a.startTs,
       a.endTs,
       a.action,
-      a.app,
-      a.window ?? null,
-      a.text ?? null,
+      sensitiveText(a.app, cipher, "action_events.app"),
+      sensitiveText(a.window, cipher, "action_events.window"),
+      sensitiveText(a.text, cipher, "action_events.text"),
       a.confidence,
       toJson(a.evidence),
-      a.uncertainty ? toJson(a.uncertainty) : null,
-      a.payload ? toJson(a.payload) : null,
+      a.uncertainty ? toJson(a.uncertainty, cipher, "action_events.uncertainty") : null,
+      a.payload ? toJson(a.payload, cipher, "action_events.payload_json") : null,
       a.reconstructedBy ? toJson(a.reconstructedBy) : null,
     );
   }
@@ -78,7 +79,7 @@ export function makeActionStore(db: DatabaseSync): ActionStore {
     },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
-      return row ? rowToAction(row) : undefined;
+      return row ? rowToAction(row, cipher) : undefined;
     },
     range(range = {}) {
       const where: string[] = [];
@@ -96,7 +97,7 @@ export function makeActionStore(db: DatabaseSync): ActionStore {
       const rows = db
         .prepare(`SELECT * FROM action_events ${clause} ORDER BY start_ts ASC ${limit}`)
         .all(...params) as Record<string, unknown>[];
-      return rows.map(rowToAction);
+      return rows.map((row) => rowToAction(row, cipher));
     },
     byIds(ids) {
       if (ids.length === 0) return [];
@@ -107,7 +108,7 @@ export function makeActionStore(db: DatabaseSync): ActionStore {
         .all(...ids) as Record<string, unknown>[];
       const order = new Map(ids.map((id, i) => [id, i]));
       return rows
-        .map(rowToAction)
+        .map((row) => rowToAction(row, cipher))
         .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
     },
     count() {

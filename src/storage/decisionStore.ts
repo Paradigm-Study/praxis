@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { StoredDecision } from "../core/types.ts";
-import { fromJsonArray, strOrUndef, toJson } from "./rows.ts";
+import { fromJsonArray, sensitiveText, strOrUndef, toJson } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface DecisionStore {
   put(d: StoredDecision): void;
@@ -9,12 +10,12 @@ export interface DecisionStore {
   sinceRowid(rowid: number, limit?: number): { maxRowid: number; decisions: StoredDecision[] };
 }
 
-function rowToDecision(row: Record<string, unknown>): StoredDecision {
+function rowToDecision(row: Record<string, unknown>, cipher?: StorageCipher): StoredDecision {
   return {
     id: row.id as string,
     kind: row.kind as string,
-    reason: row.reason as string,
-    question: strOrUndef(row.question),
+    reason: cipher?.decryptText(row.reason, "decisions.reason") ?? (row.reason as string),
+    question: strOrUndef(row.question, cipher, "decisions.question"),
     evidence: fromJsonArray(row.evidence),
     observationId: strOrUndef(row.observation_id),
     claimId: strOrUndef(row.claim_id),
@@ -22,7 +23,7 @@ function rowToDecision(row: Record<string, unknown>): StoredDecision {
   };
 }
 
-export function makeDecisionStore(db: DatabaseSync): DecisionStore {
+export function makeDecisionStore(db: DatabaseSync, cipher?: StorageCipher): DecisionStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO decisions
        (id, kind, reason, question, evidence, observation_id, claim_id, created_ts)
@@ -34,8 +35,8 @@ export function makeDecisionStore(db: DatabaseSync): DecisionStore {
       insert.run(
         d.id,
         d.kind,
-        d.reason,
-        d.question ?? null,
+        sensitiveText(d.reason, cipher, "decisions.reason"),
+        sensitiveText(d.question, cipher, "decisions.question"),
         toJson(d.evidence),
         d.observationId ?? null,
         d.claimId ?? null,
@@ -46,7 +47,7 @@ export function makeDecisionStore(db: DatabaseSync): DecisionStore {
       const rows = db
         .prepare(`SELECT * FROM decisions ORDER BY created_ts DESC LIMIT ?`)
         .all(Math.floor(n)) as Record<string, unknown>[];
-      return rows.map(rowToDecision);
+      return rows.map((row) => rowToDecision(row, cipher));
     },
     maxRowid() {
       const row = db.prepare(`SELECT MAX(rowid) AS m FROM decisions`).get() as {
@@ -63,7 +64,7 @@ export function makeDecisionStore(db: DatabaseSync): DecisionStore {
       let max = rowid;
       const decisions = rows.map((r) => {
         max = Math.max(max, Number(r._rid));
-        return rowToDecision(r);
+        return rowToDecision(r, cipher);
       });
       return { maxRowid: max, decisions };
     },

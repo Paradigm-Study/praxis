@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { EventSource, RawEvent } from "../core/types.ts";
 import { fromJsonArray, fromJsonObject, toJson } from "./rows.ts";
+import { sensitiveText } from "./rows.ts";
+import type { StorageCipher } from "./crypto.ts";
 
 export interface EventRange {
   startTs?: string;
@@ -23,21 +25,21 @@ export interface EventStore {
   sinceRowid(rowid: number, limit?: number): { maxRowid: number; events: RawEvent[] };
 }
 
-function rowToEvent(row: Record<string, unknown>): RawEvent {
+function rowToEvent(row: Record<string, unknown>, cipher?: StorageCipher): RawEvent {
   return {
     id: row.id as string,
     ts: row.ts as string,
     source: row.source as EventSource,
-    app: row.app as string,
-    window: row.window as string,
+    app: cipher?.decryptText(row.app, "raw_events.app") ?? (row.app as string),
+    window: cipher?.decryptText(row.window, "raw_events.window") ?? (row.window as string),
     type: row.type as string,
-    payload: fromJsonObject(row.payload_json) ?? {},
+    payload: fromJsonObject(row.payload_json, cipher, "raw_events.payload_json") ?? {},
     blobRefs: fromJsonArray(row.blob_refs),
     hash: row.hash as string,
   };
 }
 
-export function makeEventStore(db: DatabaseSync): EventStore {
+export function makeEventStore(db: DatabaseSync, cipher?: StorageCipher): EventStore {
   const insert = db.prepare(
     `INSERT OR IGNORE INTO raw_events
        (id, ts, source, app, window, type, payload_json, blob_refs, hash)
@@ -52,10 +54,10 @@ export function makeEventStore(db: DatabaseSync): EventStore {
       e.id,
       e.ts,
       e.source,
-      e.app,
-      e.window,
+      sensitiveText(e.app, cipher, "raw_events.app"),
+      sensitiveText(e.window, cipher, "raw_events.window"),
       e.type,
-      toJson(e.payload),
+      toJson(e.payload, cipher, "raw_events.payload_json"),
       toJson(e.blobRefs),
       e.hash,
     );
@@ -75,11 +77,11 @@ export function makeEventStore(db: DatabaseSync): EventStore {
     },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
-      return row ? rowToEvent(row) : undefined;
+      return row ? rowToEvent(row, cipher) : undefined;
     },
     getByHash(hash) {
       const row = byHash.get(hash) as Record<string, unknown> | undefined;
-      return row ? rowToEvent(row) : undefined;
+      return row ? rowToEvent(row, cipher) : undefined;
     },
     range(range = {}) {
       const where: string[] = [];
@@ -98,14 +100,14 @@ export function makeEventStore(db: DatabaseSync): EventStore {
       }
       if (range.apps?.length) {
         where.push(`app IN (${range.apps.map(() => "?").join(",")})`);
-        params.push(...range.apps);
+        params.push(...range.apps.map((app) => sensitiveText(app, cipher, "raw_events.app")!));
       }
       const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
       const limit = range.limit ? `LIMIT ${Math.floor(range.limit)}` : "";
       const rows = db
         .prepare(`SELECT * FROM raw_events ${clause} ORDER BY ts ASC ${limit}`)
         .all(...params) as Record<string, unknown>[];
-      return rows.map(rowToEvent);
+      return rows.map((row) => rowToEvent(row, cipher));
     },
     count() {
       const row = counter.get() as { n: number };
@@ -126,7 +128,7 @@ export function makeEventStore(db: DatabaseSync): EventStore {
       let max = rowid;
       const events = rows.map((r) => {
         max = Math.max(max, Number(r._rid));
-        return rowToEvent(r);
+        return rowToEvent(r, cipher);
       });
       return { maxRowid: max, events };
     },

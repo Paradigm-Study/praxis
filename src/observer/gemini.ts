@@ -3,6 +3,8 @@ import { newId as defaultNewId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
 import { renderBundle } from "./bundle.ts";
 import { logger } from "../core/log.ts";
+import { EgressAuditor } from "../privacy/egress.ts";
+import { sha256 } from "../core/hash.ts";
 import type { Observer, ObserveOptions } from "./observer.ts";
 
 const log = logger("gemini");
@@ -87,18 +89,28 @@ const SYSTEM =
 export type FetchFn = typeof fetch;
 
 export class GeminiObserver implements Observer {
+  readonly remote = true;
   readonly model: string;
-  readonly wantsImages = true;
+  readonly wantsImages: boolean;
   #apiKey: string;
   #fetch: FetchFn;
+  #auditor: EgressAuditor;
   /** Set after the current `responseFormat` shape is rejected once — later
    * calls then go straight to the legacy fields instead of paying a 400. */
   #useLegacyShape = false;
 
-  constructor(opts: { apiKey: string; model?: string; fetchFn?: FetchFn }) {
+  constructor(opts: {
+    apiKey: string;
+    model?: string;
+    fetchFn?: FetchFn;
+    auditor?: EgressAuditor;
+    includeImages?: boolean;
+  }) {
     this.#apiKey = opts.apiKey;
     this.model = opts.model ?? "gemini-3.5-flash";
     this.#fetch = opts.fetchFn ?? fetch;
+    this.#auditor = opts.auditor ?? EgressAuditor.forStore();
+    this.wantsImages = opts.includeImages ?? true;
   }
 
   async observe(bundle: ContextBundle, opts: ObserveOptions = {}): Promise<Observation> {
@@ -117,19 +129,44 @@ export class GeminiObserver implements Observer {
     parts.push({ text: userText });
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`;
-    const call = (generationConfig: Record<string, unknown>) =>
-      this.#fetch(url, {
+    const call = async (generationConfig: Record<string, unknown>) => {
+      const body = JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM }] },
+        contents: [{ role: "user", parts }],
+        generationConfig,
+      });
+      try {
+        const response = await this.#fetch(url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "x-goog-api-key": this.#apiKey,
         },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents: [{ role: "user", parts }],
-          generationConfig,
-        }),
-      });
+          body,
+        });
+        this.#auditor.record({
+          destination: url,
+          purpose: "remote_observer",
+          categories: ["reconstructed_actions", "screen_ocr", ...(bundle.frameImages?.length ? ["screenshots"] : [])],
+          bytes: Buffer.byteLength(body),
+          digest: sha256(body),
+          outcome: response.ok ? "succeeded" : "failed",
+          status: response.status,
+        });
+        return response;
+      } catch (error) {
+        this.#auditor.record({
+          destination: url,
+          purpose: "remote_observer",
+          categories: ["reconstructed_actions", "screen_context"],
+          bytes: Buffer.byteLength(body),
+          digest: sha256(body),
+          outcome: "failed",
+          error: String(error),
+        });
+        throw error;
+      }
+    };
 
     // Current (2026) structured-output shape; fall back to the legacy fields
     // if a model/endpoint rejects it — the serving API can lag the docs.
