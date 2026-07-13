@@ -4,6 +4,33 @@ import CryptoKit
 import AppKit
 import Foundation
 
+/**
+ * One permit for a whole asynchronous multi-display capture pass. Timer ticks
+ * can arrive while ScreenCaptureKit or OCR is still working; serializing those
+ * passes keeps the mutable per-display caches race-free without blocking the
+ * main run loop.
+ */
+public final class CapturePassGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inFlight = false
+
+    public init() {}
+
+    public func tryBegin() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !inFlight else { return false }
+        inFlight = true
+        return true
+    }
+
+    public func finish() {
+        lock.lock()
+        inFlight = false
+        lock.unlock()
+    }
+}
+
 /// Screen tap (ScreenCaptureKit): grabs a low-resolution frame of EVERY display
 /// on demand (called on a low-FPS timer), so a multi-monitor desk is fully
 /// visible — the reference doc on the external display is context too. PNGs go
@@ -24,41 +51,56 @@ final class ScreenCapture {
     private var lastHash: [CGDirectDisplayID: String] = [:]
     private var lastEmit: [CGDirectDisplayID: Date] = [:]
     private var lastOcr: [CGDirectDisplayID: [String]] = [:]
+    private let passGate = CapturePassGate()
+    private var passTask: Task<Void, Never>?
 
     init(policy: NativePolicyChecking) {
         self.policy = policy
     }
 
     func captureOnce() {
+        // One pass can take longer than the periodic timer on multi-display
+        // desks. Skip this tick rather than racing the per-display caches.
+        guard passGate.tryBegin() else { return }
         let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
         let started = AcquisitionFence.perform(
-            policy: policy, source: .screenVideo, app: app, window: nil
-        ) { [weak self] in
-            self?.captureAllowed(frontApp: app)
+            policy: policy, source: .screenVideo, app: nil, window: nil
+        ) {
+            self.captureAllowed(frontApp: app)
         }
-        if !started { Task { await clipBuffer?.clear() } }
+        if !started {
+            passGate.finish()
+            Task { await clipBuffer?.clear() }
+        }
     }
 
     private func captureAllowed(frontApp: String) {
-        Task {
+        passTask = Task {
+            // This covers successful completion, every thrown ScreenCaptureKit
+            // error, and cooperative task cancellation.
+            defer { self.passGate.finish() }
             do {
                 let content = try await SCShareableContent.current
-                // A display screenshot contains every visible window. If any
-                // visible app/window is excluded, skip the entire frame rather
-                // than allowing its pixels into ScreenCaptureKit output.
-                for window in content.windows where window.isOnScreen {
+                let policyWindows = content.windows.compactMap { window -> VisibleScreenWindow? in
+                    guard window.isOnScreen else { return nil }
                     let app = window.owningApplication?.applicationName ?? "unknown"
-                    let title = window.title ?? app
-                    guard self.policy.decision(
-                        source: .screenVideo, app: app, window: title, at: Date()
-                    ).allowed else {
-                        await self.clipBuffer?.clear()
-                        return
-                    }
+                    return VisibleScreenWindow(
+                        app: app,
+                        title: window.title ?? app,
+                        frame: window.frame
+                    )
+                }
+                let windows = content.windows.compactMap { window -> VisibleScreenWindow? in
+                    guard window.isOnScreen, window.windowLayer == 0,
+                          let app = window.owningApplication?.applicationName else { return nil }
+                    return VisibleScreenWindow(app: app, title: window.title ?? app, frame: window.frame)
                 }
                 for (index, display) in content.displays.enumerated() {
+                    if Task.isCancelled { return }
                     await self.capture(display, index: index,
-                                       totalDisplays: content.displays.count, app: frontApp)
+                                       totalDisplays: content.displays.count,
+                                       frontApp: frontApp, windows: windows,
+                                       policyWindows: policyWindows)
                 }
             } catch {
                 log("screen capture failed: \(error)")
@@ -66,13 +108,30 @@ final class ScreenCapture {
         }
     }
 
+    func stop() {
+        passTask?.cancel()
+        passTask = nil
+        Task { await clipBuffer?.clear() }
+    }
+
     private func capture(_ display: SCDisplay, index: Int,
-                         totalDisplays: Int, app: String) async {
+                         totalDisplays: Int, frontApp: String,
+                         windows: [VisibleScreenWindow],
+                         policyWindows: [VisibleScreenWindow]) async {
         do {
-            // Re-read the leased policy immediately before pixel acquisition.
-            guard policy.decision(
-                source: .screenVideo, app: app, window: nil, at: Date()
-            ).allowed else {
+            let attribution = ScreenFrameAttributor.attribute(
+                displayFrame: display.frame,
+                displayIndex: index,
+                frontmostApp: frontApp,
+                windows: windows,
+                policyWindows: policyWindows
+            )
+            // Re-read the leased policy for every geometry-matched window
+            // immediately before pixel acquisition. Reference displays can
+            // contain excluded content even when they are not frontmost.
+            guard ScreenFrameAttributor.acquisitionAllowed(
+                attribution, policy: policy, at: Date()
+            ) else {
                 await clipBuffer?.clear()
                 return
             }
@@ -83,6 +142,10 @@ final class ScreenCapture {
             let image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter, configuration: config
             )
+            guard !Task.isCancelled else {
+                await clipBuffer?.clear()
+                return
+            }
             // Feed the rolling clip BEFORE the changed/stale guard so it keeps
             // rolling on frames the still-emitter skips. Main display only —
             // the clip writer needs stable dimensions.
@@ -102,9 +165,14 @@ final class ScreenCapture {
             // cached text so a static display never loses its words.
             let ocr = changed ? OCR.recognize(image) : (lastOcr[display.displayID] ?? [])
             if changed { lastOcr[display.displayID] = ocr }
+            guard !Task.isCancelled else {
+                await clipBuffer?.clear()
+                return
+            }
             let blob = Emitter.shared.writeBlob(data, kind: "image", ext: "png")
             Emitter.shared.emit(
-                source: "screen_video", app: app, window: app,
+                source: "screen_video", app: attribution.app,
+                window: attribution.window,
                 type: "frame",
                 payload: [
                     "w": config.width, "h": config.height,
@@ -114,6 +182,9 @@ final class ScreenCapture {
                     "displayIndex": index,
                     "displays": totalDisplays,
                     "changed": changed,
+                    "attribution": attribution.kind,
+                    "visibleApps": attribution.visibleApps,
+                    "visibleWindows": attribution.visibleWindows,
                 ],
                 blobFiles: blob.map { [$0] }
             )

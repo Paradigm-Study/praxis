@@ -1,4 +1,10 @@
-import type { ActionEvent, ClaimKind, Episode } from "../core/types.ts";
+import type {
+  ActionEvent,
+  ClaimKind,
+  ClaimProvenance,
+  Episode,
+} from "../core/types.ts";
+import { correctionDirective } from "../reconstructor/correctionText.ts";
 
 /**
  * A claim candidate derived from a single episode, before cross-episode merge.
@@ -10,6 +16,7 @@ export interface ClaimCandidate {
   confidence: number;
   episodeId: string;
   day: string;
+  provenance?: ClaimProvenance;
 }
 
 const has = (actions: ActionEvent[], type: string) =>
@@ -25,22 +32,60 @@ export function episodeClaims(
   actions: ActionEvent[],
 ): ClaimCandidate[] {
   const day = episode.startTs.slice(0, 10);
-  const mk = (kind: ClaimKind, text: string, confidence: number): ClaimCandidate => ({
+  const mk = (
+    kind: ClaimKind,
+    text: string,
+    confidence: number,
+    provenance: ClaimProvenance = "observed_pattern",
+  ): ClaimCandidate => ({
     kind,
     text,
     confidence,
     episodeId: episode.id,
     day,
+    provenance,
   });
   const out: ClaimCandidate[] = [];
 
-  // decision_rule — from corrections (prefer X over Y).
+  // Corrections are valuable episode receipts, but only explicit durable-rule
+  // language may become immediately trusted guidance. Task-local choices stay
+  // provisional; conversational follow-ups create no memory claim at all.
   for (const a of actions) {
     if (a.action !== "corrected_agent" || !a.text) continue;
     const rejected =
       typeof a.payload?.rejects === "string" ? a.payload.rejects : undefined;
-    out.push(mk("decision_rule", decisionRuleText(a.text, rejected), 0.9));
-    out.push(mk("correction", a.text.replace(/\s+/g, " ").trim(), 0.95));
+    const directive = correctionDirective(a.text);
+    const durableScope =
+      /^(?:always|never|require|i\s+prefer|from\s+now\s+on|going\s+forward|as\s+a\s+rule)\b/i.test(directive) ||
+      /\bsource\s+of\s+truth\b/i.test(directive);
+    if (durableScope || /^(?:prefer|avoid)\b/i.test(directive)) {
+      out.push(mk(
+        "decision_rule",
+        decisionRuleText(a.text, rejected),
+        0.9,
+        durableScope ? "explicit_user_rule" : "observed_pattern",
+      ));
+    } else if (
+      /^(?:do not|don'?t)\b/i.test(directive) &&
+      !/^(?:do not|don'?t)\s+do\s+that\b/i.test(directive)
+    ) {
+      out.push(mk(
+        "decision_heuristic",
+        `Contextual correction: ${directive}`.slice(0, 500),
+        0.82,
+        "observed_pattern",
+      ));
+    } else if (
+      /^(?:use|choose|keep|switch|replace|remove|add|change|leave|restore|run|make)\b/i.test(directive) &&
+      (rejected !== undefined || /\b(?:instead(?:\s+of)?|rather\s+than|over)\b/i.test(directive))
+    ) {
+      out.push(mk(
+        "decision_heuristic",
+        `Contextual choice: ${directive}`.slice(0, 500),
+        0.82,
+        "observed_pattern",
+      ));
+    }
   }
 
   // workflow_pattern — the *stable* core cycle. Failure-handling is captured
@@ -89,19 +134,6 @@ export function episodeClaims(
     if (exts.size) {
       out.push(
         mk("artifact_type", `Primary artifacts: ${[...exts].sort().join(", ")}`, 0.75),
-      );
-    }
-  }
-
-  // unresolved_question — from low-confidence, uncertain actions.
-  for (const a of actions) {
-    if (a.confidence < 0.6 && a.uncertainty?.length) {
-      out.push(
-        mk(
-          "unresolved_question",
-          `Was "${a.text ?? a.action}" identified correctly? ${a.uncertainty[0]}`,
-          0.5,
-        ),
       );
     }
   }

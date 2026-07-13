@@ -34,6 +34,7 @@ function review(steps: string[], createdTs = "2026-06-10T10:06:00.000Z"): Correc
     targetKind: "episode",
     targetId: "episode_review",
     verdict: "edited",
+    origin: "human",
     correctedText: JSON.stringify({
       schema: WORKFLOW_REVIEW_SCHEMA,
       title: "Ship a safe change",
@@ -131,6 +132,7 @@ test("rejecting one episode removes its edges from a shared workflow claim", () 
       targetKind: "episode",
       targetId: "episode_a",
       verdict: "rejected",
+      origin: "human",
       note: WORKFLOW_REVIEW_NOTE,
       createdTs: "2026-06-12T10:00:00.000Z",
     });

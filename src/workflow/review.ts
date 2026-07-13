@@ -1,5 +1,6 @@
 import type { Correction, Episode } from "../core/types.ts";
 import type { ClaimCandidate } from "../memory/claims.ts";
+import { isHumanCorrection } from "../memory/consolidate.ts";
 import type { Store } from "../storage/index.ts";
 
 export const WORKFLOW_REVIEW_NOTE = "paradigm.workflow.review.v1";
@@ -92,7 +93,12 @@ export function latestWorkflowCorrection(
 ): Correction | undefined {
   return store.corrections
     .byTarget(episodeId)
-    .filter((item) => item.targetKind === "episode" && item.note === WORKFLOW_REVIEW_NOTE)
+    .filter(
+      (item) =>
+        item.targetKind === "episode"
+        && item.note === WORKFLOW_REVIEW_NOTE
+        && isHumanCorrection(item),
+    )
     .at(-1);
 }
 
@@ -105,8 +111,18 @@ function claimStepTitle(value: string): string {
  * replaces the heuristic workflow candidate; rejection suppresses it.
  */
 export function resolveWorkflowReview(store: Store, episode: Episode): ResolvedWorkflowReview {
-  const correction = latestWorkflowCorrection(store, episode.id);
-  if (!correction) return { reviewed: false };
+  return resolveWorkflowReviewCorrection(
+    episode,
+    latestWorkflowCorrection(store, episode.id),
+  );
+}
+
+/** Resolve a workflow review from an already-loaded correction snapshot. */
+export function resolveWorkflowReviewCorrection(
+  episode: Episode,
+  correction: Correction | undefined,
+): ResolvedWorkflowReview {
+  if (!correction || !isHumanCorrection(correction)) return { reviewed: false };
   if (correction.verdict === "rejected") return { reviewed: true, correction };
   const review = parseWorkflowReview(correction.correctedText);
   if (!review) return { reviewed: false };
@@ -121,6 +137,7 @@ export function resolveWorkflowReview(store: Store, episode: Episode): ResolvedW
       confidence: correction.verdict === "edited" ? 0.99 : 0.97,
       episodeId: episode.id,
       day: episode.startTs.slice(0, 10),
+      provenance: "human_reviewed",
     },
   };
 }

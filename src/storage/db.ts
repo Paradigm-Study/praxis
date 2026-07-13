@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export interface OpenDbOptions {
   /** Test seam: simulate a migration failure after the named version. */
@@ -102,6 +102,26 @@ function applyMigration(db: DatabaseSync, version: number): void {
       return;
     case 2:
       db.exec("CREATE TABLE IF NOT EXISTS praxis_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);");
+      return;
+    case 3:
+      if (!hasColumn(db, "claims", "provenance")) {
+        db.exec("ALTER TABLE claims ADD COLUMN provenance TEXT;");
+      }
+      return;
+    case 4:
+      if (!hasColumn(db, "corrections", "origin")) {
+        // Historical rows cannot be proven human-authored because the old MCP
+        // tool and Studio shared one shape for claims/observations. The old MCP
+        // could not target actions, episodes, or decisions, so those receipts
+        // are safely attributable to the authenticated human-facing Studio.
+        db.exec(
+          "ALTER TABLE corrections ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy';",
+        );
+        db.exec(
+          "UPDATE corrections SET origin = 'human' " +
+          "WHERE target_kind IN ('action', 'episode', 'decision');",
+        );
+      }
       return;
     default:
       throw new Error(`unknown Praxis schema migration v${version}`);

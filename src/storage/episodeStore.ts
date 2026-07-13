@@ -6,6 +6,8 @@ import type { StorageCipher } from "./crypto.ts";
 export interface EpisodeStore {
   put(e: Episode): void;
   putMany(episodes: Episode[]): void;
+  /** Atomically replace the complete derived episode projection. */
+  reconcileAll(episodes: Episode[]): void;
   get(id: string): Episode | undefined;
   all(): Episode[];
   byIds(ids: string[]): Episode[];
@@ -53,6 +55,7 @@ export function makeEpisodeStore(db: DatabaseSync, cipher?: StorageCipher): Epis
   );
   const byId = db.prepare(`SELECT * FROM episodes WHERE id = ?`);
   const counter = db.prepare(`SELECT COUNT(*) AS n FROM episodes`);
+  const remove = db.prepare(`DELETE FROM episodes WHERE id = ?`);
   const firstPage = db.prepare(
     `SELECT ${PROJECTION_COLUMNS}
        FROM episodes
@@ -94,6 +97,23 @@ export function makeEpisodeStore(db: DatabaseSync, cipher?: StorageCipher): Epis
       } catch (err) {
         db.exec("ROLLBACK");
         throw err;
+      }
+    },
+    reconcileAll(episodes) {
+      const desired = new Set(episodes.map((episode) => episode.id));
+      db.exec("SAVEPOINT praxis_episode_reconcile");
+      try {
+        const existing = db.prepare(`SELECT id FROM episodes`).all() as Array<{ id: string }>;
+        for (const episode of episodes) put(episode);
+        for (const row of existing) if (!desired.has(row.id)) remove.run(row.id);
+        db.exec("RELEASE praxis_episode_reconcile");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK TO praxis_episode_reconcile; RELEASE praxis_episode_reconcile");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        throw error;
       }
     },
     get(id) {

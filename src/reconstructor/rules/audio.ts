@@ -21,6 +21,22 @@ const SPAN_GAP_MS = 20_000;
 /** Mic/system spans within this slack of each other count as one conversation. */
 const OVERLAP_SLACK_MS = 30_000;
 
+/**
+ * A two-sided audio coincidence is enough only for apps whose primary role is a
+ * live call. Generic browsers/editors need an actual back-and-forth so nearby
+ * dictation plus a video does not become a confident meeting receipt.
+ */
+const STRONG_MEETING_APPS = [
+  /\bzoom(?:\.us)?\b/i,
+  /\bmicrosoft\s+teams\b/i,
+  /\bface\s*time\b/i,
+  /\b(?:cisco\s+)?webex\b/i,
+  /\bgoogle\s+meet\b/i,
+  /\bgo\s*to\s*meeting\b/i,
+  /\bbluejeans\b/i,
+  /\baround\b/i,
+];
+
 interface Span {
   channel: string;
   startMs: number;
@@ -33,6 +49,46 @@ function segText(e: RawEvent): string {
   return typeof t === "string" ? t : "";
 }
 
+function normalizedTranscript(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function multisetDice(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) return 0;
+  const remaining = new Map<string, number>();
+  for (const item of left) remaining.set(item, (remaining.get(item) ?? 0) + 1);
+  let intersection = 0;
+  for (const item of right) {
+    const count = remaining.get(item) ?? 0;
+    if (count > 0) {
+      intersection += 1;
+      remaining.set(item, count - 1);
+    }
+  }
+  return (2 * intersection) / (left.length + right.length);
+}
+
+function bigrams(text: string): string[] {
+  const compact = text.replace(/\s+/g, " ");
+  if (compact.length < 2) return compact ? [compact] : [];
+  return Array.from({ length: compact.length - 1 }, (_, index) => compact.slice(index, index + 2));
+}
+
+/** Deterministic transcript similarity used to reject mic/system loopback. */
+export function audioTranscriptSimilarity(left: string, right: string): number {
+  const a = normalizedTranscript(left);
+  const b = normalizedTranscript(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const tokenScore = multisetDice(a.split(" "), b.split(" "));
+  const bigramScore = multisetDice(bigrams(a), bigrams(b));
+  return Math.max(tokenScore, bigramScore);
+}
+
 function spans(events: RawEvent[], channel: string): Span[] {
   const segs = events
     .filter(
@@ -42,7 +98,7 @@ function spans(events: RawEvent[], channel: string): Span[] {
         e.payload.channel === channel &&
         segText(e).trim().length > 0,
     )
-    .sort((a, b) => toMs(a.ts) - toMs(b.ts));
+    .sort((a, b) => toMs(a.ts) - toMs(b.ts) || a.id.localeCompare(b.id));
   const out: Span[] = [];
   for (const e of segs) {
     const ms = toMs(e.ts);
@@ -62,6 +118,50 @@ function overlaps(a: Span, b: Span): boolean {
     a.startMs <= b.endMs + OVERLAP_SLACK_MS &&
     b.startMs <= a.endMs + OVERLAP_SLACK_MS
   );
+}
+
+function spanText(span: Span): string {
+  return span.segments.map(segText).join(" ");
+}
+
+function strongMeetingApp(...spans: Span[]): boolean {
+  return spans.some((span) => {
+    const app = span.segments[0]?.app ?? "";
+    return STRONG_MEETING_APPS.some((pattern) => pattern.test(app));
+  });
+}
+
+/** Count speaker turns after collapsing consecutive segments on one channel. */
+function alternatingTurnCount(...spans: Span[]): number {
+  const ordered = spans
+    .flatMap((span) => span.segments.map((event) => ({ channel: span.channel, event })))
+    .sort((left, right) =>
+      toMs(left.event.ts) - toMs(right.event.ts) || left.event.id.localeCompare(right.event.id)
+    );
+  let turns = 0;
+  let previous: string | undefined;
+  for (const item of ordered) {
+    if (item.channel === previous) continue;
+    turns += 1;
+    previous = item.channel;
+  }
+  return turns;
+}
+
+function likelyEcho(mic: Span, system: Span): boolean {
+  if (!overlaps(mic, system)) return false;
+  const micText = normalizedTranscript(spanText(mic));
+  const systemText = normalizedTranscript(spanText(system));
+  const micLength = micText.replace(/\s/g, "").length;
+  const systemLength = systemText.replace(/\s/g, "").length;
+  const shortest = Math.min(micLength, systemLength);
+  const longest = Math.max(micLength, systemLength);
+  if (shortest < 8 || longest === 0 || shortest / longest < 0.65) return false;
+  return audioTranscriptSimilarity(micText, systemText) >= 0.86;
+}
+
+function midpoint(span: Span): number {
+  return span.startMs + (span.endMs - span.startMs) / 2;
 }
 
 function snippet(spansIn: Span[], n: number): string {
@@ -94,8 +194,21 @@ export function audioActivity(ctx: RuleContext): ActionEvent[] {
 
   // Interleaved mic + system speech → a conversation with another party.
   for (const m of mic) {
-    const partner = system.find((s) => !pairedSystem.has(s) && overlaps(m, s));
-    if (partner) {
+    // System capture can contain a looped-back copy of the microphone. Treat
+    // that as one playback span, not as two people in a meeting.
+    if (system.some((s) => likelyEcho(m, s))) continue;
+    const partner = system
+      .filter((s) => !pairedSystem.has(s) && overlaps(m, s))
+      .sort(
+        (a, b) =>
+          Math.abs(midpoint(a) - midpoint(m)) - Math.abs(midpoint(b) - midpoint(m)) ||
+          a.startMs - b.startMs ||
+          a.segments[0]!.id.localeCompare(b.segments[0]!.id),
+      )[0];
+    const isMeeting = partner !== undefined && (
+      strongMeetingApp(m, partner) || alternatingTurnCount(m, partner) >= 3
+    );
+    if (partner && isMeeting) {
       pairedSystem.add(partner);
       const both = [m, partner];
       out.push(

@@ -16,14 +16,21 @@ import Speech
 ///     audio or text leaves the machine through this path.
 public final class AudioCapture: NSObject {
     private let policy: NativePolicyChecking
+    private let onReadiness: (NativeSourceReadiness) -> Void
     private var systemTap: SystemAudioTap?
     private var micTap: MicTap?
     private let systemChunker: SpeechChunker
     private let micChunker: SpeechChunker
 
-    public init(policy: NativePolicyChecking) {
+    public init(
+        policy: NativePolicyChecking,
+        onReadiness: @escaping (NativeSourceReadiness) -> Void = { _ in }
+    ) {
         self.policy = policy
-        self.systemChunker = SpeechChunker(channel: "system", policy: policy)
+        self.onReadiness = onReadiness
+        self.systemChunker = SpeechChunker(
+            channel: "system", policy: policy, requiresScreenPolicy: true
+        )
         self.micChunker = SpeechChunker(channel: "mic", policy: policy)
         super.init()
         // Warm the tracker from the main thread NOW — its first lazy touch
@@ -46,20 +53,38 @@ public final class AudioCapture: NSObject {
         ).allowed
         let enableSystem = system && allowed && screenAllowed
         let enableMic = mic && allowed
-        if !allowed {
-            systemChunker.discard()
-            micChunker.discard()
-        }
-        if enableSystem, systemTap == nil {
-            let tap = SystemAudioTap(chunker: systemChunker, policy: policy)
-            systemTap = tap
-            tap.start()
-        } else if !enableSystem, let tap = systemTap {
+        // Disabling is synchronous at the chunk boundary: buffered audio and
+        // in-flight transcription generations are invalidated before this
+        // method returns, so a late recognizer callback cannot emit after opt-out.
+        systemChunker.setEnabled(enableSystem)
+        micChunker.setEnabled(enableMic)
+        if enableSystem {
+            if systemTap == nil {
+                systemTap = SystemAudioTap(
+                    chunker: systemChunker,
+                    policy: policy,
+                    onReadiness: onReadiness
+                )
+            }
+            // Reconcile every policy tick. The tap owns single-flight and
+            // bounded retry state, so a transient SCStream failure can recover.
+            systemTap?.start()
+        } else if let tap = systemTap {
             tap.stop(); systemTap = nil
+            if system {
+                onReadiness(NativeSourceReadiness(
+                    channel: "audio_system", status: "unavailable",
+                    reason: allowed ? "screen-capture-unavailable" : "capture-policy-blocked"
+                ))
+            }
         }
         if enableMic {
             if micTap == nil {
-                micTap = MicTap(chunker: micChunker, policy: policy)
+                micTap = MicTap(
+                    chunker: micChunker,
+                    policy: policy,
+                    onReadiness: onReadiness
+                )
             }
             // Reconcile on every policy tick. If the user grants Microphone
             // access while capture is already running, a previously blocked
@@ -67,6 +92,12 @@ public final class AudioCapture: NSObject {
             micTap?.start()
         } else if !enableMic, let tap = micTap {
             tap.stop(); micTap = nil
+            if mic {
+                onReadiness(NativeSourceReadiness(
+                    channel: "audio_mic", status: "unavailable",
+                    reason: "capture-policy-blocked"
+                ))
+            }
         }
     }
 
@@ -146,6 +177,7 @@ final class FrontmostTracker {
 final class SpeechChunker {
     let channel: String
     private let policy: NativePolicyChecking
+    private let requiresScreenPolicy: Bool
     private let queue: DispatchQueue
     /// RMS below this is silence. Tuned for normalized float PCM.
     private let silenceRMS: Float = 0.012
@@ -158,10 +190,17 @@ final class SpeechChunker {
     private var spanApp = "unknown"
     private var spanWindow = "unknown"
     private var emittedPlaying = false
+    private var enabled = false
+    private var generation: UInt64 = 0
 
-    init(channel: String, policy: NativePolicyChecking) {
+    init(
+        channel: String,
+        policy: NativePolicyChecking,
+        requiresScreenPolicy: Bool = false
+    ) {
         self.channel = channel
         self.policy = policy
+        self.requiresScreenPolicy = requiresScreenPolicy
         self.queue = DispatchQueue(label: "praxis.audio.\(channel)")
     }
 
@@ -169,21 +208,37 @@ final class SpeechChunker {
         queue.async { self.appendLocked(buffer) }
     }
 
-    func discard() {
-        queue.async {
-            self.buffers = []
-            self.spanSec = 0
-            self.silentSec = 0
-            self.emittedPlaying = false
+    /// Called from CaptureRunner's main-thread reconciliation path.
+    /// Synchronous disable is deliberate: no buffered audio survives opt-out.
+    func setEnabled(_ value: Bool) {
+        queue.sync {
+            guard self.enabled != value else { return }
+            self.enabled = value
+            self.generation &+= 1
+            if !value { self.resetLocked() }
         }
     }
 
+    func discard() {
+        queue.sync {
+            self.generation &+= 1
+            self.resetLocked()
+        }
+    }
+
+    private func resetLocked() {
+        buffers = []
+        spanSec = 0
+        silentSec = 0
+        emittedPlaying = false
+    }
+
     private func appendLocked(_ buffer: AVAudioPCMBuffer) {
+        guard enabled else { return }
         let front = FrontmostTracker.shared.context
-        guard policy.decision(
-            source: .audio, app: front.app, window: front.window, at: Date()
-        ).allowed else {
-            buffers = []; spanSec = 0; silentSec = 0; emittedPlaying = false
+        guard policyAllows(app: front.app, window: front.window) else {
+            generation &+= 1
+            resetLocked()
             return
         }
         let dur = Double(buffer.frameLength) / buffer.format.sampleRate
@@ -225,9 +280,7 @@ final class SpeechChunker {
 
     private func emitPlayback(_ playing: Bool, level: Float) {
         let front = FrontmostTracker.shared.context
-        guard policy.decision(
-            source: .audio, app: front.app, window: front.window, at: Date()
-        ).allowed else { return }
+        guard policyAllows(app: front.app, window: front.window) else { return }
         Emitter.shared.emit(
             source: "audio", app: front.app,
             window: channel, type: "playback_state",
@@ -240,21 +293,33 @@ final class SpeechChunker {
         let chunk = buffers
         let app = spanApp
         let window = spanWindow
+        let chunkGeneration = generation
         buffers = []; spanSec = 0; silentSec = 0
         guard !chunk.isEmpty else { return }
         Transcriber.shared.transcribe(chunk) { [channel] text, confidence, lang in
-            guard let text, !text.isEmpty else { return }
-            guard self.policy.decision(
-                source: .audio, app: app, window: window, at: Date()
-            ).allowed else { return }
-            Emitter.shared.emit(
-                source: "audio", app: app, window: channel,
-                type: "transcript_segment",
-                payload: ["channel": channel, "text": text,
-                          "conf": Double(round(confidence * 100) / 100),
-                          "lang": lang ?? "unknown"]
-            )
+            self.queue.async {
+                guard self.enabled, self.generation == chunkGeneration,
+                      let text, !text.isEmpty else { return }
+                guard self.policyAllows(app: app, window: window) else { return }
+                Emitter.shared.emit(
+                    source: "audio", app: app, window: channel,
+                    type: "transcript_segment",
+                    payload: ["channel": channel, "text": text,
+                              "conf": Double(round(confidence * 100) / 100),
+                              "lang": lang ?? "unknown"]
+                )
+            }
         }
+    }
+
+    private func policyAllows(app: String, window: String) -> Bool {
+        let now = Date()
+        guard policy.decision(
+            source: .audio, app: app, window: window, at: now
+        ).allowed else { return false }
+        return !requiresScreenPolicy || policy.decision(
+            source: .screenVideo, app: app, window: window, at: now
+        ).allowed
     }
 }
 
@@ -357,75 +422,149 @@ final class Transcriber {
 final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
     private let chunker: SpeechChunker
     private let policy: NativePolicyChecking
+    private let onReadiness: (NativeSourceReadiness) -> Void
+    private let stateLock = NSLock()
+    private var lifecycle = AudioTapLifecycle()
     private var stream: SCStream?
     private let queue = DispatchQueue(label: "praxis.audio.scstream")
 
-    init(chunker: SpeechChunker, policy: NativePolicyChecking) {
+    init(
+        chunker: SpeechChunker,
+        policy: NativePolicyChecking,
+        onReadiness: @escaping (NativeSourceReadiness) -> Void
+    ) {
         self.chunker = chunker
         self.policy = policy
+        self.onReadiness = onReadiness
         super.init()
     }
 
     func start() {
-        let front = FrontmostTracker.shared.context
-        guard policy.decision(
-            source: .audio, app: front.app, window: front.window, at: Date()
-        ).allowed,
-        policy.decision(
-            source: .screenVideo, app: front.app, window: front.window, at: Date()
-        ).allowed else { return }
-        Task {
-            do {
-                let content = try await SCShareableContent.current
-                guard let display = content.displays.first else {
-                    log("audio: no display for system tap"); return
-                }
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                config.capturesAudio = true
-                config.excludesCurrentProcessAudio = true
-                config.sampleRate = 48_000
-                config.channelCount = 1
-                // Minimal video: SCStream requires a video config, but nothing
-                // reads these frames — the real screen tap stays on its own timer.
-                config.width = 2
-                config.height = 2
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-                let s = SCStream(filter: filter, configuration: config, delegate: self)
-                try s.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-                // SCStream has no audio-only mode; without a registered .screen
-                // output it logs a dropped-frame error PER FRAME. Register one
-                // and discard its frames.
-                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-                let current = FrontmostTracker.shared.context
-                guard self.policy.decision(
-                    source: .audio, app: current.app, window: current.window, at: Date()
-                ).allowed,
-                self.policy.decision(
-                    source: .screenVideo, app: current.app, window: current.window, at: Date()
-                ).allowed else { return }
-                try await s.startCapture()
-                stream = s
-                log("audio: system-output tap started")
-            } catch {
-                log("audio: system tap failed to start: \(error)")
-            }
-        }
+        guard policyAllowsStart() else { return }
+        stateLock.lock()
+        let token = lifecycle.requestStart(now: Date.timeIntervalSinceReferenceDate)
+        stateLock.unlock()
+        guard let token else { return }
+        onReadiness(NativeSourceReadiness(
+            channel: "audio_system", status: "unavailable", reason: "tap-starting"
+        ))
+        Task { [weak self] in await self?.startStream(token: token) }
     }
 
     func stop() {
-        let s = stream
+        stateLock.lock()
+        lifecycle.cancel()
+        let activeStream = stream
         stream = nil
+        stateLock.unlock()
+        chunker.discard()
+        let s = activeStream
         Task { try? await s?.stopCapture() }
         log("audio: system-output tap stopped")
     }
 
+    private func startStream(token: UInt64) async {
+        do {
+            let content = try await SCShareableContent.current
+            guard startIsCurrent(token) else { return }
+            guard let display = content.displays.first else {
+                failStart(token, reason: "no-display")
+                return
+            }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let config = SCStreamConfiguration()
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 1
+            // Minimal video: SCStream requires a video config, but nothing
+            // reads these frames — the real screen tap stays on its own timer.
+            config.width = 2
+            config.height = 2
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+            let candidate = SCStream(filter: filter, configuration: config, delegate: self)
+            try candidate.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+            // SCStream has no audio-only mode; without a registered .screen
+            // output it logs a dropped-frame error PER FRAME. Register one
+            // and discard its frames.
+            try candidate.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+            guard startIsCurrent(token) else { return }
+            guard policyAllowsStart() else {
+                failStart(token, reason: "capture-policy-blocked")
+                return
+            }
+            try await candidate.startCapture()
+            guard policyAllowsStart() else {
+                try? await candidate.stopCapture()
+                failStart(token, reason: "capture-policy-blocked")
+                return
+            }
+
+            // Stream installation and desired-state completion share one lock
+            // with stop(). Either stop takes the candidate, or this stale task
+            // rejects it and shuts it down; there is no orphan window.
+            let accepted = installStartedStream(candidate, token: token)
+            guard accepted else {
+                try? await candidate.stopCapture()
+                return
+            }
+            onReadiness(NativeSourceReadiness(
+                channel: "audio_system", status: "ready", reason: nil
+            ))
+            log("audio: system-output tap started")
+        } catch {
+            failStart(token, reason: "tap-start-failed")
+            log("audio: system tap failed to start: \(error)")
+        }
+    }
+
+    private func startIsCurrent(_ token: UInt64) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return lifecycle.acceptsStart(token)
+    }
+
+    private func installStartedStream(_ candidate: SCStream, token: UInt64) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        let accepted = lifecycle.completeStart(
+            token, succeeded: true, now: Date.timeIntervalSinceReferenceDate
+        )
+        if accepted { stream = candidate }
+        return accepted
+    }
+
+    private func failStart(_ token: UInt64, reason: String) {
+        stateLock.lock()
+        let current = lifecycle.acceptsStart(token)
+        if current {
+            lifecycle.completeStart(
+                token, succeeded: false, now: Date.timeIntervalSinceReferenceDate
+            )
+        }
+        stateLock.unlock()
+        if current {
+            onReadiness(NativeSourceReadiness(
+                channel: "audio_system", status: "unavailable", reason: reason
+            ))
+        }
+    }
+
+    private func policyAllowsStart() -> Bool {
+        let front = FrontmostTracker.shared.context
+        return policy.decision(
+            source: .audio, app: front.app, window: front.window, at: Date()
+        ).allowed && policy.decision(
+            source: .screenVideo, app: front.app, window: front.window, at: Date()
+        ).allowed
+    }
+
+    private func streamIsActive(_ candidate: SCStream) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return lifecycle.running && stream === candidate
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        let front = FrontmostTracker.shared.context
-        guard policy.decision(
-                source: .audio, app: front.app, window: front.window, at: Date()
-              ).allowed,
+        guard streamIsActive(stream), policyAllowsStart(),
               type == .audio, sampleBuffer.isValid,
               let pcm = AudioCaptureMath.pcmBuffer(from: sampleBuffer) else { return }
         chunker.append(pcm)
@@ -433,7 +572,19 @@ final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("audio: system tap stopped with error: \(error)")
-        self.stream = nil
+        stateLock.lock()
+        let wasActive = self.stream === stream && lifecycle.running
+        if wasActive {
+            self.stream = nil
+            lifecycle.stoppedUnexpectedly(now: Date.timeIntervalSinceReferenceDate)
+        }
+        stateLock.unlock()
+        if wasActive {
+            chunker.discard()
+            onReadiness(NativeSourceReadiness(
+                channel: "audio_system", status: "unavailable", reason: "tap-stopped"
+            ))
+        }
     }
 }
 
@@ -442,14 +593,19 @@ final class SystemAudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
 final class MicTap {
     private let chunker: SpeechChunker
     private let policy: NativePolicyChecking
+    private let onReadiness: (NativeSourceReadiness) -> Void
     private var engine: AVAudioEngine?
-    private var desired = false
-    private var startInFlight = false
+    private var lifecycle = AudioTapLifecycle()
     private var lastReportedAuthorization: AVAuthorizationStatus?
 
-    init(chunker: SpeechChunker, policy: NativePolicyChecking) {
+    init(
+        chunker: SpeechChunker,
+        policy: NativePolicyChecking,
+        onReadiness: @escaping (NativeSourceReadiness) -> Void
+    ) {
         self.chunker = chunker
         self.policy = policy
+        self.onReadiness = onReadiness
     }
 
     func start() {
@@ -457,48 +613,71 @@ final class MicTap {
             DispatchQueue.main.async { [weak self] in self?.start() }
             return
         }
-        desired = true
-        guard engine == nil, !startInFlight else { return }
+        if let existing = engine, !existing.isRunning {
+            existing.inputNode.removeTap(onBus: 0)
+            existing.stop()
+            engine = nil
+            lifecycle.stoppedUnexpectedly(now: Date.timeIntervalSinceReferenceDate)
+            chunker.discard()
+            onReadiness(NativeSourceReadiness(
+                channel: "audio_mic", status: "unavailable", reason: "tap-stopped"
+            ))
+        }
+        guard engine == nil,
+              let token = lifecycle.requestStart(now: Date.timeIntervalSinceReferenceDate)
+        else { return }
+        onReadiness(NativeSourceReadiness(
+            channel: "audio_mic", status: "unavailable", reason: "tap-starting"
+        ))
 
         let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
         switch authorization {
         case .authorized:
             lastReportedAuthorization = nil
-            startInFlight = true
-            startEngine()
+            startEngine(token: token)
         case .notDetermined:
-            startInFlight = true
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.startInFlight = false
-                    guard self.desired else { return }
+                    guard self.lifecycle.acceptsStart(token) else { return }
                     if granted {
-                        self.start()
+                        self.startEngine(token: token)
                     } else {
                         self.reportBlockedAuthorization(.denied)
+                        self.failStart(token: token, status: "blocked",
+                                       reason: "microphone-permission-denied")
                     }
                 }
             }
         case .denied, .restricted:
             reportBlockedAuthorization(authorization)
+            failStart(
+                token: token,
+                status: "blocked",
+                reason: "microphone-permission-\(Permissions.microphoneAuthorization())"
+            )
         @unknown default:
             reportBlockedAuthorization(authorization)
+            failStart(token: token, status: "blocked", reason: "microphone-permission-unknown")
         }
     }
 
-    private func startEngine() {
-        defer { startInFlight = false }
-        guard desired, engine == nil else { return }
+    private func startEngine(token: UInt64) {
+        guard lifecycle.acceptsStart(token), engine == nil else { return }
         let front = FrontmostTracker.shared.context
         guard policy.decision(
             source: .audio, app: front.app, window: front.window, at: Date()
-        ).allowed else { return }
+        ).allowed else {
+            failStart(token: token, status: "unavailable", reason: "capture-policy-blocked")
+            return
+        }
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0 else {
-            log("audio: no usable mic input format"); return
+            failStart(token: token, status: "unavailable", reason: "no-usable-input")
+            log("audio: no usable mic input format")
+            return
         }
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             // The engine reuses the tap buffer after the block returns; copy
@@ -513,10 +692,21 @@ final class MicTap {
         }
         do {
             try engine.start()
+            guard lifecycle.completeStart(
+                token, succeeded: true, now: Date.timeIntervalSinceReferenceDate
+            ) else {
+                input.removeTap(onBus: 0)
+                engine.stop()
+                return
+            }
             self.engine = engine
+            onReadiness(NativeSourceReadiness(
+                channel: "audio_mic", status: "ready", reason: nil
+            ))
             log("audio: microphone tap started")
         } catch {
             input.removeTap(onBus: 0)
+            failStart(token: token, status: "unavailable", reason: "tap-start-failed")
             log("audio: mic engine failed: \(error)")
         }
     }
@@ -526,12 +716,22 @@ final class MicTap {
             DispatchQueue.main.async { [weak self] in self?.stop() }
             return
         }
-        desired = false
-        startInFlight = false
+        lifecycle.cancel()
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
+        chunker.discard()
         log("audio: microphone tap stopped")
+    }
+
+    private func failStart(token: UInt64, status: String, reason: String) {
+        guard lifecycle.acceptsStart(token) else { return }
+        lifecycle.completeStart(
+            token, succeeded: false, now: Date.timeIntervalSinceReferenceDate
+        )
+        onReadiness(NativeSourceReadiness(
+            channel: "audio_mic", status: status, reason: reason
+        ))
     }
 
     private func reportBlockedAuthorization(_ authorization: AVAuthorizationStatus) {

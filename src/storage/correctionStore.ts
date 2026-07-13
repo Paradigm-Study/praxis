@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type {
   Correction,
+  CorrectionOrigin,
   CorrectionTarget,
   CorrectionVerdict,
 } from "../core/types.ts";
@@ -16,11 +17,15 @@ export interface CorrectionStore {
 }
 
 function rowToCorrection(row: Record<string, unknown>, cipher?: StorageCipher): Correction {
+  const origin: CorrectionOrigin = row.origin === "human" || row.origin === "agent"
+    ? row.origin
+    : "legacy";
   return {
     id: row.id as string,
     targetKind: row.target_kind as CorrectionTarget,
     targetId: row.target_id as string,
     verdict: row.verdict as CorrectionVerdict,
+    origin,
     correctedText: strOrUndef(row.corrected_text, cipher, "corrections.corrected_text"),
     note: strOrUndef(row.note, cipher, "corrections.note"),
     createdTs: row.created_ts as string,
@@ -30,12 +35,12 @@ function rowToCorrection(row: Record<string, unknown>, cipher?: StorageCipher): 
 export function makeCorrectionStore(db: DatabaseSync, cipher?: StorageCipher): CorrectionStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO corrections
-       (id, target_kind, target_id, verdict, corrected_text, note, created_ts)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (id, target_kind, target_id, verdict, origin, corrected_text, note, created_ts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const byId = db.prepare(`SELECT * FROM corrections WHERE id = ?`);
   const byTarget = db.prepare(
-    `SELECT * FROM corrections WHERE target_id = ? ORDER BY created_ts ASC`,
+    `SELECT * FROM corrections WHERE target_id = ? ORDER BY created_ts ASC, rowid ASC`,
   );
 
   return {
@@ -45,6 +50,7 @@ export function makeCorrectionStore(db: DatabaseSync, cipher?: StorageCipher): C
         c.targetKind,
         c.targetId,
         c.verdict,
+        c.origin ?? "legacy",
         sensitiveText(c.correctedText, cipher, "corrections.corrected_text"),
         sensitiveText(c.note, cipher, "corrections.note"),
         c.createdTs,
@@ -56,13 +62,13 @@ export function makeCorrectionStore(db: DatabaseSync, cipher?: StorageCipher): C
     },
     all() {
       const rows = db
-        .prepare(`SELECT * FROM corrections ORDER BY created_ts ASC`)
+        .prepare(`SELECT * FROM corrections ORDER BY created_ts ASC, rowid ASC`)
         .all() as Record<string, unknown>[];
       return rows.map((row) => rowToCorrection(row, cipher));
     },
     recent(limit) {
       const rows = db
-        .prepare(`SELECT * FROM corrections ORDER BY created_ts DESC, id DESC LIMIT ?`)
+        .prepare(`SELECT * FROM corrections ORDER BY created_ts DESC, rowid DESC LIMIT ?`)
         .all(Math.max(0, Math.floor(limit))) as Record<string, unknown>[];
       return rows.map((row) => rowToCorrection(row, cipher)).reverse();
     },

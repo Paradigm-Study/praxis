@@ -2,6 +2,7 @@ import type { ActionEvent, Claim, Observation } from "../core/types.ts";
 import { termCoverage } from "./retrieve.ts";
 import { toMs } from "../core/time.ts";
 import { redactText } from "../mesh/redact.ts";
+import { isQuestionWorthy, substantiveAction } from "./questionQuality.ts";
 
 export type DecisionKind =
   | "keep_observing"
@@ -98,6 +99,7 @@ function freshError(actions: ActionEvent[]): ActionEvent | undefined {
     .filter(
       (a) =>
         a.action === "encountered_error" &&
+        substantiveAction(a) &&
         a.confidence >= DISPATCH_ERROR_CONFIDENCE &&
         newestTs - toMs(a.startTs) <= DISPATCH_ERROR_FRESH_MS,
     )
@@ -144,7 +146,12 @@ export function decide(input: PolicyInput): Decision {
 
   // 2. A pressing uncertainty about a low-confidence action => ask the expert —
   //    UNLESS long-term memory has already established the answer.
-  if (obs.uncertainty.length > 0 && obs.suggestedQuestion && !established) {
+  if (
+    obs.uncertainty.length > 0 &&
+    obs.suggestedQuestion &&
+    !established &&
+    isQuestionWorthy(obs, input.actions)
+  ) {
     return {
       ...base,
       kind: "ask_expert",
@@ -196,7 +203,14 @@ export function decide(input: PolicyInput): Decision {
 
   // 5. Lingering uncertainty with no question => just flag it (unless long-term
   //    memory already resolved it).
-  if (obs.uncertainty.length > 0 && !established) {
+  if (
+    obs.model !== "mock" &&
+    obs.uncertainty.length > 0 &&
+    !established &&
+    input.actions.some((action) =>
+      obs.evidence.includes(action.id) && substantiveAction(action),
+    )
+  ) {
     return {
       ...base,
       kind: "mark_uncertainty",

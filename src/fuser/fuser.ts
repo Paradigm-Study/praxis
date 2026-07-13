@@ -49,11 +49,14 @@ export function fuseActions(
 /** Read actions from the ledger, fuse, and (by default) persist episodes. */
 export function fuse(
   store: Store,
-  opts: FuseOptions & { persist?: boolean } = {},
+  opts: FuseOptions & { persist?: boolean; reconcile?: boolean } = {},
 ): Episode[] {
   const actions = store.actions.range();
   const episodes = fuseActions(actions, opts);
-  if (opts.persist !== false) store.episodes.putMany(episodes);
+  if (opts.persist !== false) {
+    if (opts.reconcile ?? true) store.episodes.reconcileAll(episodes);
+    else store.episodes.putMany(episodes);
+  }
   return episodes;
 }
 

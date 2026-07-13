@@ -6,6 +6,7 @@ import type {
   ActionEvent,
   BoundaryReason,
   Claim,
+  ClaimProvenance,
   Correction,
   CorrectionTarget,
   CorrectionVerdict,
@@ -25,9 +26,13 @@ import { handleBrowserIngest } from "./browserIngest.ts";
 import { createMcpRouter } from "../mcp/router.ts";
 import { isAllowedOrigin } from "../mcp/protocol.ts";
 import { buildGraph } from "../memory/graph.ts";
+import { applyCorrections } from "../memory/consolidate.ts";
 import { logger } from "../core/log.ts";
 import { PrivacyControlStore, type PrivacyControl } from "../privacy/control.ts";
-import { RuntimeStatusStore } from "../capture/runtimeStatus.ts";
+import {
+  RuntimeStatusStore,
+  type CaptureRuntimeStatus,
+} from "../capture/runtimeStatus.ts";
 import { publishNativeAcquisitionPolicy } from "../privacy/nativePolicy.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
 import {
@@ -38,6 +43,17 @@ import {
 } from "../storage/maintenance.ts";
 import { authorizeLocalRequest, validateLocalToken } from "../security/localAuth.ts";
 import { parseWorkflowReview, WORKFLOW_REVIEW_NOTE } from "../workflow/review.ts";
+import {
+  DISMISSED_QUESTION_NOTE_PREFIX,
+  actionQuestionWasResolved,
+  decisionHasSubstantiveEvidence,
+  isActionQuestionWorthy,
+  isMeaningfulCorrection,
+  normalizeQuestion,
+  questionWasResolved,
+  sameQuestion,
+  uniqueQuestionDecisions,
+} from "../agent/questionQuality.ts";
 
 const log = logger("studio");
 
@@ -66,6 +82,27 @@ const WORKFLOW_BOUNDARY_REASONS = new Set<BoundaryReason>([
   "session_start",
   "session_end",
 ]);
+const CLAIM_PROVENANCES = new Set<ClaimProvenance>([
+  "observed_pattern",
+  "model_inference",
+  "explicit_user_rule",
+  "user_answer",
+  "human_reviewed",
+]);
+
+function correctionTargetExists(
+  store: Store,
+  targetKind: CorrectionTarget,
+  targetId: string,
+): boolean {
+  switch (targetKind) {
+    case "action": return store.actions.get(targetId) !== undefined;
+    case "episode": return store.episodes.get(targetId) !== undefined;
+    case "claim": return store.claims.get(targetId) !== undefined;
+    case "observation": return store.observations.get(targetId) !== undefined;
+    case "decision": return store.decisions.get(targetId) !== undefined;
+  }
+}
 
 interface WorkflowTruncation {
   truncated: boolean;
@@ -523,12 +560,17 @@ function projectSnapshotClaim(claim: Claim): Claim {
   const confidence = Number.isFinite(claim.confidence)
     ? Math.max(0, Math.min(1, claim.confidence))
     : 0;
+  const provenance = claim.provenance !== undefined
+    && CLAIM_PROVENANCES.has(claim.provenance)
+    ? claim.provenance
+    : undefined;
   return {
     id: clippedString(claim.id, 256, "claim.id", tracker, "claim"),
     kind: clippedString(claim.kind, 160, "claim.kind", tracker, "unknown"),
     text: clippedString(claim.text, 4_000, "claim.text", tracker, "Unavailable claim"),
     confidence,
     evidenceEpisodes: clippedStrings(claim.evidenceEpisodes, 64, 256, "claim.evidenceEpisodes", tracker),
+    ...(provenance !== undefined ? { provenance } : {}),
     createdTs: clippedString(claim.createdTs, 64, "claim.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
     updatedTs: clippedString(claim.updatedTs, 64, "claim.updatedTs", tracker, "1970-01-01T00:00:00.000Z"),
   };
@@ -608,6 +650,10 @@ function projectSnapshotCorrection(correction: Correction): Correction {
     targetKind: correction.targetKind,
     targetId: clippedString(correction.targetId, 256, "correction.targetId", tracker, "unknown"),
     verdict: correction.verdict,
+    origin:
+      correction.origin === "human" || correction.origin === "agent"
+        ? correction.origin
+        : "legacy",
     ...(correctedText !== undefined ? { correctedText } : {}),
     ...(note !== undefined ? { note } : {}),
     createdTs: clippedString(correction.createdTs, 64, "correction.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
@@ -837,7 +883,15 @@ function handleApi(
           1,
           CLAIM_SNAPSHOT_LIMIT,
         );
-        return json(res, 200, boundedHead(store.claims.top(limit).map(projectSnapshotClaim)));
+        const claims = applyCorrections(
+          store.claims.all(),
+          store.corrections.all().filter((correction) => correction.targetKind === "claim"),
+        )
+          .sort((left, right) =>
+            right.confidence - left.confidence || right.updatedTs.localeCompare(left.updatedTs),
+          )
+          .slice(0, limit);
+        return json(res, 200, boundedHead(claims.map(projectSnapshotClaim)));
       }
       case "/api/graph": {
         const nodeLimit = boundedQueryInteger(
@@ -1042,42 +1096,49 @@ function handleApi(
         if (targetKind !== "episode") {
           return json(res, 400, { error: "workflow reviews must target an episode" });
         }
-        if (!store.episodes.get(targetId)) {
-          return json(res, 404, { error: "workflow episode not found" });
-        }
         if (verdict !== "rejected" && !parseWorkflowReview(correctedText)) {
           return json(res, 400, { error: "invalid workflow review payload" });
         }
+      } else if (verdict === "edited" && !isMeaningfulCorrection(correctedText)) {
+        return json(res, 400, { error: "edited corrections require replacement text" });
       }
       const correction: Correction = {
         id: newId("corr"),
         targetKind,
         targetId,
         verdict,
+        origin: "human",
         correctedText,
         note,
         createdTs: nowIso(),
       };
-      if (isWorkflowReview) {
-        // The review and every materialized claim/node/edge change are one
-        // unit. A graph failure must never leave a verdict that the graph and
-        // playbook do not reflect.
-        store.db.exec("BEGIN IMMEDIATE");
-        try {
-          store.corrections.put(correction);
-          buildGraph(store);
-          store.db.exec("COMMIT");
-        } catch (error) {
-          try {
-            store.db.exec("ROLLBACK");
-          } catch {
-            // Preserve the materialization error if SQLite already aborted.
-          }
-          log.error(`workflow correction rolled back: ${String(error)}`);
-          return json(res, 500, { error: "workflow review could not be persisted" });
+      // A correction and its derived memory projection are one unit. This is
+      // true for action/episode/observation/decision corrections too: accepting
+      // a verdict while leaving contradicted claims visible breaks trust.
+      store.db.exec("BEGIN IMMEDIATE");
+      try {
+        // Validate under the same writer lock as the receipt. Otherwise a
+        // concurrent projection/forget can remove the target between a
+        // successful check and this insert, leaving an orphan correction.
+        if (!correctionTargetExists(store, targetKind, targetId)) {
+          store.db.exec("ROLLBACK");
+          return json(res, 404, {
+            error: isWorkflowReview
+              ? "workflow episode not found"
+              : `${targetKind} correction target not found`,
+          });
         }
-      } else {
         store.corrections.put(correction);
+        buildGraph(store);
+        store.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          store.db.exec("ROLLBACK");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        log.error(`correction rolled back: ${String(error)}`);
+        return json(res, 500, { error: "correction could not be persisted" });
       }
       log.info(`correction: ${correction.verdict} on ${correction.targetId}`);
       return json(res, 200, correction);
@@ -1088,20 +1149,51 @@ function handleApi(
   if (req.method === "POST" && path === "/api/answer") {
     return readBody(req, res, (body) => {
       const data = safeParse(body) as Record<string, unknown> | undefined;
-      if (!data?.questionId || data.answer == null) {
-        return json(res, 400, { error: "questionId and answer required" });
+      const dismissed = data?.dismissed === true;
+      if (!data?.questionId || (!dismissed && data.answer == null)) {
+        return json(res, 400, { error: "questionId and answer (or dismissed) required" });
       }
-      const answer = {
+      const question = data.question ? String(data.question).trim() : "";
+      const correctedText = dismissed ? undefined : String(data.answer).trim();
+      if (!dismissed && !isMeaningfulCorrection(correctedText)) {
+        return json(res, 400, { error: "answer requires your replacement text" });
+      }
+      const answer: Correction = {
         id: newId("corr"),
         targetKind: "decision" as const,
         targetId: String(data.questionId),
-        verdict: "edited" as const,
-        correctedText: String(data.answer),
-        note: data.question ? String(data.question) : undefined,
+        verdict: dismissed ? "rejected" as const : "edited" as const,
+        origin: "human",
+        correctedText,
+        note: dismissed
+          ? `${DISMISSED_QUESTION_NOTE_PREFIX}${normalizeQuestion(question)}`
+          : question || undefined,
         createdTs: nowIso(),
       };
-      store.corrections.put(answer);
-      log.info(`answer "${answer.correctedText}" → ${answer.targetId}`);
+      store.db.exec("BEGIN IMMEDIATE");
+      try {
+        const decision = store.decisions.get(answer.targetId);
+        if (
+          !decision ||
+          !decision.question ||
+          (decision.kind !== "ask_expert" && decision.kind !== "intervene")
+        ) {
+          store.db.exec("ROLLBACK");
+          return json(res, 404, { error: "question not found" });
+        }
+        store.corrections.put(answer);
+        buildGraph(store);
+        store.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          store.db.exec("ROLLBACK");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        log.error(`answer rolled back: ${String(error)}`);
+        return json(res, 500, { error: "answer could not be persisted" });
+      }
+      log.info(`${dismissed ? "dismissed question" : "answered question"} → ${answer.targetId}`);
       return json(res, 200, answer);
     });
   }
@@ -1122,13 +1214,129 @@ function captureStatus(
   const pauseActive =
     privacy.mode === "paused" &&
     (!privacy.pausedUntil || Date.parse(privacy.pausedUntil) > Date.now());
+  const effectiveMode = privacy.mode === "private"
+    ? "private"
+    : pauseActive
+      ? "paused"
+      : "normal";
+  const nativeActive = runtime.activeSources.some(
+    (source) => source === "native" || source === "native-stdin",
+  );
+  const agentSessionsActive = runtime.activeSources.includes("agent_sessions");
+  const sourceLastEventAt = runtime.sourceLastEventAt ?? {};
+  const channelLastEventAt = runtime.channelLastEventAt ?? {};
+  const contextHealth = ({
+    enabled,
+    producerActive,
+    lastEventAt,
+    readiness,
+    freshnessMs,
+    resourceBlockReason,
+  }: {
+    enabled: boolean;
+    producerActive: boolean;
+    lastEventAt?: string;
+    readiness: NonNullable<CaptureRuntimeStatus["sourceReadiness"]>["accessibility"];
+    freshnessMs: number;
+    resourceBlockReason?: string;
+  }) => {
+    let status: "disabled" | "blocked" | "unavailable" | "unknown" | "watching" | "receiving";
+    let reason: string | undefined;
+    if (!enabled) {
+      status = "disabled";
+      reason = "privacy-source-disabled";
+    } else if (readiness?.status === "disabled") {
+      status = "disabled";
+      reason = readiness.reason;
+    } else if (effectiveMode !== "normal") {
+      status = "blocked";
+      reason = effectiveMode === "private" ? "private-mode" : "capture-paused";
+    } else if (runtime.resources.suspended) {
+      status = "blocked";
+      reason = "resource-suspended";
+    } else if (resourceBlockReason) {
+      status = "blocked";
+      reason = resourceBlockReason;
+    } else if (!producerActive) {
+      status = "unavailable";
+      reason = "producer-not-running";
+    } else if (readiness?.status === "blocked" || readiness?.status === "unavailable") {
+      status = readiness.status;
+      reason = readiness.reason;
+    } else if (readiness?.status !== "ready") {
+      status = "unknown";
+      reason = "readiness-not-reported";
+    } else if (
+      lastEventAt &&
+      Number.isFinite(Date.parse(lastEventAt)) &&
+      Date.now() - Date.parse(lastEventAt) <= freshnessMs
+    ) {
+      status = "receiving";
+    } else {
+      status = "watching";
+    }
+    return {
+      status,
+      ...(reason ? { reason } : {}),
+      ...(lastEventAt ? { lastEventAt } : {}),
+    };
+  };
+  const screenResourceBlock = runtime.resources.batteryAware && runtime.resources.powerSource === "battery"
+    ? "battery-aware-screen-suppression"
+    : undefined;
   return {
     ...runtime,
     stale:
       runtime.state === "running" &&
       Date.now() - Date.parse(runtime.updatedAt) > 30_000,
     effectiveState: runtime.resources.suspended ? "suspended" : runtime.state,
-    effectiveMode: privacy.mode === "private" ? "private" : pauseActive ? "paused" : "normal",
+    effectiveMode,
+    health: {
+      // Reaching this authenticated endpoint proves only the Studio daemon is
+      // connected. Evidence-channel and interpretation readiness are separate.
+      daemon: { status: "connected" },
+      screenContext: contextHealth({
+        enabled: privacy.sources.screen_video,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.screen_recording ?? sourceLastEventAt.screen_video,
+        readiness: runtime.sourceReadiness?.screen_recording,
+        freshnessMs: 2 * 60_000,
+        resourceBlockReason: screenResourceBlock,
+      }),
+      accessibility: contextHealth({
+        enabled: privacy.sources.accessibility,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.accessibility ?? sourceLastEventAt.accessibility,
+        readiness: runtime.sourceReadiness?.accessibility,
+        freshnessMs: 2 * 60_000,
+      }),
+      agentContext: contextHealth({
+        enabled: privacy.sources.ai_proxy,
+        producerActive: agentSessionsActive,
+        lastEventAt: channelLastEventAt.agent_sessions ?? sourceLastEventAt.ai_proxy,
+        readiness: runtime.sourceReadiness?.agent_sessions,
+        freshnessMs: 5 * 60_000,
+      }),
+      systemAudio: contextHealth({
+        enabled: privacy.sources.audio,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.audio_system,
+        readiness: runtime.sourceReadiness?.audio_system,
+        freshnessMs: 2 * 60_000,
+      }),
+      microphoneAudio: contextHealth({
+        enabled: privacy.sources.audio,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.audio_mic,
+        readiness: runtime.sourceReadiness?.audio_mic,
+        freshnessMs: 2 * 60_000,
+      }),
+      interpretation: runtime.interpretation ?? {
+        requested: "none",
+        active: "none",
+        status: "disabled",
+      },
+    },
     privacy: {
       mode: privacy.mode,
       ...(privacy.pausedUntil ? { pausedUntil: privacy.pausedUntil } : {}),
@@ -1242,19 +1450,22 @@ function connections(store: Store): unknown {
  * evidence resolved so the user can verify before confirming.
  */
 function questions(store: Store): unknown {
-  const answered = new Set(store.corrections.all().map((c) => c.targetId));
+  const corrections = store.corrections.all();
 
   // The agent's proactive questions (it said it was unsure WHY) — each with
   // candidate answers to pick from. The card also offers a free-text box.
-  const agent = store.decisions
-    .recent(50)
-    .filter(
+  const agent = uniqueQuestionDecisions(
+    store.decisions
+      .recent(100)
+      .filter(
       (d) =>
         (d.kind === "ask_expert" || d.kind === "intervene") &&
         d.question &&
-        !answered.has(d.id),
-    )
-    .slice(0, 8)
+        decisionHasSubstantiveEvidence(d, store.actions.byIds(d.evidence)) &&
+        !questionWasResolved(d.id, d.question, corrections),
+      ),
+    8,
+  )
     .map((d) => {
       const tracker = truncationTracker();
       const obs = d.observationId ? store.observations.get(d.observationId) : undefined;
@@ -1270,11 +1481,20 @@ function questions(store: Store): unknown {
     });
 
   // Per-action verification cards (uncertain reconstructions).
-  const cards = store.actions
-    .range()
-    .filter((a) => (a.confidence < 0.85 || a.uncertainty?.length) && !answered.has(a.id))
-    .slice(-100)
-    .reverse()
+  const candidateCards: ActionEvent[] = [];
+  // SQL-bounded newest-first scan. Stop as soon as the consumer inbox is full;
+  // lifetime O(n²) semantic dedupe makes a frequently-polled endpoint degrade
+  // with every day the app runs.
+  for (const action of store.actions.recent(500)) {
+    if (
+      !isActionQuestionWorthy(action) ||
+      actionQuestionWasResolved(action.id, propose(action), corrections) ||
+      candidateCards.some((prior) => sameQuestion(propose(prior), propose(action)))
+    ) continue;
+    candidateCards.push(action);
+    if (candidateCards.length >= 20) break;
+  }
+  const cards = candidateCards
     .map((a) => ({
       actionId: a.id.slice(0, 256),
       proposed: propose(a),

@@ -22,6 +22,9 @@ function rowToClaim(row: Record<string, unknown>, cipher?: StorageCipher): Claim
     text: cipher?.decryptText(row.text, "claims.text") ?? (row.text as string),
     confidence: Number(row.confidence),
     evidenceEpisodes: fromJsonArray(row.evidence_episode_ids),
+    provenance: typeof row.provenance === "string"
+      ? row.provenance as Claim["provenance"]
+      : undefined,
     createdTs: row.created_ts as string,
     updatedTs: row.updated_ts as string,
   };
@@ -30,8 +33,8 @@ function rowToClaim(row: Record<string, unknown>, cipher?: StorageCipher): Claim
 export function makeClaimStore(db: DatabaseSync, cipher?: StorageCipher): ClaimStore {
   const insert = db.prepare(
     `INSERT OR REPLACE INTO claims
-       (id, kind, text, confidence, evidence_episode_ids, created_ts, updated_ts)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (id, kind, text, confidence, evidence_episode_ids, provenance, created_ts, updated_ts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const byId = db.prepare(`SELECT * FROM claims WHERE id = ?`);
   const byText = db.prepare(
@@ -48,6 +51,7 @@ export function makeClaimStore(db: DatabaseSync, cipher?: StorageCipher): ClaimS
         sensitiveText(c.text, cipher, "claims.text"),
         c.confidence,
         toJson(c.evidenceEpisodes),
+        c.provenance ?? null,
         c.createdTs,
         c.updatedTs,
       );

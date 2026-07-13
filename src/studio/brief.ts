@@ -16,6 +16,11 @@ import {
   safeRepoRelativePath,
 } from "../mesh/projectConsent.ts";
 import { normalizeRepoUrl } from "../mesh/workframe.ts";
+import {
+  decisionHasSubstantiveEvidence,
+  questionWasResolved,
+  uniqueQuestionDecisions,
+} from "../agent/questionQuality.ts";
 
 const log = logger("brief");
 const MAX_MESH_BRIEF_BYTES = 256 * 1024;
@@ -150,11 +155,19 @@ function relevantClaims(store: Store, episodeGoal: string, cwd?: string): Claim[
  * to ask_expert: those are the ones waiting on the human.
  */
 function undeliveredQuestions(store: Store): BriefOpenQuestion[] {
-  const answered = new Set(store.corrections.all().map((c) => c.targetId));
-  return store.decisions
-    .recent(RECENT_DECISIONS)
-    .filter((d) => d.kind === "ask_expert" && d.question && !answered.has(d.id))
-    .slice(0, MAX_OPEN_QUESTIONS)
+  const corrections = store.corrections.all();
+  return uniqueQuestionDecisions(
+    store.decisions
+      .recent(RECENT_DECISIONS)
+      .filter(
+        (d) =>
+          d.kind === "ask_expert" &&
+          d.question &&
+          decisionHasSubstantiveEvidence(d, store.actions.byIds(d.evidence)) &&
+          !questionWasResolved(d.id, d.question, corrections),
+      ),
+    MAX_OPEN_QUESTIONS,
+  )
     .map((d) => ({
       questionId: d.id,
       question: redactText(d.question!, { maxChars: 320 }),

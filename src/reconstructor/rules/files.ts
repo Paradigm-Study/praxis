@@ -28,7 +28,11 @@ export function editedFile(ctx: RuleContext): ActionEvent[] {
         endTs: e.ts,
         text: str(e, "path"),
         scored: score(signals),
-        payload: { path: str(e, "path"), hashAfter: str(e, "hashAfter") },
+        payload: {
+          path: str(e, "path"),
+          workspaceRoot: str(e, "workspaceRoot"),
+          hashAfter: str(e, "hashAfter"),
+        },
         reconstructedBy: "editedFile",
       }),
     );

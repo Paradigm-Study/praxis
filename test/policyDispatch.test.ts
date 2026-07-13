@@ -46,7 +46,7 @@ function errorAction(over: Partial<Parameters<typeof action>[0]> = {}) {
     startTs: "2026-06-10T11:59:00.000Z",
     confidence: 0.8,
     text: ERROR_TEXT.split("\n")[0]!,
-    payload: { errorText: ERROR_TEXT },
+    payload: { errorText: ERROR_TEXT, signalKinds: ["terminal_error", "agent_tool_error"] },
     ...over,
   });
 }
@@ -85,6 +85,8 @@ test("ask_expert outranks dispatch when a pressing question exists", () => {
     observation: obs({
       uncertainty: ["unsure whether the migration direction is right"],
       suggestedQuestion: "Should the migration run before or after the deploy?",
+      model: "semantic-test-observer",
+      evidence: ["action_err1"],
     }),
     actions: [errorAction()],
     claims: [],

@@ -99,6 +99,7 @@ test("desktop snapshot APIs enforce query ceilings, projections, and the Electro
       text: wide,
       confidence: 0.9,
       evidenceEpisodes: Array.from({ length: 80 }, (_, item) => `episode_${item}_${"e".repeat(300)}`),
+      ...(index === 449 ? { provenance: "explicit_user_rule" as const } : {}),
       createdTs: ts,
       updatedTs: ts,
     });
@@ -125,6 +126,7 @@ test("desktop snapshot APIs enforce query ceilings, projections, and the Electro
       targetKind: "episode",
       targetId: `episode_${index}`,
       verdict: "edited",
+      origin: "human",
       correctedText: wide,
       note: wide,
       createdTs: ts,
@@ -177,6 +179,16 @@ test("desktop snapshot APIs enforce query ceilings, projections, and the Electro
     assert.equal(episodeBody.includes(privateMarker), false);
     assert.equal(episodes.some((episode) => Object.hasOwn(episode, "payload")), false);
     assert.ok(episodes.some((episode) => episode.id === "episode_249"), "newest episode survives byte trimming");
+
+    const claims = await fetch(`${base}/api/claims?limit=999`).then((response) => response.json()) as Array<{
+      id: string;
+      provenance?: string;
+    }>;
+    assert.equal(
+      claims.find((claim) => claim.id === "claim_449")?.provenance,
+      "explicit_user_rule",
+      "claim trust provenance survives the desktop API projection",
+    );
 
     const graphResponse = await fetch(`${base}/api/graph?nodes=999&edges=999`);
     const graphBody = await graphResponse.text();

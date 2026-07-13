@@ -5,9 +5,15 @@ import { reconstruct } from "../reconstructor/reconstructor.ts";
 import { fuse } from "../fuser/fuser.ts";
 import { buildGraph } from "../memory/graph.ts";
 import { buildBundle } from "../observer/bundle.ts";
-import { AnthropicObserver, defaultObserver, MockObserver } from "../observer/observer.ts";
+import {
+  AnthropicObserver,
+  defaultObserver,
+  MockObserver,
+  type Observer,
+} from "../observer/observer.ts";
 import { CaptureManager } from "../capture/manager.ts";
 import { makeIngest } from "../capture/ingest.ts";
+import type { RawEventInput } from "../capture/source.ts";
 import { SyntheticSource } from "../capture/sources/synthetic.ts";
 import { ClipboardSource } from "../capture/sources/clipboard.ts";
 import { FilesystemSource } from "../capture/sources/filesystem.ts";
@@ -29,7 +35,11 @@ import { renderSkill, skillStats } from "../transfer/skill.ts";
 import { nowIso } from "../core/time.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
 import { capturePolicyDecision, PrivacyControlStore } from "../privacy/control.ts";
-import { resourceCaptureDecision, RuntimeStatusStore } from "../capture/runtimeStatus.ts";
+import {
+  resourceCaptureDecision,
+  RuntimeStatusStore,
+  startupInterpretationStatus,
+} from "../capture/runtimeStatus.ts";
 import { nativePolicyPathForStore } from "../privacy/nativePolicy.ts";
 import { createBackup, restoreBackup, verifyBackup } from "../storage/backup.ts";
 import { doctorStore } from "../storage/doctor.ts";
@@ -300,6 +310,9 @@ async function cmdCapture(): Promise<void> {
     );
   } else {
     const nativeCapture = has("--native") || has("--native-stdin");
+    const nativeCanAcquire = (event: RawEventInput): boolean =>
+      capturePolicyDecision(privacy.read(), event).allowed &&
+      resourceCaptureDecision(runtime.read().resources, event.source).allowed;
     // Consumer/native capture reads the pasteboard in PraxisCaptureKit, where
     // the current app/window can be fenced before body acquisition. The legacy
     // Node poller is explicit development compatibility only.
@@ -321,7 +334,21 @@ async function cmdCapture(): Promise<void> {
         },
       }));
     }
-    sources.push(new TerminalSource({ logPath: join(homedir(), ".praxis", "cmdlog.ndjson") }));
+    sources.push(new TerminalSource({
+      logPath: join(homedir(), ".praxis", "cmdlog.ndjson"),
+      canAcquire: (path) => capturePolicyDecision(privacy.read(), {
+        source: "terminal",
+        app: "terminal",
+        window: "command log",
+        type: "terminal_preflight",
+        payload: { path },
+      }).allowed && resourceCaptureDecision(
+        runtime.read().resources,
+        "terminal",
+      ).allowed,
+      acquisitionRevision: () =>
+        `${privacy.read().updatedAt}:${runtime.read().resources.updatedAt}`,
+    }));
 
     // Filesystem + git taps are OPT-IN — point them at YOUR project(s), not at
     // wherever capture was launched (which would just record Praxis's own files).
@@ -346,7 +373,21 @@ async function cmdCapture(): Promise<void> {
           ).allowed;
         },
       }));
-      sources.push(new GitSource({ repo: dir }));
+      sources.push(new GitSource({
+        repo: dir,
+        canAcquire: () => capturePolicyDecision(privacy.read(), {
+          source: "git",
+          app: "git",
+          window: dir,
+          type: "git_preflight",
+          payload: { repo: dir },
+        }).allowed && resourceCaptureDecision(
+          runtime.read().resources,
+          "git",
+        ).allowed,
+        acquisitionRevision: () =>
+          `${privacy.read().updatedAt}:${runtime.read().resources.updatedAt}`,
+      }));
     }
     if (watchDirs.length === 0) {
       process.stdout.write(
@@ -356,10 +397,13 @@ async function cmdCapture(): Promise<void> {
 
     // --native-stdin: native events arrive on stdin (the app spawned the capture
     // binary directly). --native: spawn it ourselves (dev / terminal use).
-    if (has("--native-stdin")) sources.push(new StdinNativeSource());
+    if (has("--native-stdin")) {
+      sources.push(new StdinNativeSource({ canAcquire: nativeCanAcquire }));
+    }
     else if (has("--native")) {
       sources.push(new NativeCaptureSource({
         policyPath: nativePolicyPathForStore(store),
+        canAcquire: nativeCanAcquire,
       }));
     }
   }
@@ -378,9 +422,22 @@ async function cmdCapture(): Promise<void> {
     // interval), so it can run all day at bounded cost. Opt in with
     // --observer=anthropic; otherwise the free deterministic mock is used.
     const useModel = flagVal("--observer") === "anthropic";
+    const observer: Observer = useModel ? defaultObserver(store) : new MockObserver();
+    const observerKey = process.env.PRAXIS_ANTHROPIC_API_KEY
+      ?? process.env.ANTHROPIC_API_KEY;
+    const modelActive = observer.remote === true;
+    runtime.write({
+      interpretation: startupInterpretationStatus({
+        useModel,
+        modelActive,
+        cloudConsent: privacy.read().cloudObserverConsent,
+        credentialPresent: Boolean(observerKey),
+        model: observer.model,
+      }),
+    });
     const loop = new AgentLoop(store, {
       learnerMode: has("--learner"),
-      observer: useModel ? defaultObserver(store) : new MockObserver(),
+      observer,
       // Speak up proactively, but only when it matters (≤1 every 5 min). The
       // menu-bar app tails this file and posts the native notification with the
       // candidate answers as buttons + a free-text box.
@@ -396,6 +453,14 @@ async function cmdCapture(): Promise<void> {
     process.stdout.write(
       dim(`  agent loop attached (observer: ${useModel ? "anthropic" : "mock"}, proactive questions on)\n`),
     );
+  } else {
+    runtime.write({
+      interpretation: {
+        requested: "none",
+        active: "none",
+        status: "disabled",
+      },
+    });
   }
 
   await manager.start();
@@ -435,7 +500,9 @@ async function cmdAb(): Promise<void> {
   }
 
   const store = openStore(flagVal("--data") ? { dir: flagVal("--data")! } : {});
-  const privacy = PrivacyControlStore.forStore(store).read();
+  const privacyStore = PrivacyControlStore.forStore(store);
+  const privacy = privacyStore.read();
+  const readConsent = () => privacyStore.read();
   if (!privacy.cloudObserverConsent) {
     process.stderr.write(`${red("✗")} ab requires cloud observer consent in Praxis privacy settings\n`);
     store.close();
@@ -450,12 +517,14 @@ async function cmdAb(): Promise<void> {
     model: claudeModel,
     auditor,
     includeImages: privacy.screenshotConsent,
+    readConsent,
   });
   const b = new GeminiObserver({
     apiKey: geminiKey,
     model: geminiModel,
     auditor,
     includeImages: privacy.screenshotConsent,
+    readConsent,
   });
 
   // Published per-1M-token prices, verified 2026-06-11 (ai.google.dev/pricing,
@@ -476,7 +545,12 @@ async function cmdAb(): Promise<void> {
   const PRICE_B = GEMINI_PRICES[geminiModel] ?? GEMINI_PRICES["gemini-3.5-flash"]!;
 
   const rounds = Number(flagVal("--rounds") ?? 3);
-  const judge = has("--judge") ? makeClaudeJudge(anthropicKey) : undefined;
+  const judge = has("--judge")
+    ? makeClaudeJudge(anthropicKey, "claude-haiku-4-5", {
+        auditor,
+        readConsent,
+      })
+    : undefined;
   process.stdout.write(header(`Observer A/B — ${claudeModel} vs ${geminiModel}`));
   process.stdout.write(
     `\n  ${dim(`${rounds} real windows from your ledger · nothing persisted` +

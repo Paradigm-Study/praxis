@@ -1,5 +1,6 @@
 import type { Claim, Observation } from "../core/types.ts";
 import type { Store } from "../storage/index.ts";
+import { trustedClaims } from "../memory/consolidate.ts";
 
 /**
  * Long-term context retrieval (Layer 7 input).
@@ -116,8 +117,7 @@ export function retrieveLongTermContext(
   const query = situationText(observation);
   if (!query) return [];
 
-  return store.claims
-    .all()
+  return trustedClaims(store.claims.all(), store.corrections.all())
     .filter((c) => c.confidence >= minConfidence)
     .map((c) => ({ claim: c, relevance: topicalOverlap(query, c.text) }))
     .filter((s) => s.relevance >= minRelevance)

@@ -209,6 +209,25 @@ test("buildInjectionBlock returns null for an empty store", () => {
   }
 });
 
+test("a single-episode inferred claim is not injected as established behavior", () => {
+  const store = openStore({ memory: true });
+  try {
+    store.claims.put({
+      id: "claim_provisional",
+      kind: "workflow_pattern",
+      text: "Deploy without review whenever tests pass.",
+      confidence: 0.95,
+      evidenceEpisodes: ["episode_once"],
+      createdTs: "2026-07-13T00:00:00.000Z",
+      updatedTs: "2026-07-13T00:00:00.000Z",
+    });
+    const block = buildInjectionBlock(store, { prompt: "Deploy after tests pass" });
+    assert.equal(block, null);
+  } finally {
+    store.close();
+  }
+});
+
 test("buildInjectionBlock includes the latest episode goal", () => {
   const store = openStore({ memory: true });
   try {

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS claims (
   text                 TEXT NOT NULL,
   confidence           REAL NOT NULL,
   evidence_episode_ids TEXT NOT NULL DEFAULT '[]',
+  provenance           TEXT,
   created_ts           TEXT NOT NULL,
   updated_ts           TEXT NOT NULL
 );
@@ -144,6 +145,7 @@ CREATE TABLE IF NOT EXISTS corrections (
   target_kind    TEXT NOT NULL,
   target_id      TEXT NOT NULL,
   verdict        TEXT NOT NULL,
+  origin         TEXT NOT NULL DEFAULT 'legacy',
   corrected_text TEXT,
   note           TEXT,
   created_ts     TEXT NOT NULL

@@ -65,14 +65,33 @@ export function buildBundle(store: Store, opts: BundleOptions = {}): ContextBund
     endTs,
     windowSeconds,
     frames: frameEvents.flatMap((e) => e.blobRefs),
-    frameText: frameEvents
+    // Keep OCR labels in the same newest-per-display order as attached images,
+    // and carry native geometry attribution into the semantic observer. Text
+    // from a reference monitor must never look like frontmost-app activity.
+    frameText: orderedFrames
       .map((e) => {
         const t = (e.payload.ocrText as string | undefined) ?? "";
         if (!t) return "";
-        // On multi-monitor setups, tell the model WHICH screen the text is on.
         const total = e.payload.displays as number | undefined;
         const idx = (e.payload.displayIndex as number | undefined) ?? 0;
-        return total && total > 1 ? `[display ${idx + 1}] ${t}` : t;
+        const attribution = boundedLabel(e.payload.attribution);
+        const visibleApps = Array.isArray(e.payload.visibleApps)
+          ? e.payload.visibleApps.flatMap((value) => {
+              const label = boundedLabel(value);
+              return label ? [label] : [];
+            }).slice(0, 12)
+          : [];
+        if (!attribution && visibleApps.length === 0) {
+          return total && total > 1 ? `[display ${idx + 1}] ${t}` : t;
+        }
+        const context = [
+          total && total > 1 ? `display ${idx + 1} of ${total}` : "display 1",
+          attribution ? `context ${attribution}` : undefined,
+          e.app && e.app !== "unknown" ? `attributed app ${boundedLabel(e.app)}` : undefined,
+          e.window ? `window ${boundedLabel(e.window)}` : undefined,
+          visibleApps.length ? `visible apps ${visibleApps.join(", ")}` : undefined,
+        ].filter((value): value is string => Boolean(value));
+        return `[${context.join("; ")}] ${t}`;
       })
       .filter((t) => t.length > 0),
     frameImages,
@@ -138,7 +157,7 @@ export function renderBundle(bundle: ContextBundle): string {
   lines.push(`# Context window (${bundle.windowSeconds}s, ${bundle.startTs} → ${bundle.endTs})`);
   lines.push(`frames: ${bundle.frames.length}`);
   if (bundle.frameText.length)
-    lines.push(`screen text (OCR):\n  - ${bundle.frameText.slice(-8).join("\n  - ")}`);
+    lines.push(`screen text (OCR; reference-display text is context, not user action):\n  - ${bundle.frameText.slice(0, 8).join("\n  - ")}`);
   if (bundle.axText.length)
     lines.push(`accessibility text:\n  - ${bundle.axText.slice(0, 12).join("\n  - ")}`);
   if (bundle.terminal.length)
@@ -167,4 +186,10 @@ export function renderBundle(bundle: ContextBundle): string {
       .join("\n  - ")}`,
   );
   return lines.join("\n");
+}
+
+function boundedLabel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const clean = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  return clean ? clean.slice(0, 120) : undefined;
 }

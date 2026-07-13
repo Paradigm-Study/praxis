@@ -12,8 +12,18 @@ export interface ActionRange {
 export interface ActionStore {
   put(a: ActionEvent): void;
   putMany(actions: ActionEvent[]): void;
+  /**
+   * Atomically replace the materialized actions that overlap `range`.
+   * Raw events and human corrections are intentionally untouched.
+   */
+  reconcileRange(
+    actions: ActionEvent[],
+    range?: Pick<ActionRange, "startTs" | "endTs">,
+  ): void;
   get(id: string): ActionEvent | undefined;
   range(range?: ActionRange): ActionEvent[];
+  /** Actions whose materialized interval intersects the half-open range. */
+  overlapping(range?: Pick<ActionRange, "startTs" | "endTs">): ActionEvent[];
   /** Newest first, bounded in SQL for desktop snapshot surfaces. */
   recent(limit: number): ActionEvent[];
   byIds(ids: string[]): ActionEvent[];
@@ -49,6 +59,7 @@ export function makeActionStore(db: DatabaseSync, cipher?: StorageCipher): Actio
   );
   const byId = db.prepare(`SELECT * FROM action_events WHERE id = ?`);
   const counter = db.prepare(`SELECT COUNT(*) AS n FROM action_events`);
+  const remove = db.prepare(`DELETE FROM action_events WHERE id = ?`);
 
   function put(a: ActionEvent): void {
     insert.run(
@@ -79,6 +90,40 @@ export function makeActionStore(db: DatabaseSync, cipher?: StorageCipher): Actio
         throw err;
       }
     },
+    reconcileRange(actions, range = {}) {
+      const where: string[] = [];
+      const params: string[] = [];
+      if (range.startTs) {
+        // A rule can begin before the rolling raw-event window and end inside
+        // it. Scoping deletion by start_ts would preserve that old action while
+        // also inserting the newly reconstructed tail classification.
+        where.push("end_ts >= ?");
+        params.push(range.startTs);
+      }
+      if (range.endTs) {
+        where.push("start_ts < ?");
+        params.push(range.endTs);
+      }
+      const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+      const desired = new Set(actions.map((action) => action.id));
+      // SAVEPOINT is atomic both alone and inside a caller-owned transaction.
+      db.exec("SAVEPOINT praxis_action_reconcile");
+      try {
+        const existing = db
+          .prepare(`SELECT id FROM action_events ${clause}`)
+          .all(...params) as Array<{ id: string }>;
+        for (const action of actions) put(action);
+        for (const row of existing) if (!desired.has(row.id)) remove.run(row.id);
+        db.exec("RELEASE praxis_action_reconcile");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK TO praxis_action_reconcile; RELEASE praxis_action_reconcile");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        throw error;
+      }
+    },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
       return row ? rowToAction(row, cipher) : undefined;
@@ -98,6 +143,27 @@ export function makeActionStore(db: DatabaseSync, cipher?: StorageCipher): Actio
       const limit = range.limit ? `LIMIT ${Math.floor(range.limit)}` : "";
       const rows = db
         .prepare(`SELECT * FROM action_events ${clause} ORDER BY start_ts ASC ${limit}`)
+        .all(...params) as Record<string, unknown>[];
+      return rows.map((row) => rowToAction(row, cipher));
+    },
+    overlapping(range = {}) {
+      const where: string[] = [];
+      const params: string[] = [];
+      if (range.startTs) {
+        // Point actions at the lower bound and actions that began before it
+        // but are still open both intersect the reconciliation window.
+        where.push("end_ts >= ?");
+        params.push(range.startTs);
+      }
+      if (range.endTs) {
+        where.push("start_ts < ?");
+        params.push(range.endTs);
+      }
+      const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+      const rows = db
+        .prepare(
+          `SELECT * FROM action_events ${clause} ORDER BY start_ts ASC, id ASC`,
+        )
         .all(...params) as Record<string, unknown>[];
       return rows.map((row) => rowToAction(row, cipher));
     },

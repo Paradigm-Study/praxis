@@ -16,14 +16,19 @@ export function observationClaims(
   const day = obs.createdTs.slice(0, 10);
   const out: ClaimCandidate[] = [];
   const mk = (kind: ClaimCandidate["kind"], text: string, confidence: number) =>
-    out.push({ kind, text: text.replace(/\s+/g, " ").trim(), confidence, episodeId, day });
+    out.push({
+      kind,
+      text: text.replace(/\s+/g, " ").trim(),
+      confidence,
+      episodeId,
+      day,
+      provenance: "model_inference",
+    });
 
   if (obs.decisionPoint) mk("decision_rule", obs.decisionPoint, 0.82);
   if (obs.inferredPreference) mk("taste_rule", obs.inferredPreference, 0.8);
-  for (const a of obs.acceptedOptions) if (a.trim()) mk("know_how", `Prefers: ${a}`, 0.75);
-  for (const r of obs.rejectedOptions) if (r.trim()) mk("decision_rule", `Avoids: ${r}`, 0.75);
-  if (obs.suggestedQuestion && obs.uncertainty.length) {
-    mk("unresolved_question", obs.suggestedQuestion, 0.5);
-  }
+  // acceptedOptions/rejectedOptions describe one explicit choice in this
+  // episode. Keep them in the observation/episode receipt; only the dedicated
+  // durable fields above are eligible for long-term memory claims.
   return out;
 }

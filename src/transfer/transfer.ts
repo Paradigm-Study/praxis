@@ -1,8 +1,16 @@
 import type { ActionEvent, Claim } from "../core/types.ts";
 import type { Store } from "../storage/index.ts";
 import { nowIso } from "../core/time.ts";
-import { applyCorrections } from "../memory/consolidate.ts";
+import { trustedClaims } from "../memory/consolidate.ts";
 import { latestAcceptedWorkflowReview, resolveWorkflowReview } from "../workflow/review.ts";
+import {
+  decisionHasSubstantiveEvidence,
+  questionWasResolved,
+  uniqueQuestionDecisions,
+} from "../agent/questionQuality.ts";
+
+const RECENT_QUESTION_DECISIONS = 100;
+const MAX_OPEN_QUESTIONS = 8;
 
 /**
  * A playbook is the learned model made operable: the workflow, decision rules,
@@ -39,7 +47,8 @@ function rules(claims: Claim[], kind: string): PlaybookRule[] {
 
 /** Distill the expert memory graph into an operable playbook. */
 export function buildPlaybook(store: Store): Playbook {
-  const claims = applyCorrections(store.claims.all(), store.corrections.all());
+  const corrections = store.corrections.all();
+  const claims = trustedClaims(store.claims.all(), corrections);
   const reviewed = latestAcceptedWorkflowReview(store);
   const rejectedEpisodes = new Set(
     store.episodes.all()
@@ -72,7 +81,21 @@ export function buildPlaybook(store: Store): Playbook {
     knowHow: rules(claims, "know_how"),
     tasteRules: rules(claims, "taste_rule"),
     artifactTypes: rules(claims, "artifact_type").map((r) => r.text),
-    openQuestions: rules(claims, "unresolved_question").map((r) => r.text),
+    openQuestions: uniqueQuestionDecisions(
+      store.decisions
+        .recent(RECENT_QUESTION_DECISIONS)
+        .filter(
+          (decision) =>
+            decision.kind === "ask_expert" &&
+            decision.question &&
+            decisionHasSubstantiveEvidence(
+              decision,
+              store.actions.byIds(decision.evidence),
+            ) &&
+            !questionWasResolved(decision.id, decision.question, corrections),
+        ),
+      MAX_OPEN_QUESTIONS,
+    ).map((decision) => decision.question!),
   };
 }
 

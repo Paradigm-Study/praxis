@@ -10,7 +10,7 @@ function claim(partial: Partial<Claim> & { id: string; text: string }): Claim {
     kind: partial.kind ?? "decision_rule",
     text: partial.text,
     confidence: partial.confidence ?? 0.9,
-    evidenceEpisodes: partial.evidenceEpisodes ?? [],
+    evidenceEpisodes: partial.evidenceEpisodes ?? ["episode_1", "episode_2"],
     createdTs: partial.createdTs ?? "2026-06-01T00:00:00.000Z",
     updatedTs: partial.updatedTs ?? "2026-06-01T00:00:00.000Z",
   };
@@ -80,6 +80,46 @@ test("low-confidence claims are filtered out", () => {
   store.close();
 });
 
+test("one-off inference cannot steer tasks, while claim review is applied", () => {
+  const store = freshStore();
+  try {
+    store.claims.put(claim({
+      id: "c_once",
+      text: "Deploy the database without a backup.",
+      evidenceEpisodes: ["episode_once"],
+    }));
+    assert.deepEqual(
+      retrieveForTask(store, "deploy the database without a backup"),
+      [],
+      "single-episode inference stays provisional",
+    );
+    store.corrections.put({
+      id: "review_once",
+      targetKind: "claim",
+      targetId: "c_once",
+      verdict: "edited",
+      origin: "human",
+      correctedText: "Back up the database before every deployment.",
+      createdTs: "2026-07-13T00:00:00.000Z",
+    });
+    assert.deepEqual(
+      retrieveForTask(store, "back up the database before deployment").map((item) => item.text),
+      ["Back up the database before every deployment."],
+    );
+    store.corrections.put({
+      id: "reject_once",
+      targetKind: "claim",
+      targetId: "c_once",
+      verdict: "rejected",
+      origin: "human",
+      createdTs: "2026-07-13T00:01:00.000Z",
+    });
+    assert.deepEqual(retrieveForTask(store, "back up the database before deployment"), []);
+  } finally {
+    store.close();
+  }
+});
+
 test("cwd boost reorders: artifact-anchored claim beats a slightly better textual match", () => {
   const store = freshStore();
   // ep_api touched files under the task's cwd; ep_other did not.
@@ -95,14 +135,14 @@ test("cwd boost reorders: artifact-anchored claim beats a slightly better textua
     claim({
       id: "c_far",
       text: "Retry failed api requests with exponential backoff delays.",
-      evidenceEpisodes: ["ep_other"],
+      evidenceEpisodes: ["ep_other", "ep_other_prior"],
     }),
   );
   store.claims.put(
     claim({
       id: "c_near",
       text: "Api server requests sometimes fail and need retry backoff.",
-      evidenceEpisodes: ["ep_api"],
+      evidenceEpisodes: ["ep_api", "ep_api_prior"],
     }),
   );
 
@@ -124,10 +164,10 @@ test("path boost matches repo-relative paths against absolute episode artifacts"
   store.episodes.put(episode({ id: "ep_a", artifacts: ["/Users/x/proj/src/api/server.ts"] }));
   store.episodes.put(episode({ id: "ep_b", artifacts: ["/Users/x/proj/docs/notes.md"] }));
   store.claims.put(
-    claim({ id: "c_a", text: "Server code review takes priority.", evidenceEpisodes: ["ep_a"] }),
+    claim({ id: "c_a", text: "Server code review takes priority.", evidenceEpisodes: ["ep_a", "ep_a_prior"] }),
   );
   store.claims.put(
-    claim({ id: "c_b", text: "Server code review takes priority always.", evidenceEpisodes: ["ep_b"] }),
+    claim({ id: "c_b", text: "Server code review takes priority always.", evidenceEpisodes: ["ep_b", "ep_b_prior"] }),
   );
 
   const results = retrieveForTask(store, "review the server code", { path: "src/api/server.ts" });
@@ -140,10 +180,10 @@ test("repo boost normalizes ssh and https remote forms", () => {
   store.episodes.put(episode({ id: "ep_ssh", artifacts: ["git@github.com:Acme/Widgets.git"] }));
   store.episodes.put(episode({ id: "ep_none", artifacts: ["https://github.com/other/repo"] }));
   store.claims.put(
-    claim({ id: "c_widgets", text: "Widget build pipeline is flaky.", evidenceEpisodes: ["ep_ssh"] }),
+    claim({ id: "c_widgets", text: "Widget build pipeline is flaky.", evidenceEpisodes: ["ep_ssh", "ep_ssh_prior"] }),
   );
   store.claims.put(
-    claim({ id: "c_other", text: "Widget build pipeline is flaky too.", evidenceEpisodes: ["ep_none"] }),
+    claim({ id: "c_other", text: "Widget build pipeline is flaky too.", evidenceEpisodes: ["ep_none", "ep_none_prior"] }),
   );
 
   const results = retrieveForTask(store, "fix the widget build pipeline", {
@@ -160,7 +200,7 @@ test("scope boost alone can surface a claim with no textual overlap", () => {
     claim({
       id: "c_anchored",
       text: "Zzz qqq xxyzzy.", // shares no trigrams with the task
-      evidenceEpisodes: ["ep_cwd"],
+      evidenceEpisodes: ["ep_cwd", "ep_cwd_prior"],
     }),
   );
   const without = retrieveForTask(store, "deploy the frontend");

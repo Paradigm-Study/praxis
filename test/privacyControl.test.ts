@@ -41,7 +41,352 @@ test("privacy defaults exclude sensitive apps, windows, and paths", () => {
     source: "filesystem",
     payload: { path: "config/.env.local" },
   }).reason, "excluded_path");
+  assert.equal(capturePolicyDecision(policy, {
+    ...input,
+    source: "ai_proxy",
+    payload: { cwd: "/repo", filePath: "/repo/.env.local" },
+  }).reason, "excluded_path", "every path-shaped field is checked, not only the first one");
   assert.equal(capturePolicyDecision(policy, input).allowed, true);
+});
+
+test("git privacy resolves nested file payloads against the repository root", () => {
+  const policy = {
+    ...defaultPrivacyControl(),
+    excludedPaths: ["/repo/private"],
+  };
+  const gitInput = {
+    source: "git" as const,
+    app: "git",
+    window: "/repo",
+    type: "commit",
+  };
+
+  assert.equal(capturePolicyDecision(policy, {
+    ...gitInput,
+    payload: {
+      sha: "abc1234",
+      changes: {
+        files: [
+          "src/public.ts",
+          { metadata: { new_path: "private/secret.txt" } },
+        ],
+      },
+    },
+  }).reason, "excluded_path");
+  assert.equal(capturePolicyDecision(policy, {
+    ...gitInput,
+    payload: { files: ["src/../private/secret.txt"] },
+  }).reason, "excluded_path", "relative traversal is normalized against the repo");
+  const sharedFiles = ["private/shared-secret.txt"];
+  assert.equal(capturePolicyDecision(policy, {
+    ...gitInput,
+    payload: { metadata: sharedFiles, files: sharedFiles },
+  }).reason, "excluded_path", "shared nested objects are rescanned in path context");
+  assert.equal(capturePolicyDecision(policy, {
+    ...gitInput,
+    payload: { files: ["private-copy/visible.txt"] },
+  }).allowed, true, "an absolute excluded subtree uses path boundaries");
+});
+
+test("git privacy inspects staged diff paths before any inline blob is persisted", () => {
+  const policyValue = {
+    ...defaultPrivacyControl(),
+    excludedPaths: ["/repo/private"],
+  };
+  const staged = {
+    source: "git" as const,
+    app: "git",
+    window: "/repo",
+    type: "staged_changed",
+    payload: { stat: "2 files changed, 2 insertions(+)" },
+  };
+  const privateDiffs: Array<string | Uint8Array> = [
+    " src/public.ts | 1 +\n private/secret.txt | 1 +\n 2 files changed, 2 insertions(+)",
+    Buffer.from("diff --git a/src/public.ts b/private/secret file.txt\n--- a/src/public.ts\n+++ b/private/secret file.txt\n"),
+    " src/{public.ts => ../private/renamed.ts} | 0",
+    " private/secret.png | Bin 0 -> 12 bytes",
+    "Binary files a/src/public.png and b/private/secret.png differ",
+  ];
+  for (const diff of privateDiffs) {
+    assert.equal(capturePolicyDecision(policyValue, {
+      ...staged,
+      blobs: [{ kind: "diff" as const, data: diff }],
+    }).reason, "excluded_path");
+  }
+  assert.equal(capturePolicyDecision(policyValue, {
+    ...staged,
+    blobs: [{ kind: "diff", data: " src/public.ts | 1 +" }],
+  }).allowed, true);
+
+  const store = openStore({ memory: true });
+  try {
+    const privacy = new PrivacyControlStore(undefined, policyValue);
+    const returned = makeIngest(store, { privacy }).ingest({
+      ...staged,
+      blobs: [{
+        kind: "diff",
+        data: [
+          "diff --git a/private/secret.txt b/private/secret.txt",
+          "+++ b/private/secret.txt",
+          "+api_key=sk-private0123456789",
+        ].join("\n"),
+      }],
+    });
+    assert.match(returned.id, /^suppressed_/);
+    assert.equal(store.events.count(), 0);
+    assert.equal(
+      (store.db.prepare("SELECT COUNT(*) AS n FROM blobs").get() as { n: number }).n,
+      0,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("screen and accessibility window metadata enforce excluded paths without scanning OCR prose", () => {
+  const policy = defaultPrivacyControl();
+  const privateSecondaryDisplay = {
+    source: "screen_video" as const,
+    app: "Code",
+    window: "main.ts — Code",
+    type: "frame",
+    payload: {
+      displayIndex: 1,
+      attribution: {
+        visibleWindows: ["README.md — Preview", ".env — Code"],
+      },
+      ocrText: "ordinary editor content",
+    },
+    blobs: [{ kind: "image" as const, data: "unpersisted pixels" }],
+  };
+  assert.equal(
+    capturePolicyDecision(policy, privateSecondaryDisplay).reason,
+    "excluded_path",
+  );
+  assert.equal(capturePolicyDecision(policy, {
+    source: "accessibility",
+    app: "Code",
+    window: ".ssh/config — Code",
+    type: "focused_text_changed",
+    payload: { title: "Editor", valueHash: "hash-only" },
+  }).reason, "excluded_path");
+  assert.equal(capturePolicyDecision(policy, {
+    source: "accessibility",
+    app: "Code",
+    window: "main.ts — Code",
+    type: "focused_text_changed",
+    payload: {
+      title: "credentials.json — Code",
+      valueHash: "hash-only",
+    },
+  }).reason, "excluded_path");
+  assert.equal(capturePolicyDecision(policy, {
+    source: "screen_video",
+    app: "Team Chat",
+    window: "Project discussion",
+    type: "frame",
+    payload: {
+      ocrText: "We should document how .env credentials work.",
+      transcript: "arbitrary conversational text is not path metadata",
+    },
+  }).allowed, true);
+
+  const store = openStore({ memory: true });
+  try {
+    const returned = makeIngest(store).ingest(privateSecondaryDisplay);
+    assert.match(returned.id, /^suppressed_/);
+    assert.equal(store.events.count(), 0);
+    assert.equal(
+      (store.db.prepare("SELECT COUNT(*) AS n FROM blobs").get() as { n: number }).n,
+      0,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("browser capture treats only file URLs as local paths and redacts obvious DOM secrets", () => {
+  const policy = defaultPrivacyControl();
+  const localFile = {
+    source: "browser_dom" as const,
+    app: "Chrome",
+    window: "file:///Users/alice/project/%2Eenv",
+    type: "page_loaded",
+    payload: {
+      url: "file:///Users/alice/project/%2Eenv",
+      title: ".env — Chrome",
+    },
+    blobs: [{ kind: "text" as const, data: "PRIVATE_LOCAL_DOM" }],
+  };
+  assert.equal(capturePolicyDecision(policy, localFile).reason, "excluded_path");
+  assert.equal(capturePolicyDecision(policy, {
+    source: "browser_dom",
+    app: "Chrome",
+    window: "Documentation",
+    type: "page_loaded",
+    payload: { url: "https://example.test/docs/.env-guide" },
+  }).allowed, true, "ordinary web URL paths are not local filesystem paths");
+
+  const store = openStore({ memory: true });
+  try {
+    const ingest = makeIngest(store).ingest;
+    const suppressed = ingest(localFile);
+    assert.match(suppressed.id, /^suppressed_/);
+    assert.equal(store.events.count(), 0);
+    assert.equal(
+      (store.db.prepare("SELECT COUNT(*) AS n FROM blobs").get() as { n: number }).n,
+      0,
+    );
+
+    const secret = "browser-secret-abcdefghijklmnopqrstuvwxyz012345";
+    const redacted = ingest({
+      source: "browser_dom",
+      app: "Chrome",
+      window: "Local app",
+      type: "console_error",
+      payload: {
+        url: "http://localhost:3000/",
+        message: `request failed with Bearer ${secret}`,
+      },
+      blobs: [{
+        kind: "text",
+        data: `<pre>Authorization: Bearer ${secret}</pre>`,
+      }],
+    });
+    assert.deepEqual(redacted.payload, {
+      url: "http://localhost:3000/",
+      message: "[redacted sensitive content]",
+      contentRedacted: true,
+    });
+    assert.equal(store.blobs.getText(redacted.blobRefs[0]!), "[redacted sensitive content]");
+    assert.doesNotMatch(JSON.stringify(store.events.range()), new RegExp(secret));
+
+    const ordinaryDom = "<main>Study .env configuration without credential values.</main>";
+    const ordinary = ingest({
+      source: "browser_dom",
+      app: "Chrome",
+      window: "Environment guide",
+      type: "page_loaded",
+      payload: { url: "https://example.test/docs/.env-guide" },
+      blobs: [{ kind: "text", data: ordinaryDom }],
+    });
+    assert.equal(store.blobs.getText(ordinary.blobRefs[0]!), ordinaryDom);
+  } finally {
+    store.close();
+  }
+});
+
+test("obvious secrets in file and diff blobs are redacted without discarding ordinary diffs", () => {
+  const store = openStore({ memory: true });
+  try {
+    const ingest = makeIngest(store).ingest;
+    const secret = "sk-hardcodedsecret0123456789";
+    const sensitiveDiff = [
+      "diff --git a/src/config.ts b/src/config.ts",
+      "--- a/src/config.ts",
+      "+++ b/src/config.ts",
+      `+export const api_key = \"${secret}\";`,
+    ].join("\n");
+    const redacted = ingest({
+      source: "git",
+      app: "git",
+      window: "/repo",
+      type: "staged_changed",
+      payload: { stat: "1 file changed" },
+      blobs: [{ kind: "diff", data: sensitiveDiff }],
+    });
+    assert.equal(redacted.payload.contentRedacted, true);
+    assert.equal(store.blobs.getText(redacted.blobRefs[0]!), "[redacted sensitive content]");
+
+    const ordinaryDiff = [
+      "diff --git a/src/math.ts b/src/math.ts",
+      "--- a/src/math.ts",
+      "+++ b/src/math.ts",
+      "+export const answer = 42;",
+    ].join("\n");
+    const ordinary = ingest({
+      source: "git",
+      app: "git",
+      window: "/repo",
+      type: "staged_changed",
+      payload: { stat: "1 file changed" },
+      blobs: [{ kind: "diff", data: ordinaryDiff }],
+    });
+    assert.equal(store.blobs.getText(ordinary.blobRefs[0]!), ordinaryDiff);
+    assert.doesNotMatch(JSON.stringify(store.events.range()), new RegExp(secret));
+  } finally {
+    store.close();
+  }
+});
+
+test("terminal and audio secrets are redacted, and secret OCR drops its source pixels", () => {
+  const store = openStore({ memory: true });
+  try {
+    const ingest = makeIngest(store).ingest;
+    const secret = "sk-capturesecret0123456789";
+    const terminal = ingest({
+      source: "terminal",
+      app: "iTerm2",
+      window: "/repo",
+      type: "command_run",
+      payload: {
+        cmd: `curl -H 'Bearer ${secret}' https://example.test`,
+        cwd: "/repo",
+        exitCode: 0,
+      },
+    });
+    assert.deepEqual(terminal.payload, {
+      cmd: "[redacted sensitive content]",
+      cwd: "/repo",
+      exitCode: 0,
+      contentRedacted: true,
+    });
+
+    const audio = ingest({
+      source: "audio",
+      app: "Zoom",
+      window: "mic",
+      type: "transcript_segment",
+      payload: { channel: "mic", text: `The API_KEY=${secret}` },
+    });
+    assert.deepEqual(audio.payload, {
+      channel: "mic",
+      text: "[redacted sensitive content]",
+      contentRedacted: true,
+    });
+
+    const screen = ingest({
+      source: "screen_video",
+      app: "Code",
+      window: "main.ts",
+      type: "frame",
+      payload: { ocrText: `API_KEY=${secret}`, displayIndex: 0 },
+      blobs: [{ kind: "image", data: "pixels containing the visible secret" }],
+    });
+    assert.deepEqual(screen.payload, {
+      ocrText: "[redacted sensitive content]",
+      displayIndex: 0,
+      contentRedacted: true,
+    });
+    assert.deepEqual(screen.blobRefs, []);
+    assert.equal(
+      (store.db.prepare("SELECT COUNT(*) AS n FROM blobs").get() as { n: number }).n,
+      0,
+    );
+
+    const ordinary = ingest({
+      source: "screen_video",
+      app: "Code",
+      window: "main.ts",
+      type: "frame",
+      payload: { ocrText: "ordinary editor text", displayIndex: 0 },
+      blobs: [{ kind: "image", data: "ordinary pixels" }],
+    });
+    assert.equal(ordinary.blobRefs.length, 1);
+    assert.doesNotMatch(JSON.stringify(store.events.range()), new RegExp(secret));
+  } finally {
+    store.close();
+  }
 });
 
 test("private, timed pause, and per-source controls are enforced", () => {

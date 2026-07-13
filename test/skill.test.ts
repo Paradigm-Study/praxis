@@ -17,7 +17,15 @@ function claim(kind: string, text: string, eps: string[], conf = 0.8): Claim {
   };
 }
 function correction(targetId: string, verdict: Correction["verdict"], correctedText?: string): Correction {
-  return { id: "corr_" + targetId + verdict, targetKind: "claim", targetId, verdict, correctedText, createdTs: "t" };
+  return {
+    id: "corr_" + targetId + verdict,
+    targetKind: "claim",
+    targetId,
+    verdict,
+    origin: "human",
+    correctedText,
+    createdTs: "t",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +73,18 @@ test("applyCorrections: rejected claim is dropped, edited claim is rewritten, ra
   assert.equal(out.length, 1, "rejected claim removed from the view");
   assert.equal(out[0]!.text, "Caps the agent's benchmark spend before running", "edited text wins");
   assert.ok(out[0]!.confidence >= 0.9, "a user edit is strong signal");
+  assert.equal(out[0]!.provenance, "human_reviewed", "review trust survives bounded correction views");
   // Non-destructive: the input array and its claims are unchanged.
   assert.equal(raw.length, 2, "raw list not mutated");
   assert.equal(raw[1]!.text, "vague guess about a decision", "raw claim object not mutated");
+  assert.equal(raw[1]!.provenance, undefined, "raw claim trust is not mutated");
+});
+
+test("applyCorrections: confirmation decorates the effective claim as human reviewed", () => {
+  const raw = [claim("taste_rule", "Prefers compact status updates", ["e1"])];
+  const out = applyCorrections(raw, [correction(raw[0]!.id, "confirmed")]);
+  assert.equal(out[0]?.provenance, "human_reviewed");
+  assert.equal(raw[0]?.provenance, undefined, "the stored derivation remains unchanged");
 });
 
 test("rejected claims are absent from the consolidated profile", () => {

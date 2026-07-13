@@ -53,6 +53,7 @@ test("native projection keeps local screenshot acquisition separate from cloud i
     for (const source of NATIVE_SOURCE_KEYS) {
       assert.equal(typeof projected.sources[source], "boolean", `${source} is projected explicitly`);
     }
+    assert.ok(projected.excludedPaths.includes(".env"));
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -74,6 +75,7 @@ test("native projection is owner-only, atomic, leased, and reflects every native
       sources,
       excludedApps: ["Vault"],
       excludedWindows: ["Secret"],
+      excludedPaths: [".env", ".ssh", "/repo/private"],
     });
     runtime.updateResources({ powerSource: "battery", suspended: true, batteryAware: true });
     const now = Date.parse("2026-07-12T12:00:00.000Z");
@@ -86,6 +88,7 @@ test("native projection is owner-only, atomic, leased, and reflects every native
     assert.equal(projected.expiresAt, "2026-07-12T12:00:30.000Z");
     assert.equal(projected.sources.accessibility, false);
     assert.equal(projected.sources.input_events, false);
+    assert.deepEqual(projected.excludedPaths, [".env", ".ssh", "/repo/private"]);
     assert.deepEqual(projected.resources, {
       powerSource: "battery",
       suspended: true,

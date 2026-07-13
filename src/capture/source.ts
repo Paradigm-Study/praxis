@@ -23,6 +23,30 @@ export interface RawEventInput {
 /** The funnel every source emits into. Returns the normalized, stored event. */
 export type EventSink = (input: RawEventInput) => RawEvent;
 
+/** Metadata-only capture readiness; never written into the evidence ledger. */
+export type CaptureSourceStatusChannel =
+  | "accessibility"
+  | "screen_recording"
+  | "audio_system"
+  | "audio_mic"
+  | "agent_sessions";
+export type CaptureSourceStatusState = "disabled" | "ready" | "blocked" | "unavailable";
+export interface CaptureSourceStatus {
+  channel: CaptureSourceStatusChannel;
+  status: CaptureSourceStatusState;
+  reason?: string;
+}
+export type CaptureSourceStatusSink = (status: CaptureSourceStatus) => void;
+
+export type CaptureSourceFailureReason = "start-failed" | "process-exited";
+export interface CaptureSourceFailure {
+  reason: CaptureSourceFailureReason;
+  message: string;
+  exitCode?: number;
+  signal?: string;
+}
+export type CaptureSourceFailureSink = (failure: CaptureSourceFailure) => void;
+
 /**
  * A pluggable capture tap. The native Swift client, clipboard poller, file
  * watcher, git poller, etc. all implement this. `start` receives the sink and
@@ -31,6 +55,10 @@ export type EventSink = (input: RawEventInput) => RawEvent;
 export interface CaptureSource {
   readonly name: string;
   readonly source: EventSource;
-  start(sink: EventSink): Promise<void> | void;
+  start(
+    sink: EventSink,
+    statusSink?: CaptureSourceStatusSink,
+    failureSink?: CaptureSourceFailureSink,
+  ): Promise<void> | void;
   stop(): Promise<void> | void;
 }
