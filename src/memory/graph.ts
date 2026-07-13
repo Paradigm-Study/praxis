@@ -11,6 +11,7 @@ import { nowIso } from "../core/time.ts";
 import { clamp01 } from "../reconstructor/confidence.ts";
 import { episodeClaims, type ClaimCandidate } from "./claims.ts";
 import { observationClaims } from "./modelClaims.ts";
+import { resolveWorkflowReview } from "../workflow/review.ts";
 
 export interface BuildGraphOptions {
   newId?: (prefix: string) => string;
@@ -39,6 +40,13 @@ interface MergedClaim {
   episodeIds: string[];
   days: Set<string>;
 }
+
+const WORKFLOW_EVIDENCE_EDGE_KINDS = new Set([
+  "observed_in_episode",
+  "caused_file_change",
+  "followed_passed_test",
+  "reused_across_days",
+]);
 
 function noisyOr(ps: number[]): number {
   return clamp01(1 - ps.reduce((acc, p) => acc * (1 - p), 1));
@@ -87,7 +95,12 @@ export function buildGraph(store: Store, opts: BuildGraphOptions = {}): GraphRes
   for (const ep of episodes) {
     const actions = store.actions.byIds(ep.actions);
     facts.set(ep.id, episodeFacts(actions));
-    candidates.push(...episodeClaims(ep, actions));
+    const inferred = episodeClaims(ep, actions);
+    const reviewed = resolveWorkflowReview(store, ep);
+    candidates.push(...(reviewed.reviewed
+      ? inferred.filter((candidate) => candidate.kind !== "workflow_pattern")
+      : inferred));
+    if (reviewed.candidate) candidates.push(reviewed.candidate);
   }
 
   // Model-derived claims: the role-agnostic path. Whatever the observer
@@ -122,8 +135,13 @@ export function buildGraph(store: Store, opts: BuildGraphOptions = {}): GraphRes
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
   const nodeByKey = new Map<string, GraphNode>();
+  const desiredEdgeKeys = new Set<string>();
+
+  const edgeKey = (from: string, to: string, kind: string): string =>
+    JSON.stringify([from, to, kind]);
 
   const addEdge = (from: string, to: string, kind: string, data?: Record<string, unknown>) => {
+    desiredEdgeKeys.add(edgeKey(from, to, kind));
     if (store.graph.hasEdge(from, to, kind)) return;
     if (edges.some((e) => e.from === from && e.to === to && e.kind === kind)) return;
     edges.push({ id: newId("edge"), from, to, kind, data, createdTs: now });
@@ -200,6 +218,32 @@ export function buildGraph(store: Store, opts: BuildGraphOptions = {}): GraphRes
   }
 
   if (opts.persist !== false) {
+    // Workflow claims are a materialized projection. Human review can replace
+    // or reject one, so remove only obsolete workflow rows before upserting the
+    // current set; other claim ids (and claim-targeted corrections) stay stable.
+    const activeWorkflowIds = new Set(
+      claims.filter((claim) => claim.kind === "workflow_pattern").map((claim) => claim.id),
+    );
+    for (const stale of store.claims.byKind("workflow_pattern")) {
+      if (activeWorkflowIds.has(stale.id)) continue;
+      store.graph.removeClaimNode(stale.id);
+      store.claims.remove(stale.id);
+    }
+    // A shared workflow claim keeps the same claim/node id as evidence changes.
+    // Reconcile every derived evidence edge against the desired materialized
+    // set: an episode can remain active while e.g. `reused_across_days` ceases
+    // to be true after another day's evidence is rejected.
+    for (const claim of claims.filter((item) => item.kind === "workflow_pattern")) {
+      const node = nodes.find((item) => item.claimId === claim.id);
+      if (!node) continue;
+      for (const edge of store.graph.incident(node.id)) {
+        if (
+          edge.from === node.id &&
+          WORKFLOW_EVIDENCE_EDGE_KINDS.has(edge.kind) &&
+          !desiredEdgeKeys.has(edgeKey(edge.from, edge.to, edge.kind))
+        ) store.graph.removeEdge(edge.id);
+      }
+    }
     for (const c of claims) store.claims.put(c);
     for (const n of nodes) store.graph.putNode(n);
     for (const e of edges) store.graph.putEdge(e);

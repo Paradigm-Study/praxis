@@ -14,6 +14,8 @@ export interface ActionStore {
   putMany(actions: ActionEvent[]): void;
   get(id: string): ActionEvent | undefined;
   range(range?: ActionRange): ActionEvent[];
+  /** Newest first, bounded in SQL for desktop snapshot surfaces. */
+  recent(limit: number): ActionEvent[];
   byIds(ids: string[]): ActionEvent[];
   count(): number;
 }
@@ -97,6 +99,12 @@ export function makeActionStore(db: DatabaseSync, cipher?: StorageCipher): Actio
       const rows = db
         .prepare(`SELECT * FROM action_events ${clause} ORDER BY start_ts ASC ${limit}`)
         .all(...params) as Record<string, unknown>[];
+      return rows.map((row) => rowToAction(row, cipher));
+    },
+    recent(limit) {
+      const rows = db
+        .prepare(`SELECT * FROM action_events ORDER BY start_ts DESC, id DESC LIMIT ?`)
+        .all(Math.max(0, Math.floor(limit))) as Record<string, unknown>[];
       return rows.map((row) => rowToAction(row, cipher));
     },
     byIds(ids) {

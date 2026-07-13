@@ -9,6 +9,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -155,7 +156,9 @@ test("legacy mesh grants are dropped and v2 consent stays bound after symlink re
       project: "acme/app",
     }]);
 
-    rmSync(alias);
+    // Node 24 intentionally refuses directory-style rm semantics for a
+    // symlink-to-directory. Remove the directory entry itself.
+    unlinkSync(alias);
     symlinkSync(secondRoot, alias, "dir");
     const persisted = new PrivacyControlStore(path).read().meshProjectConsents;
     assert.equal(

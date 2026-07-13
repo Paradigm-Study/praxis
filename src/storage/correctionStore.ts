@@ -11,6 +11,7 @@ export interface CorrectionStore {
   put(c: Correction): void;
   get(id: string): Correction | undefined;
   all(): Correction[];
+  recent(limit: number): Correction[];
   byTarget(targetId: string): Correction[];
 }
 
@@ -58,6 +59,12 @@ export function makeCorrectionStore(db: DatabaseSync, cipher?: StorageCipher): C
         .prepare(`SELECT * FROM corrections ORDER BY created_ts ASC`)
         .all() as Record<string, unknown>[];
       return rows.map((row) => rowToCorrection(row, cipher));
+    },
+    recent(limit) {
+      const rows = db
+        .prepare(`SELECT * FROM corrections ORDER BY created_ts DESC, id DESC LIMIT ?`)
+        .all(Math.max(0, Math.floor(limit))) as Record<string, unknown>[];
+      return rows.map((row) => rowToCorrection(row, cipher)).reverse();
     },
     byTarget(targetId) {
       const rows = byTarget.all(targetId) as Record<string, unknown>[];

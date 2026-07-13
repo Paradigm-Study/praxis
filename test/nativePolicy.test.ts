@@ -1,11 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CaptureSource } from "../src/capture/source.ts";
 import { CaptureManager } from "../src/capture/manager.ts";
 import { ClipboardSource } from "../src/capture/sources/clipboard.ts";
+import { FilesystemSource } from "../src/capture/sources/filesystem.ts";
 import { RuntimeStatusStore } from "../src/capture/runtimeStatus.ts";
 import { PrivacyControlStore } from "../src/privacy/control.ts";
 import {
@@ -144,4 +156,146 @@ test("clipboard policy denial occurs before the clipboard body acquisition funct
   source.stop();
   assert.equal(reads, 0);
   assert.equal(emits, 0);
+});
+
+test("filesystem policy denial occurs before file body acquisition", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-filesystem-preflight-"));
+  let preflights = 0;
+  let reads = 0;
+  let emits = 0;
+  let notify: ((filename: string | Buffer | null) => void) | undefined;
+  const source = new FilesystemSource({
+    root: dir,
+    canAcquire: () => { preflights++; return false; },
+    readText: () => { reads++; return "must never be read"; },
+    watchTree: (_root, callback) => {
+      notify = callback;
+      return { close() {} };
+    },
+  });
+  try {
+    source.start(() => { emits++; throw new Error("denied file content must not emit"); });
+    notify!("secret.txt");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.ok(preflights > 0);
+    assert.equal(reads, 0);
+    assert.equal(emits, 0);
+  } finally {
+    source.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("filesystem capture rejects final and parent symlinks outside the selected workspace", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-filesystem-symlink-"));
+  const root = join(dir, "selected");
+  const outside = join(dir, "outside");
+  mkdirSync(root);
+  mkdirSync(outside);
+  writeFileSync(join(outside, "secret.txt"), "must never be acquired");
+  symlinkSync(join(outside, "secret.txt"), join(root, "final-link.txt"));
+  symlinkSync(outside, join(root, "parent-link"), "dir");
+  let notify: ((filename: string | Buffer | null) => void) | undefined;
+  let reads = 0;
+  let emits = 0;
+  const source = new FilesystemSource({
+    root,
+    readText: () => { reads += 1; return "must never run"; },
+    watchTree: (_root, callback) => {
+      notify = callback;
+      return { close() {} };
+    },
+  });
+  try {
+    source.start(() => { emits += 1; throw new Error("escaped symlink must not emit"); });
+    notify!("final-link.txt");
+    notify!("parent-link/secret.txt");
+    notify!("../outside/secret.txt");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(reads, 0);
+    assert.equal(emits, 0);
+  } finally {
+    source.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("filesystem capture detects a parent-directory retarget before open", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-filesystem-retarget-parent-"));
+  const root = join(dir, "selected");
+  const nested = join(root, "nested");
+  const moved = join(root, "moved");
+  const outside = join(dir, "outside");
+  mkdirSync(nested, { recursive: true });
+  mkdirSync(outside);
+  writeFileSync(join(nested, "target.txt"), "selected bytes");
+  writeFileSync(join(outside, "target.txt"), "outside bytes");
+  let notify: ((filename: string | Buffer | null) => void) | undefined;
+  let reads = 0;
+  let emits = 0;
+  let retargeted = false;
+  const source = new FilesystemSource({
+    root,
+    beforeOpen: () => {
+      if (retargeted) return;
+      retargeted = true;
+      renameSync(nested, moved);
+      symlinkSync(outside, nested, "dir");
+    },
+    readText: () => { reads += 1; return "must never run"; },
+    watchTree: (_root, callback) => {
+      notify = callback;
+      return { close() {} };
+    },
+  });
+  try {
+    source.start(() => { emits += 1; throw new Error("retargeted parent must not emit"); });
+    notify!("nested/target.txt");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(retargeted, true);
+    assert.equal(reads, 0);
+    assert.equal(emits, 0);
+  } finally {
+    source.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("filesystem capture detects a final-component retarget after open", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-filesystem-retarget-final-"));
+  const root = join(dir, "selected");
+  const outside = join(dir, "outside.txt");
+  const target = join(root, "target.txt");
+  mkdirSync(root);
+  writeFileSync(target, "selected bytes");
+  writeFileSync(outside, "outside bytes");
+  let notify: ((filename: string | Buffer | null) => void) | undefined;
+  let reads = 0;
+  let emits = 0;
+  let retargeted = false;
+  const source = new FilesystemSource({
+    root,
+    afterOpen: () => {
+      if (retargeted) return;
+      retargeted = true;
+      unlinkSync(target);
+      symlinkSync(outside, target);
+    },
+    readText: () => { reads += 1; return "must never run"; },
+    watchTree: (_root, callback) => {
+      notify = callback;
+      return { close() {} };
+    },
+  });
+  try {
+    source.start(() => { emits += 1; throw new Error("retargeted file must not emit"); });
+    notify!("target.txt");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(retargeted, true);
+    assert.equal(reads, 0);
+    assert.equal(emits, 0);
+  } finally {
+    source.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

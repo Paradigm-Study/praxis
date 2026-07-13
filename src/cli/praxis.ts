@@ -21,7 +21,7 @@ import { fileAsk, throttledAsk } from "../agent/notify.ts";
 import { codexSessionEvents } from "../fixtures/codexSession.ts";
 import { followupSessionEvents } from "../fixtures/followupSession.ts";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, relative } from "node:path";
 import { loadEnvFile } from "../core/env.ts";
 import { bold, conf, cyan, dim, gray, green, header, red, yellow } from "./render.ts";
 import { consolidate, evidenceCoverage, applyCorrections } from "../memory/consolidate.ts";
@@ -330,7 +330,22 @@ async function cmdCapture(): Promise<void> {
       .map((d) => d.trim())
       .filter(Boolean);
     for (const dir of watchDirs) {
-      sources.push(new FilesystemSource({ root: dir }));
+      sources.push(new FilesystemSource({
+        root: dir,
+        canAcquire: (absolutePath) => {
+          const contentPolicy = capturePolicyDecision(privacy.read(), {
+            source: "filesystem",
+            app: "filesystem",
+            window: relative(process.cwd(), absolutePath),
+            type: "filesystem_preflight",
+            payload: { path: absolutePath },
+          });
+          return contentPolicy.allowed && resourceCaptureDecision(
+            runtime.read().resources,
+            "filesystem",
+          ).allowed;
+        },
+      }));
       sources.push(new GitSource({ repo: dir }));
     }
     if (watchDirs.length === 0) {

@@ -2,7 +2,20 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
 import type { Store } from "../storage/index.ts";
-import type { ActionEvent, RawEvent } from "../core/types.ts";
+import type {
+  ActionEvent,
+  BoundaryReason,
+  Claim,
+  Correction,
+  CorrectionTarget,
+  CorrectionVerdict,
+  Episode,
+  GraphEdge,
+  GraphNode,
+  Observation,
+  RawEvent,
+  StoredDecision,
+} from "../core/types.ts";
 import { newId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
 import { buildPlaybook } from "../transfer/transfer.ts";
@@ -24,8 +37,72 @@ import {
   type RetentionPolicy,
 } from "../storage/maintenance.ts";
 import { authorizeLocalRequest, validateLocalToken } from "../security/localAuth.ts";
+import { parseWorkflowReview, WORKFLOW_REVIEW_NOTE } from "../workflow/review.ts";
 
 const log = logger("studio");
+
+const WORKFLOW_PAGE_LIMIT = 25;
+const EPISODE_SNAPSHOT_LIMIT = 200;
+const CLAIM_SNAPSHOT_LIMIT = 400;
+const GRAPH_NODE_SNAPSHOT_LIMIT = 400;
+const GRAPH_EDGE_SNAPSHOT_LIMIT = 400;
+const OBSERVATION_SNAPSHOT_LIMIT = 200;
+const CORRECTION_SNAPSHOT_LIMIT = 400;
+// Electron rejects daemon responses at 5,000,000 bytes. Leave room for headers,
+// future envelope fields, and small differences between serializers.
+const API_RESPONSE_MAX_BYTES = 4_500_000;
+// A corrupted episode must not produce an unbounded SQLite IN clause. Normal
+// episodes keep every referenced action; this ceiling is only a safety valve.
+const WORKFLOW_ACTION_SAFETY_LIMIT = 1_000;
+const WORKFLOW_TRUNCATION_FIELD_LIMIT = 80;
+const WORKFLOW_BOUNDARY_REASONS = new Set<BoundaryReason>([
+  "task_shift",
+  "app_window_shift",
+  "command_test_cycle",
+  "file_save_commit",
+  "conversation_turn",
+  "long_dwell_gap",
+  "user_correction",
+  "session_start",
+  "session_end",
+]);
+
+interface WorkflowTruncation {
+  truncated: boolean;
+  fields: string[];
+  omittedFieldCount: number;
+  actionCounts: {
+    referenced: number;
+    included: number;
+    omitted: number;
+    missing: number;
+  };
+}
+
+interface WorkflowEvidenceItem {
+  episode: Omit<Episode, "payload">;
+  actions: Array<Omit<ActionEvent, "payload">>;
+  truncation: WorkflowTruncation;
+}
+
+interface WorkflowEvidencePage {
+  items: WorkflowEvidenceItem[];
+  nextCursor: string | null;
+}
+
+interface WorkflowCursor {
+  v: 1;
+  startTs: string;
+  id: string;
+}
+
+class InvalidWorkflowCursorError extends Error {}
+
+interface TruncationTracker {
+  fields: string[];
+  seen: Set<string>;
+  omittedFieldCount: number;
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -178,6 +255,477 @@ function serveStatic(webDir: string, path: string, res: ServerResponse): void {
   res.end(body);
 }
 
+function boundedQueryInteger(
+  value: string | null,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (value === null || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function encodeWorkflowCursor(episode: Pick<Episode, "startTs" | "id">): string {
+  const cursor: WorkflowCursor = { v: 1, startTs: episode.startTs, id: episode.id };
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeWorkflowCursor(value: string | null): WorkflowCursor | undefined {
+  if (value === null) return undefined;
+  if (
+    value.length < 1 ||
+    value.length > 2_048 ||
+    !/^[A-Za-z0-9_-]+$/.test(value)
+  ) throw new InvalidWorkflowCursorError("invalid workflow cursor");
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new InvalidWorkflowCursorError("invalid workflow cursor");
+    }
+    const raw = parsed as Record<string, unknown>;
+    const timestamp = typeof raw.startTs === "string" ? Date.parse(raw.startTs) : Number.NaN;
+    if (
+      raw.v !== 1 ||
+      typeof raw.startTs !== "string" ||
+      raw.startTs.length < 1 ||
+      raw.startTs.length > 128 ||
+      !Number.isFinite(timestamp) ||
+      new Date(timestamp).toISOString() !== raw.startTs ||
+      typeof raw.id !== "string" ||
+      raw.id.length < 1 ||
+      raw.id.length > 512
+    ) throw new InvalidWorkflowCursorError("invalid workflow cursor");
+    return { v: 1, startTs: raw.startTs, id: raw.id };
+  } catch (error) {
+    if (error instanceof InvalidWorkflowCursorError) throw error;
+    throw new InvalidWorkflowCursorError("invalid workflow cursor");
+  }
+}
+
+function truncationTracker(): TruncationTracker {
+  return { fields: [], seen: new Set(), omittedFieldCount: 0 };
+}
+
+function noteTruncation(tracker: TruncationTracker, field: string): void {
+  if (tracker.seen.has(field)) return;
+  tracker.seen.add(field);
+  if (tracker.fields.length < WORKFLOW_TRUNCATION_FIELD_LIMIT) tracker.fields.push(field);
+  else tracker.omittedFieldCount += 1;
+}
+
+function clippedString(
+  value: unknown,
+  maxChars: number,
+  field: string,
+  tracker: TruncationTracker,
+  fallback = "",
+): string {
+  if (typeof value !== "string") {
+    noteTruncation(tracker, field);
+    return fallback;
+  }
+  if (value.length > maxChars) noteTruncation(tracker, field);
+  return value.slice(0, maxChars);
+}
+
+function optionalClippedString(
+  value: unknown,
+  maxChars: number,
+  field: string,
+  tracker: TruncationTracker,
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    noteTruncation(tracker, field);
+    return undefined;
+  }
+  if (value.length > maxChars) noteTruncation(tracker, field);
+  return value.slice(0, maxChars);
+}
+
+function workflowBoundaryReason(
+  value: unknown,
+  tracker: TruncationTracker,
+): BoundaryReason | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string" && WORKFLOW_BOUNDARY_REASONS.has(value as BoundaryReason)) {
+    return value as BoundaryReason;
+  }
+  noteTruncation(tracker, "episode.boundaryReason");
+  return undefined;
+}
+
+function clippedStrings(
+  value: unknown,
+  maxItems: number,
+  maxChars: number,
+  field: string,
+  tracker: TruncationTracker,
+): string[] {
+  if (!Array.isArray(value)) {
+    noteTruncation(tracker, field);
+    return [];
+  }
+  if (value.length > maxItems) noteTruncation(tracker, field);
+  const result: string[] = [];
+  for (const item of value.slice(0, maxItems)) {
+    if (typeof item !== "string") {
+      noteTruncation(tracker, field);
+      continue;
+    }
+    if (item.length > maxChars) noteTruncation(tracker, field);
+    result.push(item.slice(0, maxChars));
+  }
+  return result;
+}
+
+function selectedActionIds(
+  episode: Episode,
+  limit: number,
+  tracker: TruncationTracker,
+): string[] {
+  const source: unknown[] = Array.isArray(episode.actions) ? episode.actions : [];
+  const selected: string[] = [];
+  for (const value of source.slice(0, limit)) {
+    // Oversized or malformed identifiers are omitted instead of becoming large
+    // SQLite parameters or ambiguous clipped joins.
+    if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+      noteTruncation(tracker, "episode.actions");
+      continue;
+    }
+    selected.push(value);
+  }
+  if (selected.length < source.length) noteTruncation(tracker, "episode.actions");
+  return selected;
+}
+
+function projectWorkflowAction(
+  action: ActionEvent,
+  index: number,
+  tracker: TruncationTracker,
+): Omit<ActionEvent, "payload"> {
+  const field = (name: string) => `actions[${index}].${name}`;
+  const rawConfidence = Number(action.confidence);
+  const confidence = Number.isFinite(rawConfidence)
+    ? Math.max(0, Math.min(1, rawConfidence))
+    : 0;
+  if (confidence !== rawConfidence) noteTruncation(tracker, field("confidence"));
+  const window = optionalClippedString(action.window, 500, field("window"), tracker);
+  const text = optionalClippedString(action.text, 2_000, field("text"), tracker);
+  const uncertainty = action.uncertainty === undefined
+    ? undefined
+    : clippedStrings(action.uncertainty, 12, 500, field("uncertainty"), tracker);
+  const reconstructedBy = action.reconstructedBy === undefined
+    ? undefined
+    : clippedStrings(action.reconstructedBy, 16, 160, field("reconstructedBy"), tracker);
+  return {
+    id: clippedString(action.id, 256, field("id"), tracker, `action-${index}`),
+    type: "user_action",
+    action: clippedString(action.action, 160, field("action"), tracker, "captured_action"),
+    app: clippedString(action.app, 240, field("app"), tracker),
+    ...(window !== undefined ? { window } : {}),
+    startTs: clippedString(action.startTs, 64, field("startTs"), tracker, "1970-01-01T00:00:00.000Z"),
+    endTs: clippedString(action.endTs, 64, field("endTs"), tracker, "1970-01-01T00:00:00.000Z"),
+    ...(text !== undefined ? { text } : {}),
+    confidence,
+    evidence: clippedStrings(action.evidence, 24, 160, field("evidence"), tracker),
+    ...(uncertainty !== undefined ? { uncertainty } : {}),
+    ...(reconstructedBy !== undefined ? { reconstructedBy } : {}),
+  };
+}
+
+function boundedHead<T>(items: T[], maxBytes = API_RESPONSE_MAX_BYTES): T[] {
+  const result: T[] = [];
+  let bytes = 2; // []
+  for (const item of items) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+    if (bytes + itemBytes + (result.length > 0 ? 1 : 0) > maxBytes) break;
+    result.push(item);
+    bytes += itemBytes + (result.length > 1 ? 1 : 0);
+  }
+  return result;
+}
+
+/** Keep the newest suffix while preserving the API's historical ASC order. */
+function boundedTail<T>(items: T[], maxBytes = API_RESPONSE_MAX_BYTES): T[] {
+  const result: T[] = [];
+  let bytes = 2; // []
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!;
+    const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+    if (bytes + itemBytes + (result.length > 0 ? 1 : 0) > maxBytes) break;
+    result.unshift(item);
+    bytes += itemBytes + (result.length > 1 ? 1 : 0);
+  }
+  return result;
+}
+
+function projectSnapshotEvent(event: RawEvent): RawEvent {
+  const tracker = truncationTracker();
+  return {
+    id: clippedString(event.id, 256, "event.id", tracker, "event"),
+    ts: clippedString(event.ts, 64, "event.ts", tracker, "1970-01-01T00:00:00.000Z"),
+    source: event.source,
+    app: clippedString(event.app, 240, "event.app", tracker),
+    window: clippedString(event.window, 500, "event.window", tracker),
+    type: clippedString(event.type, 160, "event.type", tracker, "captured_event"),
+    // The feed is a bounded timeline index. Full event payload remains
+    // available from /api/event/:id when a user drills into one receipt.
+    payload: {},
+    blobRefs: clippedStrings(event.blobRefs, 32, 256, "event.blobRefs", tracker),
+    hash: clippedString(event.hash, 256, "event.hash", tracker),
+  };
+}
+
+function projectSnapshotAction(action: ActionEvent, index: number): Omit<ActionEvent, "payload"> {
+  return projectWorkflowAction(action, index, truncationTracker());
+}
+
+function projectSnapshotEpisode(episode: Episode): Omit<Episode, "payload"> {
+  const tracker = truncationTracker();
+  const actions = selectedActionIds(episode, 128, tracker);
+  const id = clippedString(episode.id, 256, "episode.id", tracker, "episode");
+  const startTs = clippedString(episode.startTs, 64, "episode.startTs", tracker, "1970-01-01T00:00:00.000Z");
+  const endTs = clippedString(episode.endTs, 64, "episode.endTs", tracker, "1970-01-01T00:00:00.000Z");
+  const summary = clippedString(episode.summary, 2_000, "episode.summary", tracker);
+  const goal = optionalClippedString(episode.goal, 1_000, "episode.goal", tracker);
+  const boundaryReason = workflowBoundaryReason(episode.boundaryReason, tracker);
+  const artifacts = clippedStrings(episode.artifacts, 32, 500, "episode.artifacts", tracker);
+  const decisionPoints = clippedStrings(episode.decisionPoints, 16, 500, "episode.decisionPoints", tracker);
+  const rejectedPaths = clippedStrings(episode.rejectedPaths, 16, 500, "episode.rejectedPaths", tracker);
+  let uncertainty = clippedStrings(episode.uncertainty, 16, 500, "episode.uncertainty", tracker);
+  if (tracker.seen.size > 0) {
+    uncertainty = [
+      ...uncertainty.slice(0, 15),
+      "Episode snapshot was truncated for safe desktop display.",
+    ];
+  }
+  return {
+    id,
+    type: "context_episode",
+    startTs,
+    endTs,
+    summary,
+    ...(goal !== undefined ? { goal } : {}),
+    actions,
+    artifacts,
+    decisionPoints,
+    rejectedPaths,
+    uncertainty,
+    ...(boundaryReason !== undefined ? { boundaryReason } : {}),
+  };
+}
+
+function projectSnapshotClaim(claim: Claim): Claim {
+  const tracker = truncationTracker();
+  const confidence = Number.isFinite(claim.confidence)
+    ? Math.max(0, Math.min(1, claim.confidence))
+    : 0;
+  return {
+    id: clippedString(claim.id, 256, "claim.id", tracker, "claim"),
+    kind: clippedString(claim.kind, 160, "claim.kind", tracker, "unknown"),
+    text: clippedString(claim.text, 4_000, "claim.text", tracker, "Unavailable claim"),
+    confidence,
+    evidenceEpisodes: clippedStrings(claim.evidenceEpisodes, 64, 256, "claim.evidenceEpisodes", tracker),
+    createdTs: clippedString(claim.createdTs, 64, "claim.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+    updatedTs: clippedString(claim.updatedTs, 64, "claim.updatedTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotNode(node: GraphNode): Omit<GraphNode, "data"> {
+  const tracker = truncationTracker();
+  const confidence = Number.isFinite(node.confidence)
+    ? Math.max(0, Math.min(1, node.confidence))
+    : 0;
+  const claimId = optionalClippedString(node.claimId, 256, "node.claimId", tracker);
+  return {
+    id: clippedString(node.id, 256, "node.id", tracker, "node"),
+    kind: clippedString(node.kind, 160, "node.kind", tracker, "unknown"),
+    label: clippedString(node.label, 4_000, "node.label", tracker, "Unavailable node"),
+    confidence,
+    ...(claimId !== undefined ? { claimId } : {}),
+    createdTs: clippedString(node.createdTs, 64, "node.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+    updatedTs: clippedString(node.updatedTs, 64, "node.updatedTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotEdge(edge: GraphEdge): Omit<GraphEdge, "data"> {
+  const tracker = truncationTracker();
+  return {
+    id: clippedString(edge.id, 256, "edge.id", tracker, "edge"),
+    from: clippedString(edge.from, 256, "edge.from", tracker, "unknown"),
+    to: clippedString(edge.to, 256, "edge.to", tracker, "unknown"),
+    kind: clippedString(edge.kind, 160, "edge.kind", tracker, "unknown"),
+    createdTs: clippedString(edge.createdTs, 64, "edge.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotObservation(observation: Observation): Observation {
+  const tracker = truncationTracker();
+  const optionalText = (value: unknown, max: number, field: string) =>
+    optionalClippedString(value, max, field, tracker);
+  const episodeId = optionalText(observation.episodeId, 256, "observation.episodeId");
+  const intent = optionalText(observation.intent, 2_000, "observation.intent");
+  const task = optionalText(observation.task, 2_000, "observation.task");
+  const decisionPoint = optionalText(observation.decisionPoint, 2_000, "observation.decisionPoint");
+  const inferredPreference = optionalText(observation.inferredPreference, 2_000, "observation.inferredPreference");
+  const suggestedQuestion = optionalText(observation.suggestedQuestion, 2_000, "observation.suggestedQuestion");
+  const options = observation.options === undefined
+    ? undefined
+    : clippedStrings(observation.options, 16, 500, "observation.options", tracker);
+  return {
+    id: clippedString(observation.id, 256, "observation.id", tracker, "observation"),
+    bundleId: clippedString(observation.bundleId, 256, "observation.bundleId", tracker, "bundle"),
+    ...(episodeId !== undefined ? { episodeId } : {}),
+    ...(intent !== undefined ? { intent } : {}),
+    ...(task !== undefined ? { task } : {}),
+    ...(decisionPoint !== undefined ? { decisionPoint } : {}),
+    acceptedOptions: clippedStrings(observation.acceptedOptions, 16, 500, "observation.acceptedOptions", tracker),
+    rejectedOptions: clippedStrings(observation.rejectedOptions, 16, 500, "observation.rejectedOptions", tracker),
+    ...(inferredPreference !== undefined ? { inferredPreference } : {}),
+    uncertainty: clippedStrings(observation.uncertainty, 16, 500, "observation.uncertainty", tracker),
+    ...(suggestedQuestion !== undefined ? { suggestedQuestion } : {}),
+    ...(options !== undefined ? { options } : {}),
+    evidence: clippedStrings(observation.evidence, 64, 256, "observation.evidence", tracker),
+    model: clippedString(observation.model, 240, "observation.model", tracker, "unknown"),
+    createdTs: clippedString(observation.createdTs, 64, "observation.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotCorrection(correction: Correction): Correction {
+  const tracker = truncationTracker();
+  const correctedText = optionalClippedString(
+    correction.correctedText,
+    64 * 1024,
+    "correction.correctedText",
+    tracker,
+  );
+  const note = optionalClippedString(correction.note, 2_000, "correction.note", tracker);
+  return {
+    id: clippedString(correction.id, 256, "correction.id", tracker, "correction"),
+    targetKind: correction.targetKind,
+    targetId: clippedString(correction.targetId, 256, "correction.targetId", tracker, "unknown"),
+    verdict: correction.verdict,
+    ...(correctedText !== undefined ? { correctedText } : {}),
+    ...(note !== undefined ? { note } : {}),
+    createdTs: clippedString(correction.createdTs, 64, "correction.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotDecision(decision: StoredDecision): StoredDecision {
+  const tracker = truncationTracker();
+  const question = optionalClippedString(decision.question, 2_000, "decision.question", tracker);
+  const observationId = optionalClippedString(decision.observationId, 256, "decision.observationId", tracker);
+  const claimId = optionalClippedString(decision.claimId, 256, "decision.claimId", tracker);
+  return {
+    id: clippedString(decision.id, 256, "decision.id", tracker, "decision"),
+    kind: clippedString(decision.kind, 160, "decision.kind", tracker, "unknown"),
+    reason: clippedString(decision.reason, 4_000, "decision.reason", tracker),
+    ...(question !== undefined ? { question } : {}),
+    evidence: clippedStrings(decision.evidence, 64, 256, "decision.evidence", tracker),
+    ...(observationId !== undefined ? { observationId } : {}),
+    ...(claimId !== undefined ? { claimId } : {}),
+    createdTs: clippedString(decision.createdTs, 64, "decision.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectWorkflowItem(
+  store: Store,
+  episode: Episode,
+  actionLimit: number,
+): WorkflowEvidenceItem {
+  const tracker = truncationTracker();
+  const sourceActionCount = Array.isArray(episode.actions) ? episode.actions.length : 0;
+  const actionIds = selectedActionIds(episode, actionLimit, tracker);
+  const sourceActions = store.actions.byIds(actionIds);
+  const existingActionIds = new Set(sourceActions.map((action) => action.id));
+  const missingActionCount = actionIds.filter((id) => !existingActionIds.has(id)).length;
+  const projectedActions = sourceActions.map((action, index) => projectWorkflowAction(action, index, tracker));
+  const episodeId = clippedString(episode.id, 256, "episode.id", tracker, "episode");
+  const startTs = clippedString(episode.startTs, 64, "episode.startTs", tracker, "1970-01-01T00:00:00.000Z");
+  const endTs = clippedString(episode.endTs, 64, "episode.endTs", tracker, "1970-01-01T00:00:00.000Z");
+  const summary = clippedString(episode.summary, 2_000, "episode.summary", tracker);
+  const goal = optionalClippedString(episode.goal, 1_000, "episode.goal", tracker);
+  const boundaryReason = workflowBoundaryReason(episode.boundaryReason, tracker);
+  const artifacts = clippedStrings(episode.artifacts, 64, 500, "episode.artifacts", tracker);
+  const decisionPoints = clippedStrings(episode.decisionPoints, 32, 500, "episode.decisionPoints", tracker);
+  const rejectedPaths = clippedStrings(episode.rejectedPaths, 32, 500, "episode.rejectedPaths", tracker);
+  let uncertainty = clippedStrings(episode.uncertainty, 32, 500, "episode.uncertainty", tracker);
+  const omittedActionCount = Math.max(0, sourceActionCount - actionIds.length);
+  if (tracker.seen.size > 0 || missingActionCount > 0) {
+    const warning = `Workflow evidence was truncated: included ${sourceActions.length} of ${sourceActionCount} referenced actions; shortened, omitted, or missing evidence may make this review incomplete.`;
+    uncertainty = [...uncertainty.slice(0, 31), warning.slice(0, 500)];
+  }
+  const item: WorkflowEvidenceItem = {
+    episode: {
+      id: episodeId,
+      type: "context_episode",
+      startTs,
+      endTs,
+      summary,
+      ...(goal !== undefined ? { goal } : {}),
+      actions: actionIds,
+      artifacts,
+      decisionPoints,
+      rejectedPaths,
+      uncertainty,
+      ...(boundaryReason !== undefined ? { boundaryReason } : {}),
+    },
+    actions: projectedActions,
+    truncation: {
+      truncated: false,
+      fields: tracker.fields,
+      omittedFieldCount: tracker.omittedFieldCount,
+      actionCounts: {
+        referenced: sourceActionCount,
+        included: sourceActions.length,
+        omitted: omittedActionCount,
+        missing: missingActionCount,
+      },
+    },
+  };
+  item.truncation.truncated = tracker.seen.size > 0 || missingActionCount > 0;
+  return item;
+}
+
+function workflowPageBytes(items: WorkflowEvidenceItem[], nextCursor: string | null): number {
+  return Buffer.byteLength(JSON.stringify({ items, nextCursor }), "utf8");
+}
+
+function workflowEvidencePage(store: Store, url: URL): WorkflowEvidencePage {
+  const limit = boundedQueryInteger(url.searchParams.get("limit"), WORKFLOW_PAGE_LIMIT, 1, WORKFLOW_PAGE_LIMIT);
+  const cursor = decodeWorkflowCursor(url.searchParams.get("cursor"));
+  // Fetch one extra row so continuation is exact without a separate COUNT.
+  const fetched = store.episodes.pageAfter(limit + 1, cursor);
+  const candidates = fetched.slice(0, limit);
+  const items: WorkflowEvidenceItem[] = [];
+
+  for (const episode of candidates) {
+    let actionLimit = Math.min(episode.actions.length, WORKFLOW_ACTION_SAFETY_LIMIT);
+    let item = projectWorkflowItem(store, episode, actionLimit);
+    let bytes = workflowPageBytes([...items, item], encodeWorkflowCursor(episode));
+
+    // Usually the page is shortened between episodes. If one episode alone is
+    // oversized, progressively omit its tail actions and report that omission.
+    while (items.length === 0 && bytes > API_RESPONSE_MAX_BYTES && actionLimit > 0) {
+      actionLimit = Math.floor(actionLimit / 2);
+      item = projectWorkflowItem(store, episode, actionLimit);
+      bytes = workflowPageBytes([item], encodeWorkflowCursor(episode));
+    }
+    if (bytes > API_RESPONSE_MAX_BYTES) {
+      if (items.length === 0) throw new Error("bounded workflow projection exceeds response limit");
+      break;
+    }
+    items.push(item);
+  }
+
+  const hasMore = items.length < candidates.length || fetched.length > limit;
+  const last = items.length > 0 ? candidates[items.length - 1] : undefined;
+  return { items, nextCursor: hasMore && last ? encodeWorkflowCursor(last) : null };
+}
+
 function handleApi(
   store: Store,
   req: IncomingMessage,
@@ -249,26 +797,93 @@ function handleApi(
       case "/api/storage/retention":
         return json(res, 200, RetentionPolicyStore.forStore(store).read());
       case "/api/feed":
-        return json(res, 200, store.events.range({ limit: 300 }).reverse());
+        return json(
+          res,
+          200,
+          boundedHead(store.events.recent(300).map(projectSnapshotEvent)),
+        );
       case "/api/actions":
         // Newest first, bounded — the timeline grows forever; the browser
         // must not be handed (and animate) tens of thousands of rows.
-        return json(res, 200, store.actions.range().slice(-400).reverse());
-      case "/api/episodes":
-        return json(res, 200, store.episodes.all());
-      case "/api/claims":
-        return json(res, 200, store.claims.all());
-      case "/api/graph":
-        return json(res, 200, {
-          nodes: store.graph.nodes(),
-          edges: store.graph.edges(),
-        });
-      case "/api/observations":
-        return json(res, 200, store.observations.all());
-      case "/api/corrections":
-        return json(res, 200, store.corrections.all());
+        return json(
+          res,
+          200,
+          boundedHead(store.actions.recent(400).map(projectSnapshotAction)),
+        );
+      case "/api/episodes": { // Oldest-to-newest within the bounded recent window.
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          EPISODE_SNAPSHOT_LIMIT,
+          1,
+          EPISODE_SNAPSHOT_LIMIT,
+        );
+        const episodes = store.episodes.recentProjection(limit).map(projectSnapshotEpisode);
+        return json(res, 200, boundedTail(episodes));
+      }
+      case "/api/workflows": {
+        try {
+          return json(res, 200, workflowEvidencePage(store, url));
+        } catch (error) {
+          if (error instanceof InvalidWorkflowCursorError) {
+            return json(res, 400, { error: "invalid workflow cursor" });
+          }
+          throw error;
+        }
+      }
+      case "/api/claims": {
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          CLAIM_SNAPSHOT_LIMIT,
+          1,
+          CLAIM_SNAPSHOT_LIMIT,
+        );
+        return json(res, 200, boundedHead(store.claims.top(limit).map(projectSnapshotClaim)));
+      }
+      case "/api/graph": {
+        const nodeLimit = boundedQueryInteger(
+          url.searchParams.get("nodes"),
+          GRAPH_NODE_SNAPSHOT_LIMIT,
+          1,
+          GRAPH_NODE_SNAPSHOT_LIMIT,
+        );
+        const edgeLimit = boundedQueryInteger(
+          url.searchParams.get("edges"),
+          GRAPH_EDGE_SNAPSHOT_LIMIT,
+          1,
+          GRAPH_EDGE_SNAPSHOT_LIMIT,
+        );
+        // Reserve independent budgets so a pathological node label cannot
+        // starve every edge (or vice versa) from the same snapshot.
+        const nodes = boundedHead(store.graph.nodes(nodeLimit).map(projectSnapshotNode), 3_000_000);
+        const edges = boundedHead(store.graph.edges(edgeLimit).map(projectSnapshotEdge), 1_400_000);
+        return json(res, 200, { nodes, edges });
+      }
+      case "/api/observations": {
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          OBSERVATION_SNAPSHOT_LIMIT,
+          1,
+          OBSERVATION_SNAPSHOT_LIMIT,
+        );
+        const observations = store.observations.recent(limit).map(projectSnapshotObservation);
+        return json(res, 200, boundedTail(observations));
+      }
+      case "/api/corrections": {
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          CORRECTION_SNAPSHOT_LIMIT,
+          1,
+          CORRECTION_SNAPSHOT_LIMIT,
+        );
+        const corrections = store.corrections.recent(limit).map(projectSnapshotCorrection);
+        return json(res, 200, boundedTail(corrections));
+      }
       case "/api/decisions":
-        return json(res, 200, store.decisions.recent(50));
+        return json(
+          res,
+          200,
+          boundedHead(store.decisions.recent(50).map(projectSnapshotDecision)),
+        );
       case "/api/playbook":
         return json(res, 200, buildPlaybook(store));
       case "/api/connections":
@@ -411,16 +1026,59 @@ function handleApi(
       if (!data?.targetKind || !data?.targetId || !data?.verdict) {
         return json(res, 400, { error: "targetKind, targetId, verdict required" });
       }
-      const correction = {
+      const targetKind = String(data.targetKind) as CorrectionTarget;
+      const verdict = String(data.verdict) as CorrectionVerdict;
+      if (!["action", "episode", "claim", "observation", "decision"].includes(targetKind)) {
+        return json(res, 400, { error: "invalid correction targetKind" });
+      }
+      if (!["confirmed", "rejected", "edited"].includes(verdict)) {
+        return json(res, 400, { error: "invalid correction verdict" });
+      }
+      const targetId = String(data.targetId);
+      const note = data.note ? String(data.note) : undefined;
+      const correctedText = data.correctedText ? String(data.correctedText) : undefined;
+      const isWorkflowReview = note === WORKFLOW_REVIEW_NOTE;
+      if (isWorkflowReview) {
+        if (targetKind !== "episode") {
+          return json(res, 400, { error: "workflow reviews must target an episode" });
+        }
+        if (!store.episodes.get(targetId)) {
+          return json(res, 404, { error: "workflow episode not found" });
+        }
+        if (verdict !== "rejected" && !parseWorkflowReview(correctedText)) {
+          return json(res, 400, { error: "invalid workflow review payload" });
+        }
+      }
+      const correction: Correction = {
         id: newId("corr"),
-        targetKind: data.targetKind as never,
-        targetId: String(data.targetId),
-        verdict: data.verdict as never,
-        correctedText: data.correctedText ? String(data.correctedText) : undefined,
-        note: data.note ? String(data.note) : undefined,
+        targetKind,
+        targetId,
+        verdict,
+        correctedText,
+        note,
         createdTs: nowIso(),
       };
-      store.corrections.put(correction);
+      if (isWorkflowReview) {
+        // The review and every materialized claim/node/edge change are one
+        // unit. A graph failure must never leave a verdict that the graph and
+        // playbook do not reflect.
+        store.db.exec("BEGIN IMMEDIATE");
+        try {
+          store.corrections.put(correction);
+          buildGraph(store);
+          store.db.exec("COMMIT");
+        } catch (error) {
+          try {
+            store.db.exec("ROLLBACK");
+          } catch {
+            // Preserve the materialization error if SQLite already aborted.
+          }
+          log.error(`workflow correction rolled back: ${String(error)}`);
+          return json(res, 500, { error: "workflow review could not be persisted" });
+        }
+      } else {
+        store.corrections.put(correction);
+      }
       log.info(`correction: ${correction.verdict} on ${correction.targetId}`);
       return json(res, 200, correction);
     });
@@ -598,14 +1256,16 @@ function questions(store: Store): unknown {
     )
     .slice(0, 8)
     .map((d) => {
+      const tracker = truncationTracker();
       const obs = d.observationId ? store.observations.get(d.observationId) : undefined;
       return {
-        questionId: d.id,
-        question: d.question,
-        options: obs?.options ?? [],
-        kind: d.kind,
-        createdTs: d.createdTs,
-        evidence: (d.evidence ?? []).map((id) => evidenceSummary(store, id)),
+        questionId: clippedString(d.id, 256, "question.id", tracker, "question"),
+        question: clippedString(d.question, 2_000, "question.question", tracker, "What should happen next?"),
+        options: clippedStrings(obs?.options ?? [], 8, 500, "question.options", tracker),
+        kind: clippedString(d.kind, 160, "question.kind", tracker, "ask_expert"),
+        createdTs: clippedString(d.createdTs, 64, "question.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+        evidence: clippedStrings(d.evidence ?? [], 24, 256, "question.evidence", tracker)
+          .map((id) => evidenceSummary(store, id)),
       };
     });
 
@@ -613,15 +1273,17 @@ function questions(store: Store): unknown {
   const cards = store.actions
     .range()
     .filter((a) => (a.confidence < 0.85 || a.uncertainty?.length) && !answered.has(a.id))
+    .slice(-100)
+    .reverse()
     .map((a) => ({
-      actionId: a.id,
+      actionId: a.id.slice(0, 256),
       proposed: propose(a),
-      action: a.action,
-      app: a.app,
-      text: a.text,
+      action: a.action.slice(0, 160),
+      app: a.app.slice(0, 240),
+      text: a.text?.slice(0, 2_000),
       confidence: a.confidence,
-      uncertainty: a.uncertainty ?? [],
-      evidence: a.evidence.map((id) => evidenceSummary(store, id)),
+      uncertainty: (a.uncertainty ?? []).slice(0, 12).map((item) => item.slice(0, 500)),
+      evidence: a.evidence.slice(0, 24).map((id) => evidenceSummary(store, id.slice(0, 256))),
     }));
 
   return { agent, cards };
@@ -640,7 +1302,7 @@ function propose(a: ActionEvent): string {
 
 function evidenceSummary(store: Store, id: string): unknown {
   const ev: RawEvent | undefined = store.events.get(id);
-  if (!ev) return { id, label: id };
+  if (!ev) return { id: id.slice(0, 256), label: id.slice(0, 256) };
   const text =
     (ev.payload.text as string) ??
     (ev.payload.value as string) ??
@@ -648,14 +1310,14 @@ function evidenceSummary(store: Store, id: string): unknown {
     (ev.payload.title as string) ??
     "";
   return {
-    id,
+    id: id.slice(0, 256),
     source: ev.source,
-    type: ev.type,
-    app: ev.app,
-    ts: ev.ts,
-    label: `${ev.source}/${ev.type}`,
+    type: ev.type.slice(0, 160),
+    app: ev.app.slice(0, 240),
+    ts: ev.ts.slice(0, 64),
+    label: `${ev.source}/${ev.type}`.slice(0, 320),
     snippet: String(text).slice(0, 80),
-    blobRefs: ev.blobRefs,
+    blobRefs: ev.blobRefs.slice(0, 32).map((hash) => hash.slice(0, 256)),
   };
 }
 

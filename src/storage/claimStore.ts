@@ -7,9 +7,11 @@ export interface ClaimStore {
   put(c: Claim): void;
   get(id: string): Claim | undefined;
   all(): Claim[];
+  top(limit: number): Claim[];
   byKind(kind: ClaimKind): Claim[];
   /** Exact-text match within a kind — used to dedupe/merge claims. */
   findByText(kind: string, text: string): Claim | undefined;
+  remove(id: string): void;
   count(): number;
 }
 
@@ -36,6 +38,7 @@ export function makeClaimStore(db: DatabaseSync, cipher?: StorageCipher): ClaimS
     `SELECT * FROM claims WHERE kind = ? AND text = ? LIMIT 1`,
   );
   const counter = db.prepare(`SELECT COUNT(*) AS n FROM claims`);
+  const remove = db.prepare(`DELETE FROM claims WHERE id = ?`);
 
   return {
     put(c) {
@@ -59,6 +62,12 @@ export function makeClaimStore(db: DatabaseSync, cipher?: StorageCipher): ClaimS
         .all() as Record<string, unknown>[];
       return rows.map((row) => rowToClaim(row, cipher));
     },
+    top(limit) {
+      const rows = db
+        .prepare(`SELECT * FROM claims ORDER BY confidence DESC, updated_ts DESC, id DESC LIMIT ?`)
+        .all(Math.max(0, Math.floor(limit))) as Record<string, unknown>[];
+      return rows.map((row) => rowToClaim(row, cipher));
+    },
     byKind(kind) {
       const rows = db
         .prepare(`SELECT * FROM claims WHERE kind = ? ORDER BY confidence DESC`)
@@ -68,6 +77,9 @@ export function makeClaimStore(db: DatabaseSync, cipher?: StorageCipher): ClaimS
     findByText(kind, text) {
       const row = byText.get(kind, sensitiveText(text, cipher, "claims.text")) as Record<string, unknown> | undefined;
       return row ? rowToClaim(row, cipher) : undefined;
+    },
+    remove(id) {
+      remove.run(id);
     },
     count() {
       return (counter.get() as { n: number }).n;

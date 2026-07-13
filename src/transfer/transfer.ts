@@ -1,6 +1,8 @@
 import type { ActionEvent, Claim } from "../core/types.ts";
 import type { Store } from "../storage/index.ts";
 import { nowIso } from "../core/time.ts";
+import { applyCorrections } from "../memory/consolidate.ts";
+import { latestAcceptedWorkflowReview, resolveWorkflowReview } from "../workflow/review.ts";
 
 /**
  * A playbook is the learned model made operable: the workflow, decision rules,
@@ -37,15 +39,31 @@ function rules(claims: Claim[], kind: string): PlaybookRule[] {
 
 /** Distill the expert memory graph into an operable playbook. */
 export function buildPlaybook(store: Store): Playbook {
-  const claims = store.claims.all();
-  const workflowClaim = rules(claims, "workflow_pattern")[0];
-  const workflow = workflowClaim
-    ? workflowClaim.text
-        .replace(/^Workflow:\s*/, "")
-        .split("→")
-        .map((s) => s.trim())
-        .filter(Boolean)
-    : [];
+  const claims = applyCorrections(store.claims.all(), store.corrections.all());
+  const reviewed = latestAcceptedWorkflowReview(store);
+  const rejectedEpisodes = new Set(
+    store.episodes.all()
+      .filter((episode) => {
+        const resolution = resolveWorkflowReview(store, episode);
+        return resolution.reviewed && !resolution.review;
+      })
+      .map((episode) => episode.id),
+  );
+  const workflowClaim = rules(
+    claims.filter((claim) =>
+      claim.kind !== "workflow_pattern" ||
+      claim.evidenceEpisodes.some((episodeId) => !rejectedEpisodes.has(episodeId))),
+    "workflow_pattern",
+  )[0];
+  const workflow = reviewed?.review
+    ? reviewed.review.steps.map((step) => step.title)
+    : workflowClaim
+      ? workflowClaim.text
+          .replace(/^Workflow:\s*/, "")
+          .split("→")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
 
   return {
     generatedTs: nowIso(),
