@@ -31,7 +31,17 @@ export interface Scored {
 
 /** Combine present signals via noisy-OR. */
 export function score(signals: Signal[]): Scored {
-  const present = signals.filter((s) => s.p > 0);
+  // Multiple features can be extracted from one raw event (for example a
+  // filesystem change that also carries a diff). They describe one source,
+  // not independent corroboration. Keep the strongest interpretation of each
+  // raw event so noisy-OR cannot count the same evidence twice.
+  const independent = new Map<string, Signal>();
+  for (const signal of signals) {
+    if (signal.p <= 0) continue;
+    const prior = independent.get(signal.id);
+    if (!prior || signal.p > prior.p) independent.set(signal.id, signal);
+  }
+  const present = [...independent.values()];
   const conf = clamp01(1 - present.reduce((acc, s) => acc * (1 - s.p), 1));
   return {
     confidence: round2(conf),

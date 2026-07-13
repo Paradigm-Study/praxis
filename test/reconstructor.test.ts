@@ -2,8 +2,21 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fullPipeline } from "./helpers.ts";
 import { reconstructEvents } from "../src/reconstructor/reconstructor.ts";
+import { score } from "../src/reconstructor/confidence.ts";
 import { makeSeededIdGen } from "../src/core/ids.ts";
 import type { RawEvent } from "../src/core/types.ts";
+
+test("confidence counts each raw event as one independent signal", () => {
+  const scored = score([
+    { id: "raw_file", p: 0.9, tag: "file_changed" },
+    { id: "raw_file", p: 0.4, tag: "diff" },
+    { id: "raw_save", p: 0.6, tag: "cmd_s" },
+  ]);
+
+  assert.equal(scored.confidence, 0.96);
+  assert.deepEqual(scored.evidence, ["raw_file", "raw_save"]);
+  assert.deepEqual(scored.signals, ["file_changed", "cmd_s"]);
+});
 
 test("universal AX scraper: role-less bubble still reconstructs the submit", () => {
   const text = "what is the firehose architecture";
@@ -52,6 +65,11 @@ test("every action is evidence-backed with confidence in [0,1]", async () => {
   for (const a of actions) {
     assert.ok(a.confidence >= 0 && a.confidence <= 1, `conf ${a.action}`);
     assert.ok(a.evidence.length >= 1, `evidence ${a.action}`);
+    assert.equal(
+      new Set(a.evidence).size,
+      a.evidence.length,
+      `duplicate evidence ${a.action}`,
+    );
     assert.equal(a.type, "user_action");
   }
 });
