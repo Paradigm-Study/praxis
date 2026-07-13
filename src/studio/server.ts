@@ -7,6 +7,7 @@ import { newId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
 import { buildPlaybook } from "../transfer/transfer.ts";
 import { buildBrief } from "./brief.ts";
+import { buildTeamGate } from "./teamGate.ts";
 import { handleBrowserIngest } from "./browserIngest.ts";
 import { createMcpRouter } from "../mcp/router.ts";
 import { isAllowedOrigin } from "../mcp/protocol.ts";
@@ -48,6 +49,9 @@ export function startStudio(store: Store, port = 4319): Server {
     try {
       if (req.method === "GET" && path === "/api/health") {
         return json(res, 200, { ok: true });
+      }
+      if (path === "/api/mesh/gate" && !localToken) {
+        return json(res, 403, { error: "team gate requires local authentication" });
       }
       if (
         (path.startsWith("/api/") || path === "/mcp" || path.startsWith("/mcp/")) &&
@@ -183,6 +187,17 @@ function handleApi(
 ): void {
   // --- reads ---
   if (req.method === "GET") {
+    if (path === "/api/mesh/gate") {
+      const cwd = url.searchParams.get("cwd");
+      const targetPath = url.searchParams.get("path");
+      if (!cwd || !targetPath) {
+        return json(res, 400, { error: "cwd and path are required" });
+      }
+      void buildTeamGate(store, { cwd, path: targetPath })
+        .then((result) => json(res, 200, result))
+        .catch((err) => json(res, 500, { error: String(err) }));
+      return;
+    }
     // Team brief (async — may consult the mesh relay; empty when mesh is off).
     if (path === "/api/brief") {
       void buildBrief(store, {

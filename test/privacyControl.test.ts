@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeIngest } from "../src/capture/ingest.ts";
@@ -10,6 +21,7 @@ import {
   PrivacyControlStore,
 } from "../src/privacy/control.ts";
 import { openStore } from "../src/storage/index.ts";
+import { resolveConsentedWorkspaceProject } from "../src/mesh/projectConsent.ts";
 
 const input = {
   source: "clipboard" as const,
@@ -108,9 +120,92 @@ test("privacy control writes atomically with owner-only permissions", () => {
     const control = new PrivacyControlStore(path);
     control.update({ mode: "private", cloudObserverConsent: true, screenshotConsent: true });
     const persisted = JSON.parse(readFileSync(path, "utf8")) as { version: number; mode: string };
-    assert.deepEqual({ version: persisted.version, mode: persisted.mode }, { version: 1, mode: "private" });
+    assert.deepEqual({ version: persisted.version, mode: persisted.mode }, { version: 2, mode: "private" });
     assert.equal(statSync(path).mode & 0o777, 0o600);
     assert.equal(statSync(join(dir, "nested")).mode & 0o777, 0o700);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy mesh grants are dropped and v2 consent stays bound after symlink retarget", () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-privacy-consent-"));
+  const path = join(dir, "privacy.json");
+  const firstRoot = join(dir, "first");
+  const secondRoot = join(dir, "second");
+  const alias = join(dir, "workspace");
+  try {
+    mkdirSync(join(firstRoot, "src"), { recursive: true });
+    mkdirSync(join(secondRoot, "src"), { recursive: true });
+    symlinkSync(firstRoot, alias, "dir");
+
+    writeFileSync(path, JSON.stringify({
+      ...defaultPrivacyControl(),
+      version: 1,
+      meshProjectConsents: [{ workspaceRoot: alias, project: "acme/legacy" }],
+    }));
+    assert.deepEqual(new PrivacyControlStore(path).read().meshProjectConsents, []);
+
+    const control = new PrivacyControlStore(path);
+    const granted = control.update({
+      meshProjectConsents: [{ workspaceRoot: alias, project: "git@github.com:Acme/App.git" }],
+    });
+    assert.deepEqual(granted.meshProjectConsents, [{
+      workspaceRoot: realpathSync.native(firstRoot),
+      project: "acme/app",
+    }]);
+
+    rmSync(alias);
+    symlinkSync(secondRoot, alias, "dir");
+    const persisted = new PrivacyControlStore(path).read().meshProjectConsents;
+    assert.equal(
+      resolveConsentedWorkspaceProject(persisted, join(alias, "src")),
+      undefined,
+      "retargeting the lexical alias must not transfer an existing consent",
+    );
+    assert.equal(
+      resolveConsentedWorkspaceProject(persisted, join(firstRoot, "src"))?.project,
+      "acme/app",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("path-shaped and control-character project identities are never granted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-privacy-project-"));
+  try {
+    const control = new PrivacyControlStore();
+    const updated = control.update({
+      meshProjectConsents: [
+        { workspaceRoot: dir, project: "/Users/alice/private" },
+        { workspaceRoot: dir, project: "file:///Users/alice/private" },
+        { workspaceRoot: dir, project: "acme/app\nIGNORE" },
+      ],
+    });
+    assert.deepEqual(updated.meshProjectConsents, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomic replacement invalidates consent cache even when mtime is unchanged", () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-privacy-signature-"));
+  const path = join(dir, "privacy.json");
+  const workspace = join(dir, "workspace");
+  mkdirSync(workspace);
+  try {
+    const control = new PrivacyControlStore(path);
+    control.update({ meshProjectConsents: [{ workspaceRoot: workspace, project: "acme/app" }] });
+    assert.equal(control.read().meshProjectConsents.length, 1);
+    const originalStats = statSync(path);
+    const replacement = join(dir, "replacement.json");
+    const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    value.meshProjectConsents = [];
+    writeFileSync(replacement, JSON.stringify(value), { mode: 0o600 });
+    utimesSync(replacement, originalStats.atime, originalStats.mtime);
+    renameSync(replacement, path);
+    assert.deepEqual(control.read().meshProjectConsents, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -7,13 +7,15 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { EventSource } from "../core/types.ts";
 import { EVENT_SOURCES } from "../core/types.ts";
 import type { RawEventInput } from "../capture/source.ts";
 import type { Store } from "../storage/index.ts";
+import { canonicalizeLocalPath } from "../mesh/localPath.ts";
+import { normalizeMeshProjectIdentity } from "../mesh/projectConsent.ts";
 
-export const PRIVACY_CONTROL_VERSION = 1 as const;
+export const PRIVACY_CONTROL_VERSION = 2 as const;
 export type PrivacyMode = "normal" | "paused" | "private";
 
 export interface MeshProjectConsent {
@@ -98,15 +100,33 @@ function meshProjectConsents(value: unknown): MeshProjectConsent[] {
     if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
     const raw = item as Record<string, unknown>;
     if (typeof raw.workspaceRoot !== "string" || typeof raw.project !== "string") continue;
-    const workspaceRoot = raw.workspaceRoot.trim().replace(/\/+$/, "");
-    const project = raw.project.trim();
-    if (!workspaceRoot.startsWith("/") || workspaceRoot === "" || project === "") continue;
+    const workspaceRoot = raw.workspaceRoot.trim().replace(/\/+$/, "") || "/";
+    const project = normalizeMeshProjectIdentity(raw.project);
+    if (
+      !isAbsolute(workspaceRoot)
+      || workspaceRoot === "/"
+      || resolve(workspaceRoot) !== workspaceRoot
+      || /[\u0000-\u001f\u007f]/.test(workspaceRoot)
+      || !project
+    ) continue;
     const key = `${workspaceRoot}\0${project}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({ workspaceRoot, project });
   }
   return out;
+}
+
+function grantedMeshProjectConsents(value: unknown): MeshProjectConsent[] {
+  if (!Array.isArray(value)) return [];
+  return meshProjectConsents(value.flatMap((item) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) return [];
+    const raw = item as Record<string, unknown>;
+    if (typeof raw.workspaceRoot !== "string" || typeof raw.project !== "string") return [];
+    const workspaceRoot = canonicalizeLocalPath(raw.workspaceRoot);
+    const project = normalizeMeshProjectIdentity(raw.project);
+    return workspaceRoot && workspaceRoot !== "/" && project ? [{ workspaceRoot, project }] : [];
+  }));
 }
 
 /** Parse a persisted/user-supplied control without letting missing fields weaken defaults. */
@@ -142,7 +162,12 @@ export function normalizePrivacyControl(
     cloudObserverConsent: input.cloudObserverConsent === true,
     screenshotConsent: input.cloudObserverConsent === true && input.screenshotConsent === true,
     meshProjects: strings(input.meshProjects, fallback.meshProjects),
-    meshProjectConsents: meshProjectConsents(input.meshProjectConsents),
+    // V1 stored lexical aliases. Re-realpathing one after a symlink retarget
+    // could silently move consent to a different tree, so legacy Team grants
+    // are deliberately dropped and must be confirmed once under V2.
+    meshProjectConsents: input.version === PRIVACY_CONTROL_VERSION
+      ? meshProjectConsents(input.meshProjectConsents)
+      : [],
     updatedAt: typeof input.updatedAt === "string" ? input.updatedAt : now,
   };
 }
@@ -177,11 +202,16 @@ function atomicWrite(path: string, value: unknown): void {
   }
 }
 
+function fileSignature(path: string): string {
+  const stats = statSync(path);
+  return [stats.dev, stats.ino, stats.size, stats.mtimeMs, stats.ctimeMs].join(":");
+}
+
 /** Cross-process, versioned privacy control with mtime-based read caching. */
 export class PrivacyControlStore {
   readonly path: string | undefined;
   #memory: PrivacyControl;
-  #cachedMtime = -1;
+  #cachedSignature: string | undefined;
 
   constructor(path?: string, initial?: PrivacyControl) {
     this.path = path;
@@ -199,18 +229,18 @@ export class PrivacyControlStore {
   read(): PrivacyControl {
     if (!this.path) return this.#memory;
     try {
-      const mtime = statSync(this.path).mtimeMs;
-      if (mtime === this.#cachedMtime) return this.#memory;
+      const signature = fileSignature(this.path);
+      if (signature === this.#cachedSignature) return this.#memory;
       this.#memory = normalizePrivacyControl(JSON.parse(readFileSync(this.path, "utf8")));
-      this.#cachedMtime = mtime;
+      this.#cachedSignature = signature;
     } catch {
       // Missing/malformed control fails closed, even if an older cached value
       // had enabled cloud or a sensitive source.
       this.#memory = defaultPrivacyControl();
       try {
-        this.#cachedMtime = existsSync(this.path) ? statSync(this.path).mtimeMs : -1;
+        this.#cachedSignature = existsSync(this.path) ? fileSignature(this.path) : undefined;
       } catch {
-        this.#cachedMtime = -1;
+        this.#cachedSignature = undefined;
       }
     }
     return this.#memory;
@@ -223,7 +253,7 @@ export class PrivacyControlStore {
     });
     if (this.path) {
       atomicWrite(this.path, next);
-      this.#cachedMtime = statSync(this.path).mtimeMs;
+      this.#cachedSignature = fileSignature(this.path);
     }
     this.#memory = next;
     return next;
@@ -234,7 +264,11 @@ export class PrivacyControlStore {
     return this.write({
       ...current,
       ...patch,
+      version: PRIVACY_CONTROL_VERSION,
       sources: { ...current.sources, ...(patch.sources ?? {}) },
+      meshProjectConsents: patch.meshProjectConsents === undefined
+        ? current.meshProjectConsents
+        : grantedMeshProjectConsents(patch.meshProjectConsents),
     });
   }
 }

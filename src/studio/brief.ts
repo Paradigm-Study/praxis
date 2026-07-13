@@ -1,13 +1,24 @@
 import { basename } from "node:path";
 import type { Store } from "../storage/index.ts";
 import type { Claim } from "../core/types.ts";
-import type { BriefPayload } from "../mesh/types.ts";
+import type { BriefPayload, LifecycleStage } from "../mesh/types.ts";
 import { retrieveForTask } from "../agent/retrieveForTask.ts";
 import { redactText } from "../mesh/redact.ts";
 import { logger } from "../core/log.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
+import { PrivacyControlStore } from "../privacy/control.ts";
+import {
+  isMeshProjectConsented,
+  normalizeMeshProjectIdentity,
+  resolveConsentedWorkspaceProject,
+  safeMeshRelayBaseUrl,
+  safeMeshWireIdentity,
+  safeRepoRelativePath,
+} from "../mesh/projectConsent.ts";
+import { normalizeRepoUrl } from "../mesh/workframe.ts";
 
 const log = logger("brief");
+const MAX_MESH_BRIEF_BYTES = 256 * 1024;
 
 /**
  * The studio's session brief, served at GET /api/brief (wired in
@@ -37,8 +48,8 @@ export interface BriefOptions {
   /** Project filter (git remote url or dir name). */
   project?: string;
   /**
-   * Optional cwd hint. Used LOCALLY (claim retrieval, project basename); the
-   * absolute path itself is never forwarded to the relay.
+   * Optional cwd hint. Used LOCALLY for claim retrieval and active project
+   * consent resolution; the absolute path itself is never forwarded.
    */
   cwd?: string;
   /** Injectable for tests. Defaults to globalThis.fetch. */
@@ -73,11 +84,37 @@ export async function buildBrief(
 ): Promise<StudioBrief> {
   const episodeGoal = latestEpisodeGoal(store);
   return {
-    ...(await fetchMeshBrief(opts, EgressAuditor.forStore(store))),
+    ...(await fetchMeshBrief(
+      opts,
+      EgressAuditor.forStore(store),
+      resolveBriefProject(store, opts),
+    )),
     episodeGoal,
     topClaims: relevantClaims(store, episodeGoal, opts.cwd),
     openQuestions: undeliveredQuestions(store),
   };
+}
+
+/** Resolve a hook/API hint to exactly one currently consented mesh project. */
+export function resolveBriefProject(
+  store: Store,
+  opts: Pick<BriefOptions, "cwd" | "project">,
+): string | undefined {
+  const consents = PrivacyControlStore.forStore(store).read().meshProjectConsents;
+  const requested = opts.project ? normalizeRepoUrl(opts.project) : undefined;
+  const workspace = opts.cwd ?? (opts.project ? undefined : process.cwd());
+
+  if (workspace) {
+    const resolved = resolveConsentedWorkspaceProject(consents, workspace);
+    if (!resolved || (requested !== undefined && requested !== resolved.project)) {
+      return undefined;
+    }
+    return resolved.project;
+  }
+
+  return requested && isMeshProjectConsented(consents, requested)
+    ? requested
+    : undefined;
 }
 
 /**
@@ -88,7 +125,7 @@ export async function buildBrief(
 function latestEpisodeGoal(store: Store): string {
   const latest = store.episodes.latest(1).at(-1);
   if (!latest) return "";
-  return redactText(latest.goal ?? latest.summary ?? "");
+  return redactText(latest.goal ?? latest.summary ?? "", { maxChars: 320 });
 }
 
 /**
@@ -102,7 +139,7 @@ function relevantClaims(store: Store, episodeGoal: string, cwd?: string): Claim[
     [episodeGoal, cwd ? basename(cwd) : ""].filter(Boolean).join(" ") || "current work";
   return retrieveForTask(store, taskText, { cwd, limit: 5 }).map((c) => ({
     ...c,
-    text: redactText(c.text),
+    text: redactText(c.text, { maxChars: 320 }),
   }));
 }
 
@@ -120,9 +157,159 @@ function undeliveredQuestions(store: Store): BriefOpenQuestion[] {
     .slice(0, MAX_OPEN_QUESTIONS)
     .map((d) => ({
       questionId: d.id,
-      question: redactText(d.question!),
+      question: redactText(d.question!, { maxChars: 320 }),
       createdTs: d.createdTs,
     }));
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+export function safeSharedText(value: unknown, maxChars = 240): string {
+  return typeof value === "string"
+    ? redactText(value.slice(0, Math.max(1_024, maxChars * 4)).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim(), {
+        maxChars,
+      })
+    : "";
+}
+
+function meshRoster(): Map<string, string> {
+  const raw = process.env.PRAXIS_MESH_ROSTER_JSON;
+  if (!raw || Buffer.byteLength(raw) > 128 * 1024) return new Map();
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
+    const entries = Object.entries(parsed as Record<string, unknown>);
+    if (entries.length > 500) return new Map();
+    return new Map(entries.flatMap(([person, value]) => {
+      if (!/^member-[a-f0-9]{24}$/.test(person) || typeof value !== "string" || value.length > 100) return [];
+      const displayName = safeSharedText(value, 100);
+      return displayName ? [[person, displayName] as const] : [];
+    }));
+  } catch {
+    return new Map();
+  }
+}
+
+function localDisplayName(person: string, roster: Map<string, string>): string {
+  return roster.get(person) ?? "Team member";
+}
+
+/** Resolve a relay principal to locally provisioned roster text, never its opaque wire id. */
+export function meshDisplayName(person: string): string {
+  return localDisplayName(person, meshRoster());
+}
+
+/** Read a relay JSON response without allowing an unbounded body into memory. */
+export async function boundedMeshJson(response: Response): Promise<unknown> {
+  const declared = Number(response.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > MAX_MESH_BRIEF_BYTES) throw new Error("mesh brief response too large");
+  if (!response.body) return JSON.parse("");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_MESH_BRIEF_BYTES) {
+      await reader.cancel();
+      throw new Error("mesh brief response too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+}
+
+function sharedArtifacts(value: unknown): Array<{ repo: string; path: string; branch?: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 16).flatMap((item) => {
+    const artifact = record(item);
+    const rawRepo = typeof artifact?.repo === "string" ? artifact.repo.slice(0, 500) : "";
+    const rawPath = typeof artifact?.path === "string" ? artifact.path.slice(0, 1_025) : "";
+    const repo = normalizeMeshProjectIdentity(rawRepo);
+    const path = safeRepoRelativePath(rawPath);
+    const branch = typeof artifact?.branch === "string" ? artifact.branch : "";
+    return repo && path
+      ? [{
+          repo,
+          path,
+          ...(branch.length <= 120 && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(branch)
+            ? { branch }
+            : {}),
+        }]
+      : [];
+  });
+}
+
+/** Bound and whitelist relay-controlled data before it enters agent context. */
+function normalizeMeshBrief(value: unknown): BriefPayload {
+  const body = record(value);
+  const roster = meshRoster();
+  const teammates = Array.isArray(body?.teammates)
+    ? body.teammates.slice(0, 20).flatMap((item) => {
+        const teammate = record(item);
+        const personId = safeSharedText(teammate?.person, 120);
+        const intent = safeSharedText(teammate?.intent, 320);
+        const ts = safeSharedText(teammate?.ts, 64);
+        return personId && intent && ts
+          ? [{ person: localDisplayName(personId, roster), intent, artifacts: sharedArtifacts(teammate?.artifacts), ts }]
+          : [];
+      })
+    : [];
+  const lockedSpecs = Array.isArray(body?.lockedSpecs)
+    ? body.lockedSpecs.slice(0, 20).flatMap((item) => {
+        const spec = record(item);
+        const personId = safeSharedText(spec?.person, 120);
+        const cardId = safeSharedText(spec?.cardId, 160);
+        const ts = safeSharedText(spec?.ts, 64);
+        const criteria = Array.isArray(spec?.specCriteria)
+          ? spec.specCriteria.slice(0, 16).flatMap((raw) => {
+              const criterion = record(raw);
+              const id = safeSharedText(criterion?.id, 120);
+              const behavior = safeSharedText(criterion?.behavior, 320);
+              return id && behavior ? [{ id, behavior }] : [];
+            })
+          : [];
+        return personId && cardId && ts
+          ? [{ person: localDisplayName(personId, roster), cardId, specCriteria: criteria, artifacts: sharedArtifacts(spec?.artifacts), ts }]
+          : [];
+      })
+    : [];
+  const recentDecisions = Array.isArray(body?.recentDecisions)
+    ? body.recentDecisions.slice(0, 20).flatMap((item) => {
+        const decision = record(item);
+        const personId = safeSharedText(decision?.person, 120);
+        const project = typeof decision?.project === "string"
+          ? normalizeMeshProjectIdentity(decision.project)
+          : undefined;
+        const cardId = safeSharedText(decision?.cardId, 160);
+        const stage = decision?.stage;
+        const ts = safeSharedText(decision?.ts, 64);
+        const verdict = safeSharedText(decision?.verdict, 320);
+        return personId && cardId && ts
+          && (stage === "clarify" || stage === "plan" || stage === "spec" || stage === "results")
+          ? [{
+              person: localDisplayName(personId, roster),
+              ...(project ? { project } : {}),
+              cardId,
+              stage: stage as LifecycleStage,
+              ...(verdict ? { verdict } : {}),
+              ts,
+            }]
+          : [];
+      })
+    : [];
+  return { teammates, lockedSpecs, recentDecisions };
 }
 
 /**
@@ -133,18 +320,26 @@ function undeliveredQuestions(store: Store): BriefOpenQuestion[] {
 async function fetchMeshBrief(
   opts: BriefOptions,
   auditor: EgressAuditor,
+  project: string | undefined,
 ): Promise<BriefPayload> {
-  const url = process.env.PRAXIS_MESH_URL;
+  const rawUrl = process.env.PRAXIS_MESH_URL;
   const token = process.env.PRAXIS_MESH_TOKEN;
-  const person = opts.person ?? process.env.PRAXIS_PERSON;
-  if (!url || !token || !person) return EMPTY_MESH;
+  const person = safeMeshWireIdentity(process.env.PRAXIS_PERSON);
+  const teamId = process.env.PRAXIS_MESH_TEAM_ID;
+  const deviceId = process.env.PRAXIS_MESH_DEVICE_ID;
+  const safeTeamId = teamId === undefined ? undefined : safeMeshWireIdentity(teamId);
+  const safeDeviceId = deviceId === undefined ? undefined : safeMeshWireIdentity(deviceId);
+  if (
+    !rawUrl || !token || !person || !project
+    || (teamId === undefined) !== (deviceId === undefined)
+    || (teamId !== undefined && (!safeTeamId || !safeDeviceId))
+  ) return EMPTY_MESH;
+  const url = safeMeshRelayBaseUrl(rawUrl);
+  if (!url) return EMPTY_MESH;
 
-  const params = new URLSearchParams({ person });
-  const project = opts.project ?? (opts.cwd ? basename(opts.cwd) : basename(process.cwd()));
-  if (project) params.set("project", project);
-  // The cwd hint stays LOCAL: an absolute path leaks the username/home layout
-  // to the relay (which ignores the param anyway) — only the basename-derived
-  // project identity crosses the mesh boundary.
+  const params = new URLSearchParams({ person, project });
+  // The cwd hint stays LOCAL: an absolute path leaks the username/home layout.
+  // Only the canonical project from the live privacy mapping crosses the mesh.
 
   const fetchFn = opts.fetchFn ?? fetch;
   try {
@@ -152,14 +347,15 @@ async function fetchMeshBrief(
     const res = await fetchFn(endpoint, {
       headers: {
         authorization: `Bearer ${token}`,
-        ...(process.env.PRAXIS_MESH_TEAM_ID && {
-          "x-mesh-team-id": process.env.PRAXIS_MESH_TEAM_ID,
+        ...(safeTeamId && {
+          "x-mesh-team-id": safeTeamId,
         }),
-        ...(process.env.PRAXIS_MESH_DEVICE_ID && {
-          "x-mesh-device-id": process.env.PRAXIS_MESH_DEVICE_ID,
+        ...(safeDeviceId && {
+          "x-mesh-device-id": safeDeviceId,
         }),
       },
       signal: AbortSignal.timeout(2000),
+      redirect: "error",
     });
     if (!res.ok) {
       auditor.record({
@@ -173,6 +369,7 @@ async function fetchMeshBrief(
       log.debug(`relay /brief ${res.status} — serving local-only brief`);
       return EMPTY_MESH;
     }
+    const normalized = normalizeMeshBrief(await boundedMeshJson(res));
     auditor.record({
       destination: url,
       purpose: "mesh_brief",
@@ -181,12 +378,7 @@ async function fetchMeshBrief(
       outcome: "succeeded",
       status: res.status,
     });
-    const body = (await res.json()) as Partial<BriefPayload> | null;
-    return {
-      teammates: Array.isArray(body?.teammates) ? body.teammates : [],
-      lockedSpecs: Array.isArray(body?.lockedSpecs) ? body.lockedSpecs : [],
-      recentDecisions: Array.isArray(body?.recentDecisions) ? body.recentDecisions : [],
-    };
+    return normalized;
   } catch (err) {
     auditor.record({
       destination: url,

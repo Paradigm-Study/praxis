@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Episode } from "../core/types.ts";
 import type { Store } from "../storage/index.ts";
 import { redactText, redactWorkFrame } from "./redact.ts";
 import type { WorkFrame, WorkFrameStatus } from "./types.ts";
+import { canonicalizeLocalPath, pathIsInside } from "./localPath.ts";
 
 /**
  * Episode → WorkFrame projection (contract v0).
@@ -124,16 +126,28 @@ export function toRepoRelativePath(
   artifact: string,
   repoRoot: string,
 ): string | undefined {
-  if (artifact.startsWith("~")) return undefined;
-  if (!artifact.startsWith("/")) {
-    return artifact.startsWith("./") ? artifact.slice(2) : artifact;
+  const value = artifact.trim();
+  if (value === "" || value.startsWith("~") || /[\u0000-\u001f\u007f]/.test(value)) {
+    return undefined;
   }
-  const root = repoRoot.replace(/\/+$/, "");
-  if (root && artifact.startsWith(`${root}/`)) {
-    const relative = artifact.slice(root.length + 1);
-    return relative.length > 0 ? relative : undefined;
-  }
-  return undefined;
+
+  // Treat backslashes as separators for traversal detection even on POSIX.
+  // A captured Windows absolute path cannot be related to a local POSIX
+  // consent root and therefore fails closed.
+  const portable = value.replaceAll("\\", "/");
+  if (/^[A-Za-z]:\//.test(portable) || portable.startsWith("//")) return undefined;
+  if (portable.split("/").includes("..")) return undefined;
+
+  const root = canonicalizeLocalPath(repoRoot);
+  if (!root) return undefined;
+  const candidate = canonicalizeLocalPath(
+    isAbsolute(portable) ? portable : resolve(root, portable),
+  );
+  if (!candidate || !pathIsInside(candidate, root)) return undefined;
+
+  const repoRelative = relative(root, candidate);
+  if (repoRelative === "" || repoRelative === ".") return undefined;
+  return repoRelative.split(sep).join("/");
 }
 
 export function episodeToWorkFrame(

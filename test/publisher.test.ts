@@ -3,16 +3,20 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
+  realpathSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
+  readdirSync,
 } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Episode } from "../src/core/types.ts";
 import { MeshPublisher, resolveEpisodeProject } from "../src/mesh/publisher.ts";
-import type { WorkFrame } from "../src/mesh/types.ts";
+import type { BoardroomLifecycle, WorkFrame } from "../src/mesh/types.ts";
 import { PrivacyControlStore } from "../src/privacy/control.ts";
 import { action, freshStore } from "./helpers.ts";
 
@@ -22,6 +26,7 @@ interface RequestRecord {
   authorization: string | undefined;
   teamId: string | undefined;
   deviceId: string | undefined;
+  idempotencyKey: string | undefined;
   body: string;
 }
 
@@ -29,6 +34,19 @@ interface RelayListener {
   url: string;
   fetchFn: typeof fetch;
   bound: boolean;
+}
+
+interface StoredSpoolRecord {
+  spoolVersion: 1;
+  scope: { teamId: string | null; person: string; device: string };
+  frame: WorkFrame;
+}
+
+function readSpool(path: string): StoredSpoolRecord[] {
+  return readFileSync(path, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as StoredSpoolRecord);
 }
 
 function tempPaths(): { dir: string; configPath: string; spoolPath: string } {
@@ -48,7 +66,7 @@ function listen(server: Server, fallbackFetch: typeof fetch): Promise<RelayListe
         // the exact transport assertions through the publisher's injected
         // fetch seam there; ordinary environments still use node:http below.
         resolve({
-          url: "http://publisher-test.invalid",
+          url: "https://publisher-test.invalid",
           fetchFn: fallbackFetch,
           bound: false,
         });
@@ -92,6 +110,7 @@ function fetchRequestRecord(
     authorization: headers.get("authorization") ?? undefined,
     teamId: headers.get("x-mesh-team-id") ?? undefined,
     deviceId: headers.get("x-mesh-device-id") ?? undefined,
+    idempotencyKey: headers.get("idempotency-key") ?? undefined,
     body: typeof init?.body === "string" ? init.body : "",
   };
 }
@@ -133,6 +152,23 @@ function frame(id: string): WorkFrame {
   };
 }
 
+function card(cardId: string, verdict: string): BoardroomLifecycle {
+  return {
+    v: 0,
+    kind: "card_event",
+    person: "alice",
+    device: "laptop",
+    project: "praxis",
+    ts: "2026-07-12T12:00:00.000Z",
+    cardId,
+    stage: "results",
+    event: "decided",
+    verdict,
+    artifacts: [{ repo: "praxis", path: "src/index.ts" }],
+    specCriteria: [],
+  };
+}
+
 function episode(id = "episode_1"): Episode {
   return {
     id,
@@ -170,6 +206,9 @@ test("publish posts a frame with the relay path and bearer token", async () => {
       deviceId: typeof req.headers["x-mesh-device-id"] === "string"
         ? req.headers["x-mesh-device-id"]
         : undefined,
+      idempotencyKey: typeof req.headers["idempotency-key"] === "string"
+        ? req.headers["idempotency-key"]
+        : undefined,
       body,
     });
     res.writeHead(200, { "content-type": "application/json" });
@@ -197,12 +236,261 @@ test("publish posts a frame with the relay path and bearer token", async () => {
     assert.equal(requests[0]!.authorization, "Bearer secret-token");
     assert.equal(requests[0]!.teamId, "team-praxis");
     assert.equal(requests[0]!.deviceId, "device-praxis");
+    assert.equal(requests[0]!.idempotencyKey, "praxis:frame_happy");
     assert.deepEqual(JSON.parse(requests[0]!.body), {
       ...sent,
       device: "device-praxis",
     });
   } finally {
     await close(server, relay.bound);
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("a committed response loss retries the same frame idempotently after restart", async () => {
+  const paths = tempPaths();
+  const attempts: Array<{ id: string; key: string | null }> = [];
+  try {
+    const responseLost = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async (_input, init) => {
+        attempts.push({
+          id: (JSON.parse(String(init?.body)) as WorkFrame).id,
+          key: new Headers(init?.headers).get("idempotency-key"),
+        });
+        return {
+          ok: true,
+          status: 201,
+          text: async () => { throw new Error("connection closed after commit"); },
+        } as unknown as Response;
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    const lost = await responseLost.publish(frame("frame_committed"));
+    assert.equal(lost.ok, false);
+    assert.equal(existsSync(paths.spoolPath), true);
+
+    const restarted = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "token-rotated",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async (_input, init) => {
+        attempts.push({
+          id: (JSON.parse(String(init?.body)) as WorkFrame).id,
+          key: new Headers(init?.headers).get("idempotency-key"),
+        });
+        return jsonResponse({ ok: true, seq: attempts.length });
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.equal((await restarted.publish(frame("frame_current"))).ok, true);
+    assert.deepEqual(attempts.map((attempt) => attempt.id), [
+      "frame_committed",
+      "frame_committed",
+      "frame_current",
+    ]);
+    assert.equal(attempts[0]!.key, "praxis:frame_committed");
+    assert.equal(attempts[1]!.key, attempts[0]!.key);
+    assert.equal(existsSync(paths.spoolPath), false);
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("publisher rejects unsafe boundaries before fetch and requests never follow redirects", async () => {
+  const paths = tempPaths();
+  let calls = 0;
+  let redirect: RequestInit["redirect"];
+  try {
+    assert.throws(() => new MeshPublisher({
+      url: "http://localhost:4600",
+      token: "token",
+      person: "alice",
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    }), /credential-free HTTPS|loopback/);
+    const priorProxyMode = process.env.NODE_USE_ENV_PROXY;
+    const priorProxy = process.env.HTTP_PROXY;
+    try {
+      process.env.NODE_USE_ENV_PROXY = "1";
+      process.env.HTTP_PROXY = "http://127.0.0.1:9999";
+      assert.throws(() => new MeshPublisher({
+        url: "http://127.0.0.1:4600",
+        token: "token",
+        person: "alice",
+        configPath: paths.configPath,
+        spoolPath: paths.spoolPath,
+      }), /credential-free HTTPS|loopback/);
+    } finally {
+      if (priorProxyMode === undefined) delete process.env.NODE_USE_ENV_PROXY;
+      else process.env.NODE_USE_ENV_PROXY = priorProxyMode;
+      if (priorProxy === undefined) delete process.env.HTTP_PROXY;
+      else process.env.HTTP_PROXY = priorProxy;
+    }
+    assert.throws(() => new MeshPublisher({
+      url: "https://token@relay.example.test",
+      token: "token",
+      person: "alice",
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    }), /credential-free HTTPS|loopback/);
+
+    const publisher = new MeshPublisher({
+      url: "https://relay.example.test",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async (_input, init) => {
+        calls += 1;
+        redirect = init?.redirect;
+        return jsonResponse({ ok: true, seq: calls });
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.equal((await publisher.publish({ ...frame("unsafe-project"), project: "/Users/alice/private" })).ok, false);
+    assert.equal((await publisher.publish({
+      ...frame("unsafe-artifact"),
+      artifacts: [{ repo: "praxis", path: "../private.txt" }],
+    })).ok, false);
+    assert.equal((await publisher.publish({
+      ...frame("encoded-traversal"),
+      artifacts: [{ repo: "praxis", path: "src/%2e%2e/private.txt" }],
+    })).ok, false);
+    assert.equal(calls, 0);
+    assert.equal((await publisher.publish(frame("safe-frame"))).ok, true);
+    assert.equal(calls, 1);
+    assert.equal(redirect, "error");
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous acknowledgements, timeouts, and transient errors remain retryable", async () => {
+  for (const scenario of ["invalid-ack", "oversized-ack", "timeout", "503"] as const) {
+    const paths = tempPaths();
+    const attempts: Array<{ id: string; key: string | null }> = [];
+    try {
+      const failing = new MeshPublisher({
+        url: "https://relay.example.test",
+        token: "token",
+        person: "alice",
+        device: "laptop",
+        requestTimeoutMs: 250,
+        fetchFn: (async (_input, init) => {
+          const body = JSON.parse(String(init?.body)) as WorkFrame;
+          attempts.push({ id: body.id, key: new Headers(init?.headers).get("idempotency-key") });
+          if (scenario === "invalid-ack") return jsonResponse({ ok: true, seq: -1 });
+          if (scenario === "oversized-ack") {
+            return new Response("x".repeat(70 * 1024), {
+              headers: { "content-length": String(70 * 1024) },
+            });
+          }
+          if (scenario === "503") return new Response("busy", { status: 503 });
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+          });
+        }) as typeof fetch,
+        configPath: paths.configPath,
+        spoolPath: paths.spoolPath,
+      });
+      const first = await failing.publish(frame(`frame-${scenario}`));
+      assert.equal(first.ok, false, scenario);
+      assert.equal(existsSync(paths.spoolPath), true, `${scenario} must persist the ambiguous frame`);
+
+      const recovered = new MeshPublisher({
+        url: "https://relay.example.test",
+        token: "rotated-token",
+        person: "alice",
+        device: "laptop",
+        fetchFn: (async (_input, init) => {
+          const body = JSON.parse(String(init?.body)) as WorkFrame;
+          attempts.push({ id: body.id, key: new Headers(init?.headers).get("idempotency-key") });
+          return jsonResponse({ ok: true, seq: attempts.length });
+        }) as typeof fetch,
+        configPath: paths.configPath,
+        spoolPath: paths.spoolPath,
+      });
+      assert.equal((await recovered.publish(frame(`current-${scenario}`))).ok, true);
+      assert.equal(attempts[0]!.key, attempts[1]!.key, `${scenario} retry key must be stable`);
+      assert.equal(existsSync(paths.spoolPath), false);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("card event idempotency keys distinguish different immutable bodies", async () => {
+  const paths = tempPaths();
+  const keys: string[] = [];
+  try {
+    const publisher = new MeshPublisher({
+      url: "https://relay.example.test",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async (_input, init) => {
+        keys.push(new Headers(init?.headers).get("idempotency-key") ?? "");
+        return jsonResponse({ ok: true, seq: keys.length });
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    await publisher.publish(card("release", "ship"));
+    await publisher.publish(card("release", "hold"));
+    assert.match(keys[0]!, /^praxis:card:[a-f0-9]{64}$/);
+    assert.match(keys[1]!, /^praxis:card:[a-f0-9]{64}$/);
+    assert.notEqual(keys[0], keys[1]);
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("mesh text redaction removes all local path forms and secret identifiers", async () => {
+  const paths = tempPaths();
+  let sent = "";
+  try {
+    const publisher = new MeshPublisher({
+      url: "https://relay.example.test",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async (_input, init) => {
+        sent = String(init?.body);
+        return jsonResponse({ ok: true, seq: 1 });
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    const privateFrame = {
+      ...frame("private-paths"),
+      intent: "edit /opt/client-secret and D:\\work\\private but keep https://github.com/acme/app",
+      uncertainty: ["also file:///Users/alice/private and \\\\server\\share\\secret"],
+      artifacts: [{ repo: "praxis", path: "src/index.ts", branch: "sk-abcdefghijklmnop" }],
+      sessionKey: "/Users/alice/private/session",
+    } as WorkFrame;
+    assert.equal((await publisher.publish(privateFrame)).ok, true);
+    assert.equal(sent.includes("/opt/client-secret"), false);
+    assert.equal(sent.includes("D:\\work"), false);
+    assert.equal(sent.includes("file:///"), false);
+    assert.equal(sent.includes("server\\share"), false);
+    assert.equal(sent.includes("sk-abcdefghijklmnop"), false);
+    assert.equal(sent.includes("/Users/alice"), false);
+    assert.equal(sent.includes("https://github.com/acme/app"), true, "public URLs remain intact");
+    const parsed = JSON.parse(sent) as WorkFrame;
+    assert.equal(parsed.artifacts[0]!.branch, undefined);
+    assert.equal(parsed.sessionKey, undefined);
+
+    const huge = { ...frame("bounded-text"), intent: "x".repeat(2_000_000) };
+    assert.equal((await publisher.publish(huge)).ok, true);
+    assert.ok((JSON.parse(sent) as WorkFrame).intent.length <= 500);
+  } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
 });
@@ -312,7 +600,11 @@ test("network failures spool frames and a later publish flushes them first", asy
       .split(/\r?\n/)
       .filter(Boolean);
     assert.equal(lines.length, 1);
-    assert.deepEqual(JSON.parse(lines[0]!), spooled);
+    assert.deepEqual(JSON.parse(lines[0]!), {
+      spoolVersion: 1,
+      scope: { teamId: null, person: "alice", device: "laptop" },
+      frame: spooled,
+    });
 
     const delivered: WorkFrame[] = [];
     const fallbackFetch = (async (
@@ -345,6 +637,156 @@ test("network failures spool frames and a later publish flushes them first", asy
     } finally {
       await close(server, relay.bound);
     }
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("durable spool records never cross hosted team credential scopes", async () => {
+  const paths = tempPaths();
+  const offline = new MeshPublisher({
+    url: "https://relay.invalid",
+    token: "team-a-token",
+    person: "alice",
+    teamId: "team-a",
+    device: "device-1",
+    fetchFn: (async () => { throw new Error("offline"); }) as typeof fetch,
+    configPath: paths.configPath,
+    spoolPath: paths.spoolPath,
+  });
+  const fromTeamA = frame("frame_team_a");
+
+  try {
+    assert.equal((await offline.publish(fromTeamA)).ok, false);
+    assert.equal(readSpool(paths.spoolPath)[0]!.scope.teamId, "team-a");
+
+    const delivered: Array<{ teamId: string | null; id: string }> = [];
+    const fetchFn = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      delivered.push({
+        teamId: headers.get("x-mesh-team-id"),
+        id: (JSON.parse(String(init?.body)) as WorkFrame).id,
+      });
+      return jsonResponse({ ok: true, seq: delivered.length });
+    }) as typeof fetch;
+
+    const teamB = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "team-b-token",
+      person: "alice",
+      teamId: "team-b",
+      device: "device-1",
+      fetchFn,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.deepEqual(await teamB.publish(frame("frame_team_b")), { ok: true, seq: 1 });
+    assert.deepEqual(delivered, [{ teamId: "team-b", id: "frame_team_b" }]);
+    assert.equal(readSpool(paths.spoolPath)[0]!.frame.id, "frame_team_a");
+
+    const teamA = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "team-a-token-rotated",
+      person: "alice",
+      teamId: "team-a",
+      device: "device-1",
+      fetchFn,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.deepEqual(await teamA.publish(frame("frame_team_a_current")), { ok: true, seq: 3 });
+    assert.deepEqual(delivered, [
+      { teamId: "team-b", id: "frame_team_b" },
+      { teamId: "team-a", id: "frame_team_a" },
+      { teamId: "team-a", id: "frame_team_a_current" },
+    ]);
+    assert.equal(existsSync(paths.spoolPath), false);
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("durable spool retains only a bounded newest queue and quarantines oversized legacy data", async () => {
+  const paths = tempPaths();
+  try {
+    const records = Array.from({ length: 300 }, (_, index) => ({
+      spoolVersion: 1,
+      scope: { teamId: null, person: "alice", device: "laptop" },
+      frame: frame(`queued-${index}`),
+    }));
+    writeFileSync(paths.spoolPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, {
+      mode: 0o600,
+    });
+    const offline = new MeshPublisher({
+      url: "https://relay.example.test",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async () => { throw new Error("offline"); }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    await offline.publish(frame("current-bounded"));
+    const retained = readSpool(paths.spoolPath);
+    assert.equal(retained.length, 256);
+    assert.equal(retained[0]!.frame.id, "queued-45");
+    assert.equal(retained.at(-1)!.frame.id, "current-bounded");
+
+    writeFileSync(paths.spoolPath, Buffer.alloc(8 * 1024 * 1024 + 1, 120), { mode: 0o600 });
+    const restarted = new MeshPublisher({
+      url: "https://relay.example.test",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      fetchFn: (async () => { throw new Error("offline"); }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    await restarted.publish(frame("after-quarantine"));
+    assert.equal(readSpool(paths.spoolPath).length, 1);
+    assert.equal(readSpool(paths.spoolPath)[0]!.frame.id, "after-quarantine");
+    assert.ok(readdirSync(paths.dir).some((name) => name.startsWith("mesh-spool.ndjson.quarantine-")));
+  } finally {
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("spool retries revalidate current project consent and drop revoked frames", async () => {
+  const paths = tempPaths();
+  let allowed = new Set(["praxis"]);
+  const consent = (project: string) => allowed.has(project);
+  try {
+    const offline = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      currentProjectConsent: consent,
+      fetchFn: (async () => { throw new Error("offline"); }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.equal((await offline.publish(frame("frame_revoked"))).ok, false);
+
+    allowed = new Set(["other"]);
+    const delivered: WorkFrame[] = [];
+    const online = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "token",
+      person: "alice",
+      device: "laptop",
+      currentProjectConsent: consent,
+      fetchFn: (async (_input, init) => {
+        delivered.push(JSON.parse(String(init?.body)) as WorkFrame);
+        return jsonResponse({ ok: true, seq: delivered.length });
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    const current = { ...frame("frame_allowed"), project: "other" };
+    assert.deepEqual(await online.publish(current), { ok: true, seq: 1 });
+    assert.deepEqual(delivered.map((item) => item.id), ["frame_allowed"]);
+    assert.equal(existsSync(paths.spoolPath), false);
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
@@ -402,8 +844,8 @@ test("onEpisodeClosed resolves with its frame when the relay is down", async () 
     assert.ok(published);
     assert.equal(published.kind, "workframe");
     assert.equal(published.person, "alice");
-    const spooled = JSON.parse(readFileSync(paths.spoolPath, "utf8").trim()) as WorkFrame;
-    assert.equal(spooled.id, published.id);
+    const spooled = readSpool(paths.spoolPath)[0]!;
+    assert.equal(spooled.frame.id, published.id);
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
@@ -419,7 +861,7 @@ test("closed episodes publish as done; open episodes announce as active", async 
 
   try {
     const publisher = new MeshPublisher({
-      url: "http://relay.invalid",
+      url: "https://relay.invalid",
       token: "token",
       person: "alice",
       project: "praxis",
@@ -454,9 +896,10 @@ test("concurrent publishes with a pending spool never double-deliver", async () 
 
   try {
     const publisher = new MeshPublisher({
-      url: "http://relay.invalid",
+      url: "https://relay.invalid",
       token: "token",
       person: "alice",
+      device: "laptop",
       fetchFn,
       configPath: paths.configPath,
       spoolPath: paths.spoolPath,
@@ -487,7 +930,7 @@ test("publish is a redaction boundary: extra fields and secrets never serialize"
 
   try {
     const publisher = new MeshPublisher({
-      url: "http://relay.invalid",
+      url: "https://relay.invalid",
       token: "token",
       person: "alice",
       fetchFn,
@@ -496,12 +939,14 @@ test("publish is a redaction boundary: extra fields and secrets never serialize"
     });
     const smuggled = {
       ...frame("frame_smuggle"),
+      person: "mallory",
       intent: "work with sk-abcdefghijklmnop in it",
       promptBody: "RAW PROMPT BODY",
     } as WorkFrame;
     await publisher.publish(smuggled);
     assert.equal(bodies.length, 1);
     assert.ok(!("promptBody" in bodies[0]!), "unknown fields must not reach the wire");
+    assert.equal(bodies[0]!.person, "alice");
     assert.equal(bodies[0]!.intent, "work with [redacted] in it");
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
@@ -528,9 +973,9 @@ test("network retry spool stores the redacted wire frame, not the caller object"
       promptBody: "must never be spooled",
     } as WorkFrame;
     await publisher.publish(unsafe);
-    const spooled = JSON.parse(readFileSync(paths.spoolPath, "utf8")) as Record<string, unknown>;
-    assert.equal(spooled.intent, "use [redacted]");
-    assert.ok(!("promptBody" in spooled));
+    const spooled = readSpool(paths.spoolPath)[0]!;
+    assert.equal(spooled.frame.intent, "use [redacted]");
+    assert.ok(!("promptBody" in spooled.frame));
   } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
@@ -614,6 +1059,14 @@ test("fromEnv binds hosted team and device identity", () => {
     assert.ok(publisher);
     assert.equal(publisher.teamId, "team-praxis");
     assert.equal(publisher.device, "device-praxis");
+    delete process.env.PRAXIS_MESH_DEVICE_ID;
+    assert.equal(MeshPublisher.fromEnv(), undefined);
+    assert.throws(() => new MeshPublisher({
+      url: "https://mesh.example.test",
+      token: "hosted-token",
+      person: "alice",
+      teamId: "team-praxis",
+    }), /provisioned device id/);
   } finally {
     for (const key of keys) {
       const value = previous.get(key);
@@ -647,7 +1100,7 @@ test("episode project identity comes only from an explicit workspace consent", (
       }],
     });
     assert.deepEqual(resolveEpisodeProject(store, scoped), {
-      project: "git@github.com:acme/app.git",
+      project: "acme/app",
       repoRoot: "/Users/alice/work/app",
       sessionKey: "session-123",
     });
@@ -666,5 +1119,50 @@ test("episode project identity comes only from an explicit workspace consent", (
     );
   } finally {
     store.close();
+  }
+});
+
+test("episode project resolution canonicalizes symlinks and rejects ambiguous roots", () => {
+  const paths = tempPaths();
+  const store = freshStore();
+  try {
+    const realRoot = join(paths.dir, "real-workspace");
+    const aliasRoot = join(paths.dir, "workspace-alias");
+    mkdirSync(join(realRoot, "packages", "api"), { recursive: true });
+    symlinkSync(realRoot, aliasRoot, "dir");
+    const edit = action({
+      id: "symlink-workspace-edit",
+      action: "edited_file",
+      startTs: "2026-07-12T12:00:00.000Z",
+      payload: { cwd: join(realRoot, "packages", "api") },
+    });
+    store.actions.put(edit);
+    const scoped = { ...episode("symlink-workspace-episode"), actions: [edit.id] };
+
+    PrivacyControlStore.forStore(store).update({
+      meshProjectConsents: [{
+        workspaceRoot: aliasRoot,
+        project: "git@github.com:Acme/App.git",
+      }],
+    });
+    assert.deepEqual(resolveEpisodeProject(store, scoped), {
+      project: "acme/app",
+      repoRoot: realpathSync.native(realRoot),
+    });
+
+    PrivacyControlStore.forStore(store).update({
+      meshProjectConsents: [
+        { workspaceRoot: aliasRoot, project: "acme/app" },
+        { workspaceRoot: realRoot, project: "acme/other" },
+      ],
+    });
+    assert.equal(
+      resolveEpisodeProject(store, scoped),
+      undefined,
+      "two projects at the same canonical root must fail closed",
+    );
+  } finally {
+    store.close();
+    rmSync(paths.dir, { recursive: true, force: true });
   }
 });

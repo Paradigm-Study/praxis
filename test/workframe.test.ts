@@ -1,10 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { sha256 } from "../src/core/hash.ts";
 import type { ActionEvent, Episode, RawEvent } from "../src/core/types.ts";
 import {
   episodeToWorkFrame,
   normalizeRepoUrl,
+  toRepoRelativePath,
 } from "../src/mesh/workframe.ts";
 import { freshStore } from "./helpers.ts";
 
@@ -202,6 +206,36 @@ test("episodeToWorkFrame relativizes absolute paths under repoRoot and drops the
     ["src/auth.ts", "src/index.ts"],
     "absolute local paths must never cross the mesh boundary",
   );
+});
+
+test("repo-relative projection rejects traversal, prefix peers, and symlink escapes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "praxis-workframe-paths-"));
+  const root = join(dir, "repo");
+  const outside = join(dir, "outside");
+  try {
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "secret.ts"), "private");
+    symlinkSync(outside, join(root, "linked-outside"), "dir");
+
+    assert.equal(toRepoRelativePath("src/index.ts", root), "src/index.ts");
+    assert.equal(toRepoRelativePath(join(root, "src", "auth.ts"), root), "src/auth.ts");
+    for (const unsafe of [
+      "",
+      ".",
+      "../secret.ts",
+      "src/../../secret.ts",
+      "src\\..\\secret.ts",
+      "src/unsafe\nheading.ts",
+      join(dir, "repository", "prefix-peer.ts"),
+      join(root, "linked-outside", "secret.ts"),
+      "~/notes.md",
+    ]) {
+      assert.equal(toRepoRelativePath(unsafe, root), undefined, `must reject ${unsafe}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("episodeToWorkFrame falls back to summary and applies defaults", () => {

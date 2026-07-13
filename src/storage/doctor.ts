@@ -2,6 +2,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -47,6 +48,16 @@ const NDJSON_FILES = [
   "notifications.ndjson",
   "egress.ndjson",
 ] as const;
+
+function ndjsonFileNames(base: string): string[] {
+  const names = new Set<string>(NDJSON_FILES);
+  if (base && existsSync(base)) {
+    for (const entry of readdirSync(base, { withFileTypes: true })) {
+      if (entry.isFile() && /^mesh-outbox-spool-[a-f0-9]{16}\.ndjson$/.test(entry.name)) names.add(entry.name);
+    }
+  }
+  return [...names];
+}
 
 function issue(
   issues: DoctorIssue[],
@@ -107,6 +118,7 @@ function checkPermissions(base: string, repair: boolean, issues: DoctorIssue[]):
     join(base, "privacy.json"),
     join(base, "retention.json"),
     join(base, "egress.ndjson"),
+    ...ndjsonFileNames(base).map((name) => join(base, name)),
     join(base, "keys", "master-keys.json"),
     ...(process.env.PRAXIS_DATA_KEY_FILE ? [process.env.PRAXIS_DATA_KEY_FILE] : []),
     ...walkFiles(join(base, "blobs")),
@@ -135,9 +147,11 @@ function checkPermissions(base: string, repair: boolean, issues: DoctorIssue[]):
 
 function checkSpools(base: string, repair: boolean, issues: DoctorIssue[]): number {
   let corrupt = 0;
-  for (const name of NDJSON_FILES) {
+  for (const name of ndjsonFileNames(base)) {
     const path = join(base, name);
     if (!existsSync(path)) continue;
+    const stats = lstatSync(path);
+    if (!stats.isFile() || stats.isSymbolicLink()) continue;
     const lines = readFileSync(path, "utf8").split(/\r?\n/);
     const valid: string[] = [];
     let fileCorrupt = 0;

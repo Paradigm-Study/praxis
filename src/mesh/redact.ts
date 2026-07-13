@@ -15,7 +15,17 @@ export interface RedactOptions {
 
 /** Redact secrets/PII/content from a mesh-bound string. Deterministic. */
 export function redactText(text: string, opts: RedactOptions = {}): string {
-  let redacted = text;
+  let redacted = opts.maxChars === undefined
+    ? text
+    : text.slice(0, Math.max(1_024, Math.max(0, Math.trunc(opts.maxChars)) * 4));
+
+  // Absolute paths disclose usernames, mount layouts, and client names. URLs
+  // are left intact: their slashes are preceded by ':'/'/' or a host byte.
+  redacted = redacted
+    .replace(/\b(?:file|vscode):\/\/[^\s"'`]*/gi, "[redacted path]")
+    .replace(/\\\\[^\s\\"'`]+\\[^\s"'`]*/g, "[redacted path]")
+    .replace(/(?<![:/A-Za-z0-9])\/(?!\/)[^\s"'`]*/g, "[redacted path]")
+    .replace(/\b[A-Za-z]:[\\/][^\s"'`]*/g, "[redacted path]");
 
   // Keep this order stable: the more specific forms must be removed before
   // the broad encoded-value rules below inspect the remaining text.
@@ -67,6 +77,7 @@ export function redactText(text: string, opts: RedactOptions = {}): string {
  * wire — this function is the redaction boundary, not just a string filter.
  */
 export function redactWorkFrame(frame: WorkFrame): WorkFrame {
+  const sessionKey = safeOpaqueId(frame.sessionKey);
   return {
     v: 0,
     id: frame.id,
@@ -75,19 +86,19 @@ export function redactWorkFrame(frame: WorkFrame): WorkFrame {
     device: frame.device,
     project: frame.project,
     ts: frame.ts,
-    intent: redactText(frame.intent),
+    intent: redactText(frame.intent, { maxChars: 500 }),
     status: frame.status,
-    artifacts: frame.artifacts
+    artifacts: frame.artifacts.slice(0, 64)
       .filter((artifact) => !isSecretArtifactPath(artifact.path))
       .map((artifact) => ({
         repo: artifact.repo,
         path: artifact.path,
-        ...(artifact.branch !== undefined ? { branch: artifact.branch } : {}),
+        ...(safeBranch(artifact.branch) ? { branch: safeBranch(artifact.branch) } : {}),
       })),
-    uncertainty: frame.uncertainty.map((value) => redactText(value)),
-    claimsTouched: [...frame.claimsTouched],
-    evidenceRefs: [...frame.evidenceRefs],
-    ...(frame.sessionKey !== undefined ? { sessionKey: frame.sessionKey } : {}),
+    uncertainty: frame.uncertainty.slice(0, 16).map((value) => redactText(value, { maxChars: 240 })),
+    claimsTouched: frame.claimsTouched.slice(0, 64).filter(isSafeReference),
+    evidenceRefs: frame.evidenceRefs.slice(0, 64).filter((value) => /^[a-f0-9]{64}$/.test(value)),
+    ...(sessionKey ? { sessionKey } : {}),
   };
 }
 
@@ -104,14 +115,16 @@ export function redactMeshFrame(frame: MeshFrame): MeshFrame {
     cardId: frame.cardId,
     stage: frame.stage,
     event: frame.event,
-    ...(frame.verdict !== undefined ? { verdict: redactText(frame.verdict) } : {}),
-    artifacts: frame.artifacts
+    ...(frame.verdict !== undefined ? { verdict: redactText(frame.verdict, { maxChars: 500 }) } : {}),
+    artifacts: frame.artifacts.slice(0, 64)
       .filter((artifact) => !isSecretArtifactPath(artifact.path))
       .map((artifact) => ({ repo: artifact.repo, path: artifact.path })),
-    specCriteria: frame.specCriteria.map((criterion) => ({
+    specCriteria: frame.specCriteria.slice(0, 32).flatMap((criterion) => safeOpaqueId(criterion.id)
+      ? [{
       id: criterion.id,
-      behavior: redactText(criterion.behavior),
-    })),
+      behavior: redactText(criterion.behavior, { maxChars: 500 }),
+    }]
+      : []),
   };
 }
 
@@ -132,4 +145,20 @@ function isSecretArtifactPath(path: string): boolean {
     || /\.pem$/i.test(segment)
     || /^credentials/i.test(segment)
   );
+}
+
+function isSafeReference(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(value)
+    && redactText(value) === value;
+}
+
+function safeOpaqueId(value: string | undefined): string | undefined {
+  return value && isSafeReference(value) ? value : undefined;
+}
+
+function safeBranch(value: string | undefined): string | undefined {
+  if (!value || value.length > 200 || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value)) {
+    return undefined;
+  }
+  return redactText(value) === value ? value : undefined;
 }

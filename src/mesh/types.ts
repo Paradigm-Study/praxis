@@ -105,6 +105,7 @@ export interface BriefLockedSpec {
 
 export interface BriefRecentDecision {
   person: string;
+  project?: string;
   cardId: string;
   stage: LifecycleStage;
   verdict?: string;

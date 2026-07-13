@@ -4,13 +4,16 @@ import { test } from "node:test";
 import {
   chmodSync,
   appendFileSync,
+  copyFileSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -207,22 +210,90 @@ test("verified backup restores atomically and preserves a pre-restore backup", (
   const backup = join(root, "snapshot.praxisbackup");
   try {
     const original = openStore({ dir });
+    const scopedSpool = join(dir, "mesh-outbox-spool-deadbeefdeadbeef.ndjson");
+    writeFileSync(scopedSpool, `${JSON.stringify({ queued: true })}\n`, { mode: 0o600 });
     const before = makeIngest(original).ingest({
       source: "synthetic", app: "Test", window: "before", type: "before", payload: { secret: "before" },
     });
     createBackup(original, backup);
     assert.equal(verifyBackup(backup).ok, true);
+    assert.ok(verifyBackup(backup).manifest?.files.some((file) =>
+      file.path === "mesh-outbox-spool-deadbeefdeadbeef.ndjson"));
     const after = makeIngest(original).ingest({
       source: "synthetic", app: "Test", window: "after", type: "after", payload: { secret: "after" },
     });
     original.close();
+    writeFileSync(join(dir, "post-snapshot.tmp"), "must disappear", { mode: 0o600 });
 
     const result = restoreBackup(backup, dir);
     assert.equal(verifyBackup(result.preRestoreBackup).ok, true);
     const restored = openStore({ dir });
     assert.ok(restored.events.get(before.id));
     assert.equal(restored.events.get(after.id), undefined);
+    assert.equal(readFileSync(scopedSpool, "utf8"), `${JSON.stringify({ queued: true })}\n`);
+    assert.equal(existsSync(join(dir, "post-snapshot.tmp")), false);
     restored.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backup rejects destinations and unsupported live entries inside the blob boundary", () => {
+  const root = tempDir("praxis-backup-boundary-");
+  const dir = join(root, "data");
+  const external = join(root, "external");
+  try {
+    const store = openStore({ dir });
+    writeFileSync(external, "outside");
+    assert.throws(
+      () => createBackup(store, join(store.paths.blobs, "nested", "snapshot.praxisbackup")),
+      /must not be inside the live blob store/,
+    );
+
+    const nestedLink = join(store.paths.blobs, "unsafe-link");
+    symlinkSync(external, nestedLink);
+    assert.throws(() => createBackup(store, join(root, "nested-link.praxisbackup")), /unsupported live blob entry/);
+    rmSync(nestedLink);
+
+    const auxiliaryLink = join(dir, "mesh-outbox-spool-deadbeefdeadbeef.ndjson");
+    symlinkSync(external, auxiliaryLink);
+    assert.throws(() => createBackup(store, join(root, "aux-link.praxisbackup")), /unsupported auxiliary/);
+    rmSync(auxiliaryLink);
+
+    const realBlobs = join(root, "real-blobs");
+    renameSync(store.paths.blobs, realBlobs);
+    symlinkSync(realBlobs, store.paths.blobs, "dir");
+    assert.throws(() => createBackup(store, join(root, "root-link.praxisbackup")), /real directory/);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("restore rejects key-fingerprint and database-schema manifest mismatches", () => {
+  const root = tempDir("praxis-backup-contract-");
+  const dir = join(root, "data");
+  const backup = join(root, "snapshot.praxisbackup");
+  try {
+    const store = openStore({ dir });
+    createBackup(store, backup);
+    store.close();
+    const manifestPath = join(backup, "manifest.json");
+    const original = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      schemaVersion: number;
+      encryptionKeyVersions: number[];
+      encryptionKeyFingerprints: Record<string, string>;
+    };
+    const fingerprintVersion = String(original.encryptionKeyVersions[0]);
+    const wrongFingerprint = structuredClone(original);
+    wrongFingerprint.encryptionKeyFingerprints[fingerprintVersion] = "0".repeat(64);
+    writeFileSync(manifestPath, JSON.stringify(wrongFingerprint));
+    assert.throws(() => restoreBackup(backup, dir), /does not match this backup/);
+
+    const wrongSchema = structuredClone(original);
+    wrongSchema.schemaVersion += 1;
+    writeFileSync(manifestPath, JSON.stringify(wrongSchema));
+    assert.match(verifyBackup(backup).errors.join("; "), /database schema .* does not match manifest/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -269,6 +340,68 @@ test("tampered backup is rejected before target mutation", () => {
   }
 });
 
+test("backup verification rejects symlinked content and manifest files", () => {
+  const root = tempDir("praxis-backup-symlink-");
+  const dir = join(root, "data");
+  const backup = join(root, "snapshot.praxisbackup");
+  try {
+    const store = openStore({ dir });
+    createBackup(store, backup);
+    store.close();
+
+    const database = join(backup, "praxis.db");
+    rmSync(database);
+    symlinkSync(join(dir, "praxis.db"), database);
+    assert.equal(verifyBackup(backup).ok, false, "database symlinks must never be followed");
+
+    rmSync(database);
+    copyFileSync(join(dir, "praxis.db"), database);
+    const manifest = join(backup, "manifest.json");
+    const realManifest = join(root, "manifest-real.json");
+    renameSync(manifest, realManifest);
+    symlinkSync(realManifest, manifest);
+    assert.match(verifyBackup(backup).errors.join("; "), /manifest must be a regular file/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backup manifest paths are unique, normalized, allowlisted, and size bounded", () => {
+  const root = tempDir("praxis-backup-manifest-policy-");
+  const dir = join(root, "data");
+  const backup = join(root, "snapshot.praxisbackup");
+  try {
+    const store = openStore({ dir });
+    createBackup(store, backup);
+    store.close();
+    const manifestPath = join(backup, "manifest.json");
+    const original = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      files: Array<{ path: string; bytes: number; sha256: string }>;
+    };
+    const database = original.files.find((file) => file.path === "praxis.db")!;
+
+    original.files.push({ ...database });
+    writeFileSync(manifestPath, JSON.stringify(original));
+    assert.match(verifyBackup(backup).errors.join("; "), /duplicate path praxis\.db/);
+
+    original.files.pop();
+    database.path = "blobs/../praxis.db";
+    writeFileSync(manifestPath, JSON.stringify(original));
+    assert.match(verifyBackup(backup).errors.join("; "), /unsafe or unsupported path/);
+
+    database.path = "keys/master-keys.json";
+    writeFileSync(manifestPath, JSON.stringify(original));
+    assert.match(verifyBackup(backup).errors.join("; "), /unsafe or unsupported path/);
+
+    database.path = "praxis.db";
+    database.bytes = 9 * 1024 * 1024 * 1024;
+    writeFileSync(manifestPath, JSON.stringify(original));
+    assert.match(verifyBackup(backup).errors.join("; "), /invalid size praxis\.db/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("doctor detects and safely repairs permissions, orphan files/rows, and torn spools", () => {
   const dir = tempDir("praxis-doctor-");
   try {
@@ -282,13 +415,15 @@ test("doctor detects and safely repairs permissions, orphan files/rows, and torn
       "INSERT INTO blobs(hash, kind, path, bytes, created_at) VALUES(?, 'text', ?, 6, ?)",
     ).run("deadbeef", indexedOrphan, new Date().toISOString());
     writeFileSync(join(dir, "egress.ndjson"), `${JSON.stringify({ ok: true })}\n{torn`, { mode: 0o600 });
+    const scopedSpool = join(dir, "mesh-outbox-spool-deadbeefdeadbeef.ndjson");
+    writeFileSync(scopedSpool, `${JSON.stringify({ ok: true })}\n{also-torn`, { mode: 0o600 });
     chmodSync(store.paths.db, 0o644);
 
     const before = doctorStore(store);
     assert.equal(before.ok, false);
     assert.equal(before.counts.orphanBlobFiles, 1);
     assert.equal(before.counts.orphanBlobRows, 1);
-    assert.equal(before.counts.corruptSpoolLines, 1);
+    assert.equal(before.counts.corruptSpoolLines, 2);
 
     const repaired = doctorStore(store, { repair: true });
     assert.equal(repaired.ok, true);
@@ -296,6 +431,7 @@ test("doctor detects and safely repairs permissions, orphan files/rows, and torn
     assert.equal(existsSync(orphanFile), false);
     assert.equal(existsSync(indexedOrphan), false);
     assert.equal((readFileSync(join(dir, "egress.ndjson"), "utf8").match(/\n/g) ?? []).length, 1);
+    assert.equal((readFileSync(scopedSpool, "utf8").match(/\n/g) ?? []).length, 1);
     assert.equal(chmodMode(store.paths.db), 0o600);
     assert.equal(doctorStore(store).ok, true);
     store.close();

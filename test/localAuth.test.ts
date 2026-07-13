@@ -46,6 +46,10 @@ test("Studio health is minimal while reads and mutations require bearer auth", a
     assert.deepEqual(await health.json(), { ok: true });
 
     assert.equal((await fetch(`${base}/api/status`)).status, 401);
+    assert.equal((await fetch(`${base}/api/mesh/gate?cwd=/tmp&path=/tmp/file.ts`)).status, 401);
+    assert.equal((await fetch(`${base}/api/mesh/gate?cwd=/tmp&path=/tmp/file.ts`, {
+      headers: { authorization: "Bearer wrong-token" },
+    })).status, 401);
     assert.equal((await fetch(`${base}/api/privacy`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
@@ -54,6 +58,7 @@ test("Studio health is minimal while reads and mutations require bearer auth", a
 
     const authorized = { authorization: `Bearer ${TOKEN}` };
     assert.equal((await fetch(`${base}/api/status`, { headers: authorized })).status, 200);
+    assert.equal((await fetch(`${base}/api/mesh/gate`, { headers: authorized })).status, 400);
     const mutation = await fetch(`${base}/api/privacy`, {
       method: "PUT",
       headers: { ...authorized, "content-type": "application/json", origin: base },
@@ -71,11 +76,30 @@ test("Studio health is minimal while reads and mutations require bearer auth", a
     });
     assert.equal(projectMutation.status, 200);
     assert.deepEqual(await projectMutation.json(), {
-      projects: [{ workspaceRoot: "/Users/alice/work/app", project: "https://github.com/acme/app" }],
+      projects: [{ workspaceRoot: "/Users/alice/work/app", project: "acme/app" }],
     });
     assert.deepEqual(await (await fetch(`${base}/api/mesh/projects`, { headers: authorized })).json(), {
-      projects: [{ workspaceRoot: "/Users/alice/work/app", project: "https://github.com/acme/app" }],
+      projects: [{ workspaceRoot: "/Users/alice/work/app", project: "acme/app" }],
     });
+  } finally {
+    await close(server);
+    store.close();
+    if (previous === undefined) delete process.env.PRAXIS_LOCAL_TOKEN;
+    else process.env.PRAXIS_LOCAL_TOKEN = previous;
+  }
+});
+
+test("team gate stays disabled when Studio has no local bearer token", async () => {
+  const previous = process.env.PRAXIS_LOCAL_TOKEN;
+  delete process.env.PRAXIS_LOCAL_TOKEN;
+  const store = freshStore();
+  const server = startStudio(store, 0);
+  const port = await portOf(server);
+  try {
+    assert.equal(
+      (await fetch(`http://127.0.0.1:${port}/api/mesh/gate?cwd=/tmp&path=/tmp/file.ts`)).status,
+      403,
+    );
   } finally {
     await close(server);
     store.close();
