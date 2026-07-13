@@ -57,10 +57,14 @@ public final class AudioCapture: NSObject {
         } else if !enableSystem, let tap = systemTap {
             tap.stop(); systemTap = nil
         }
-        if enableMic, micTap == nil {
-            let tap = MicTap(chunker: micChunker, policy: policy)
-            micTap = tap
-            tap.start()
+        if enableMic {
+            if micTap == nil {
+                micTap = MicTap(chunker: micChunker, policy: policy)
+            }
+            // Reconcile on every policy tick. If the user grants Microphone
+            // access while capture is already running, a previously blocked
+            // tap can recover without restarting the app.
+            micTap?.start()
         } else if !enableMic, let tap = micTap {
             tap.stop(); micTap = nil
         }
@@ -439,6 +443,9 @@ final class MicTap {
     private let chunker: SpeechChunker
     private let policy: NativePolicyChecking
     private var engine: AVAudioEngine?
+    private var desired = false
+    private var startInFlight = false
+    private var lastReportedAuthorization: AVAuthorizationStatus?
 
     init(chunker: SpeechChunker, policy: NativePolicyChecking) {
         self.chunker = chunker
@@ -446,13 +453,43 @@ final class MicTap {
     }
 
     func start() {
-        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            guard granted else { log("audio: microphone not granted"); return }
-            DispatchQueue.main.async { self?.startEngine() }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.start() }
+            return
+        }
+        desired = true
+        guard engine == nil, !startInFlight else { return }
+
+        let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        switch authorization {
+        case .authorized:
+            lastReportedAuthorization = nil
+            startInFlight = true
+            startEngine()
+        case .notDetermined:
+            startInFlight = true
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.startInFlight = false
+                    guard self.desired else { return }
+                    if granted {
+                        self.start()
+                    } else {
+                        self.reportBlockedAuthorization(.denied)
+                    }
+                }
+            }
+        case .denied, .restricted:
+            reportBlockedAuthorization(authorization)
+        @unknown default:
+            reportBlockedAuthorization(authorization)
         }
     }
 
     private func startEngine() {
+        defer { startInFlight = false }
+        guard desired, engine == nil else { return }
         let front = FrontmostTracker.shared.context
         guard policy.decision(
             source: .audio, app: front.app, window: front.window, at: Date()
@@ -479,15 +516,28 @@ final class MicTap {
             self.engine = engine
             log("audio: microphone tap started")
         } catch {
+            input.removeTap(onBus: 0)
             log("audio: mic engine failed: \(error)")
         }
     }
 
     func stop() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.stop() }
+            return
+        }
+        desired = false
+        startInFlight = false
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         log("audio: microphone tap stopped")
+    }
+
+    private func reportBlockedAuthorization(_ authorization: AVAuthorizationStatus) {
+        guard lastReportedAuthorization != authorization else { return }
+        lastReportedAuthorization = authorization
+        log("audio: microphone permission \(Permissions.microphoneAuthorization())")
     }
 }
 

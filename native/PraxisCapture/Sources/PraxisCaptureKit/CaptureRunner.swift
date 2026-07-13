@@ -136,8 +136,11 @@ public final class CaptureRunner {
             }
             if audio == nil {
                 audio = AudioCapture(policy: policy)
-                AudioCapture.requestPermissions(mic: mic) { ok in
-                    if !ok { log("audio: speech/mic permission incomplete — transcripts may be unavailable") }
+                // Speech authorization is shared by both channels. MicTap owns
+                // the microphone request so a pending/changed TCC decision can
+                // be retried by the regular reconciliation loop.
+                AudioCapture.requestPermissions(mic: false) { ok in
+                    if !ok { log("audio: speech permission incomplete — transcripts may be unavailable") }
                 }
             }
             audio?.set(system: system && Permissions.screenRecordingAllowed(), mic: mic)
