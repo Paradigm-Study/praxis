@@ -40,24 +40,34 @@ export interface WorkFrameContext {
  * untouched; URL-like remotes lose transport-specific ssh syntax instead.
  */
 export function normalizeRepoUrl(raw: string): string {
-  const scp = raw.match(/^(?:[^@/\s]+)@([^:/\s]+):(.+)$/);
+  const value = raw.trim();
+  const scp = value.match(/^(?:[^@/\s]+)@([^:/\s]+):(.+)$/);
   if (scp) {
     return toHttpsRepo(scp[1]!, scp[2]!);
   }
 
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    const path = normalizeRepoPath(value);
+    return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(path)
+      ? path.toLowerCase()
+      : value;
+  }
 
   try {
-    const url = new URL(raw);
+    const url = new URL(value);
     const path = normalizeRepoPath(url.pathname);
     if (url.protocol === "ssh:") {
       return toHttpsRepo(url.host, path);
     }
 
+    if (url.hostname.toLowerCase() === "github.com" && /^[^/]+\/[^/]+$/.test(path)) {
+      return path.toLowerCase();
+    }
+
     const origin = `${url.protocol}//${url.host.toLowerCase()}`;
     return path ? `${origin}/${path.toLowerCase()}` : origin;
   } catch {
-    return raw;
+    return value;
   }
 }
 
@@ -67,6 +77,9 @@ function normalizeRepoPath(raw: string): string {
 
 function toHttpsRepo(host: string, rawPath: string): string {
   const path = normalizeRepoPath(rawPath).toLowerCase();
+  if (host.toLowerCase() === "github.com" && /^[^/]+\/[^/]+$/.test(path)) {
+    return path;
+  }
   const origin = `https://${host.toLowerCase()}`;
   return path ? `${origin}/${path}` : origin;
 }
@@ -149,7 +162,7 @@ export function episodeToWorkFrame(
     kind: "workframe",
     person: ctx.person,
     device: ctx.device,
-    project: ctx.project,
+    project: repo,
     ts: ctx.ts ?? episode.endTs,
     intent: redactText(oneLine(intentSource ?? "")),
     status: ctx.status ?? "active",

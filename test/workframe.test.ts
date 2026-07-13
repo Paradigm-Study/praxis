@@ -54,10 +54,10 @@ function episode(overrides: Partial<Episode> = {}): Episode {
   };
 }
 
-test("normalizeRepoUrl canonicalizes remote URLs and preserves directory names", () => {
+test("normalizeRepoUrl converges GitHub remotes on owner/repo and preserves directory names", () => {
   assert.equal(
     normalizeRepoUrl("git@github.com:Acme/Repo.git"),
-    "https://github.com/acme/repo",
+    "acme/repo",
   );
   assert.equal(
     normalizeRepoUrl("ssh://git@Git.Example.COM/Acme/Repo.git"),
@@ -65,8 +65,9 @@ test("normalizeRepoUrl canonicalizes remote URLs and preserves directory names",
   );
   assert.equal(
     normalizeRepoUrl("https://GitHub.com/Acme/Repo.git/"),
-    "https://github.com/acme/repo",
+    "acme/repo",
   );
+  assert.equal(normalizeRepoUrl("Acme/Repo"), "acme/repo");
   assert.equal(normalizeRepoUrl("Praxis"), "Praxis");
 });
 
@@ -139,14 +140,14 @@ test("episodeToWorkFrame projects redacted metadata and hashed evidence", (t) =>
   assert.equal(frame.kind, "workframe");
   assert.equal(frame.person, "alice");
   assert.equal(frame.device, "laptop");
-  assert.equal(frame.project, "git@github.com:Acme/Repo.git");
+  assert.equal(frame.project, "acme/repo");
   assert.equal(frame.ts, "2026-07-12T18:00:00.000Z");
   assert.equal(frame.status, "done");
   assert.equal(frame.sessionKey, "session_123");
   assert.equal(frame.intent, "Ship auth flow for [redacted]");
   assert.deepEqual(frame.artifacts, [
-    { repo: "https://github.com/acme/repo", path: "src/index.ts" },
-    { repo: "https://github.com/acme/repo", path: "docs/Guide.md" },
+    { repo: "acme/repo", path: "src/index.ts" },
+    { repo: "acme/repo", path: "docs/Guide.md" },
   ]);
   assert.deepEqual(frame.uncertainty, [
     "Ask [redacted] about [redacted]",
