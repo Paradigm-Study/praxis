@@ -16,6 +16,13 @@ import type { Store } from "../storage/index.ts";
 export const PRIVACY_CONTROL_VERSION = 1 as const;
 export type PrivacyMode = "normal" | "paused" | "private";
 
+export interface MeshProjectConsent {
+  /** Absolute local workspace root used only on-device for episode matching. */
+  workspaceRoot: string;
+  /** Stable team-visible project identity, preferably the canonical git remote. */
+  project: string;
+}
+
 export interface PrivacyControl {
   version: typeof PRIVACY_CONTROL_VERSION;
   mode: PrivacyMode;
@@ -27,6 +34,7 @@ export interface PrivacyControl {
   cloudObserverConsent: boolean;
   screenshotConsent: boolean;
   meshProjects: string[];
+  meshProjectConsents: MeshProjectConsent[];
   updatedAt: string;
 }
 
@@ -70,6 +78,7 @@ export function defaultPrivacyControl(now = new Date().toISOString()): PrivacyCo
     cloudObserverConsent: false,
     screenshotConsent: false,
     meshProjects: [],
+    meshProjectConsents: [],
     updatedAt: now,
   };
 }
@@ -79,6 +88,25 @@ function strings(value: unknown, fallback: string[]): string[] {
     return [...fallback];
   }
   return [...new Set(value.map((item) => item.trim()).filter(Boolean))];
+}
+
+function meshProjectConsents(value: unknown): MeshProjectConsent[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const out: MeshProjectConsent[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    if (typeof raw.workspaceRoot !== "string" || typeof raw.project !== "string") continue;
+    const workspaceRoot = raw.workspaceRoot.trim().replace(/\/+$/, "");
+    const project = raw.project.trim();
+    if (!workspaceRoot.startsWith("/") || workspaceRoot === "" || project === "") continue;
+    const key = `${workspaceRoot}\0${project}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ workspaceRoot, project });
+  }
+  return out;
 }
 
 /** Parse a persisted/user-supplied control without letting missing fields weaken defaults. */
@@ -114,6 +142,7 @@ export function normalizePrivacyControl(
     cloudObserverConsent: input.cloudObserverConsent === true,
     screenshotConsent: input.cloudObserverConsent === true && input.screenshotConsent === true,
     meshProjects: strings(input.meshProjects, fallback.meshProjects),
+    meshProjectConsents: meshProjectConsents(input.meshProjectConsents),
     updatedAt: typeof input.updatedAt === "string" ? input.updatedAt : now,
   };
 }

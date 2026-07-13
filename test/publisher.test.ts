@@ -11,8 +11,10 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Episode } from "../src/core/types.ts";
-import { MeshPublisher } from "../src/mesh/publisher.ts";
+import { MeshPublisher, resolveEpisodeProject } from "../src/mesh/publisher.ts";
 import type { WorkFrame } from "../src/mesh/types.ts";
+import { PrivacyControlStore } from "../src/privacy/control.ts";
+import { action, freshStore } from "./helpers.ts";
 
 interface RequestRecord {
   method: string | undefined;
@@ -618,5 +620,51 @@ test("fromEnv binds hosted team and device identity", () => {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  }
+});
+
+test("episode project identity comes only from an explicit workspace consent", () => {
+  const store = freshStore();
+  try {
+    const edit = action({
+      id: "workspace-edit",
+      action: "edited_file",
+      startTs: "2026-07-12T12:00:00.000Z",
+      payload: {
+        cwd: "/Users/alice/work/app/packages/api",
+        sessionKey: "session-123",
+        filePath: "src/api.ts",
+      },
+    });
+    store.actions.put(edit);
+    const scoped = { ...episode("workspace-episode"), actions: [edit.id] };
+    assert.equal(resolveEpisodeProject(store, scoped), undefined);
+
+    PrivacyControlStore.forStore(store).update({
+      meshProjectConsents: [{
+        workspaceRoot: "/Users/alice/work/app",
+        project: "git@github.com:acme/app.git",
+      }],
+    });
+    assert.deepEqual(resolveEpisodeProject(store, scoped), {
+      project: "git@github.com:acme/app.git",
+      repoRoot: "/Users/alice/work/app",
+      sessionKey: "session-123",
+    });
+
+    const second = action({
+      id: "other-workspace-edit",
+      action: "edited_file",
+      startTs: "2026-07-12T12:00:01.000Z",
+      payload: { cwd: "/Users/alice/work/other", sessionKey: "session-123" },
+    });
+    store.actions.put(second);
+    assert.equal(
+      resolveEpisodeProject(store, { ...scoped, actions: [edit.id, second.id] }),
+      undefined,
+      "an episode spanning an unconsented workspace fails closed",
+    );
+  } finally {
+    store.close();
   }
 });

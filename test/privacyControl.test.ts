@@ -66,6 +66,41 @@ test("final ingest gate never persists blocked inline content or blobs", () => {
   store.close();
 });
 
+test("clipboard and accessibility secrets are redacted before payload or blob persistence", () => {
+  const store = openStore({ memory: true });
+  try {
+    const ingest = makeIngest(store);
+    const clipboard = ingest.ingest({
+      ...input,
+      payload: { text: "api_key=sk-supersecretvalue1234567890" },
+      blobs: [{ kind: "text", data: "Bearer abcdefghijklmnopqrstuvwxyz012345" }],
+    });
+    assert.deepEqual(clipboard.payload, {
+      text: "[redacted sensitive content]",
+      contentRedacted: true,
+    });
+    assert.equal(store.blobs.getText(clipboard.blobRefs[0]!), "[redacted sensitive content]");
+
+    const accessibility = ingest.ingest({
+      source: "accessibility",
+      app: "Editor",
+      window: "Login",
+      type: "focused_text_changed",
+      payload: { password: "short-but-sensitive", title: "Sign in" },
+    });
+    assert.deepEqual(accessibility.payload, {
+      password: "[redacted sensitive content]",
+      title: "Sign in",
+      contentRedacted: true,
+    });
+    const persisted = JSON.stringify(store.events.range());
+    assert.equal(persisted.includes("supersecret"), false);
+    assert.equal(persisted.includes("short-but-sensitive"), false);
+  } finally {
+    store.close();
+  }
+});
+
 test("privacy control writes atomically with owner-only permissions", () => {
   const dir = mkdtempSync(join(tmpdir(), "praxis-privacy-"));
   const path = join(dir, "nested", "privacy.json");

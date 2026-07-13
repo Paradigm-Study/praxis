@@ -170,3 +170,14 @@ try Data("{broken".utf8).write(to: policyURL, options: [.atomic])
 expect(!required.decision(source: .accessibility, at: now).allowed, "corrupt policy fails closed")
 
 print("Native acquisition policy self-test passed")
+
+expect(SensitiveContentFilter.looksSensitive("api_key=sk-supersecretvalue1234567890"),
+       "API key-shaped clipboard text is sensitive")
+expect(SensitiveContentFilter.looksSensitive("Bearer abcdefghijklmnopqrstuvwxyz012345"),
+       "bearer clipboard text is sensitive")
+expect(SensitiveContentFilter.looksSensitive("aB3dE5fG7hJ9kLmN2pQrS4tUvW6xY8z0"),
+       "standalone high-entropy clipboard values fail closed")
+expect(!SensitiveContentFilter.looksSensitive("ordinary project status text"),
+       "ordinary prose is retained")
+
+print("Sensitive content filter self-test passed")

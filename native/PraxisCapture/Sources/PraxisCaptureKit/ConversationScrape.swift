@@ -85,10 +85,15 @@ enum ConversationScrape {
         if budget <= 0 { return }
         budget -= 1
         let role = AXSnapshot.copyString(el, kAXRoleAttribute) ?? ""
+        let subrole = AXSnapshot.copyString(el, kAXSubroleAttribute) ?? ""
+        // Never read a secure node's value/title or traverse its children.
+        if AXSnapshot.isProtected(el, role: role, subrole: subrole) { return }
         if role == "AXStaticText" || role == "AXTextArea" {
-            if let v = AXSnapshot.copyString(el, kAXValueAttribute), !v.isEmpty {
+            if let v = AXSnapshot.copyString(el, kAXValueAttribute), !v.isEmpty,
+               !SensitiveContentFilter.looksSensitive(v) {
                 out.append(v)
-            } else if let t = AXSnapshot.copyString(el, kAXTitleAttribute), !t.isEmpty {
+            } else if let t = AXSnapshot.copyString(el, kAXTitleAttribute), !t.isEmpty,
+                      !SensitiveContentFilter.looksSensitive(t) {
                 out.append(t)
             }
         }

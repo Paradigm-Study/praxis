@@ -39,13 +39,18 @@ enum AXSnapshot {
         let element = el as! AXUIElement
 
         let role = copyString(element, kAXRoleAttribute) ?? ""
+        let subrole = copyString(element, kAXSubroleAttribute) ?? ""
+        // Inspect non-content attributes first. Secure/protected fields must
+        // never have AXValue read at all.
+        if isProtected(element, role: role, subrole: subrole) { return }
         let value = copyString(element, kAXValueAttribute)
         let title = copyString(element, kAXTitleAttribute)
         // An empty field often reports its placeholder as the value — skip those
         // so the reconstructor doesn't treat "Type / for commands" as user input.
         let placeholder = copyString(element, kAXPlaceholderValueAttribute)
         if role == "AXTextField" || role == "AXTextArea" || role == "AXComboBox" {
-            guard let v = value, v != lastValue else { return }
+            guard let v = value, v != lastValue,
+                  !SensitiveContentFilter.looksSensitive(v) else { return }
             let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty || v == placeholder { return } // empty composer
             lastValue = v
@@ -67,5 +72,17 @@ enum AXSnapshot {
         var v: AnyObject?
         guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success else { return nil }
         return v as? String
+    }
+
+    static func isProtected(_ element: AXUIElement, role: String? = nil, subrole: String? = nil) -> Bool {
+        let roleValue = (role ?? copyString(element, kAXRoleAttribute) ?? "").lowercased()
+        let subroleValue = (subrole ?? copyString(element, kAXSubroleAttribute) ?? "").lowercased()
+        if roleValue.contains("secure") || subroleValue.contains("secure") { return true }
+        var protected: AnyObject?
+        if AXUIElementCopyAttributeValue(element, "AXProtectedContent" as CFString, &protected) == .success,
+           let value = protected as? Bool {
+            return value
+        }
+        return false
     }
 }

@@ -211,6 +211,10 @@ function handleApi(
         return json(res, 200, captureStatus(store));
       case "/api/privacy":
         return json(res, 200, PrivacyControlStore.forStore(store).read());
+      case "/api/mesh/projects":
+        return json(res, 200, {
+          projects: PrivacyControlStore.forStore(store).read().meshProjectConsents,
+        });
       case "/api/egress":
         return json(
           res,
@@ -295,6 +299,18 @@ function handleApi(
       const control = PrivacyControlStore.forStore(store).update(data as Partial<PrivacyControl>);
       publishNativeAcquisitionPolicy(store);
       return json(res, 200, control);
+    });
+  }
+  if (req.method === "PUT" && path === "/api/mesh/projects") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      if (!data || !Array.isArray(data.projects)) {
+        return json(res, 400, { error: "projects must be an array" });
+      }
+      const control = PrivacyControlStore.forStore(store).update({
+        meshProjectConsents: data.projects as PrivacyControl["meshProjectConsents"],
+      });
+      return json(res, 200, { projects: control.meshProjectConsents });
     });
   }
   if (req.method === "PUT" && path === "/api/runtime/resources") {

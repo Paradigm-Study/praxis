@@ -48,12 +48,20 @@ export interface MeshPublisherOptions {
   fetchFn?: typeof fetch;
   /** Optional consent allowlist of git remotes or project directory names. */
   projects?: string[];
+  /** Resolve an episode to an explicitly consented workspace/project pair. */
+  projectContext?: (episode: Episode) => MeshEpisodeProject | undefined;
   /** Defaults to ~/.config/praxis/mesh.json. */
   configPath?: string;
   /** Defaults to the Praxis data directory's mesh outbox spool. */
   spoolPath?: string;
   /** Metadata-only egress audit. */
   auditor?: EgressAuditor;
+}
+
+export interface MeshEpisodeProject {
+  project: string;
+  repoRoot: string;
+  sessionKey?: string;
 }
 
 export interface PublishResult {
@@ -106,6 +114,49 @@ function readConsentConfig(path: string): ConsentConfig | undefined {
   }
 }
 
+function insideWorkspace(cwd: string, root: string): boolean {
+  return cwd === root || cwd.startsWith(`${root}/`);
+}
+
+/**
+ * Resolve an episode from captured session/workspace metadata to one explicit
+ * local-root → team-project consent. Absolute roots stay local; only `project`
+ * reaches the relay. Ambiguous multi-workspace episodes fail closed.
+ */
+export function resolveEpisodeProject(
+  store: Store,
+  episode: Episode,
+): MeshEpisodeProject | undefined {
+  const actions = store.actions.byIds(episode.actions);
+  const workspaces = [...new Set(actions
+    .map((action) => action.payload?.cwd)
+    .filter((value): value is string => typeof value === "string" && value.startsWith("/"))
+    .map((value) => value.replace(/\/+$/, "")))];
+  if (workspaces.length === 0) return undefined;
+
+  const consents = PrivacyControlStore.forStore(store).read().meshProjectConsents;
+  const matches = new Map<string, MeshEpisodeProject>();
+  for (const cwd of workspaces) {
+    const consent = consents
+      .filter((candidate) => insideWorkspace(cwd, candidate.workspaceRoot))
+      .sort((a, b) => b.workspaceRoot.length - a.workspaceRoot.length)[0];
+    if (!consent) return undefined;
+    matches.set(`${consent.workspaceRoot}\0${consent.project}`, {
+      project: consent.project,
+      repoRoot: consent.workspaceRoot,
+    });
+  }
+  if (matches.size !== 1) return undefined;
+  const context = [...matches.values()][0]!;
+  const sessionKeys = [...new Set(actions
+    .map((action) => action.payload?.sessionKey)
+    .filter((value): value is string => typeof value === "string" && value !== ""))];
+  return {
+    ...context,
+    ...(sessionKeys.length === 1 ? { sessionKey: sessionKeys[0] } : {}),
+  };
+}
+
 export class MeshPublisher {
   readonly url: string;
   readonly person: string;
@@ -116,6 +167,7 @@ export class MeshPublisher {
   protected store: Store | undefined;
   protected fetchFn: typeof fetch;
   protected projects: string[] | undefined;
+  protected projectContext: ((episode: Episode) => MeshEpisodeProject | undefined) | undefined;
   protected spoolPath: string;
   protected auditor: EgressAuditor;
   /**
@@ -144,6 +196,7 @@ export class MeshPublisher {
       : config?.projects === undefined
         ? undefined
         : [...config.projects];
+    this.projectContext = opts.projectContext;
     this.spoolPath = opts.spoolPath
       ?? join(defaultDataDir(), "mesh-outbox-spool.ndjson");
     this.auditor = opts.auditor ?? EgressAuditor.forStore(opts.store);
@@ -160,15 +213,18 @@ export class MeshPublisher {
     const token = process.env.PRAXIS_MESH_TOKEN;
     const person = process.env.PRAXIS_PERSON;
     if (!url || !token || !person) return undefined;
-    const projects = store ? PrivacyControlStore.forStore(store).read().meshProjects : [];
-    // Environment credentials alone no longer grant every project: the
-    // versioned privacy control carries affirmative per-project consent.
+    // Environment credentials alone never grant a project. Each episode is
+    // matched at publish time against the live, explicit workspace mapping so
+    // a long-running service sees consent changes without a restart.
     return new MeshPublisher({
       url,
       token,
       person,
       store,
-      projects,
+      projects: [],
+      projectContext: store
+        ? (episode) => resolveEpisodeProject(store, episode)
+        : () => undefined,
       ...(process.env.PRAXIS_MESH_TEAM_ID && {
         teamId: process.env.PRAXIS_MESH_TEAM_ID,
       }),
@@ -202,17 +258,24 @@ export class MeshPublisher {
     status: WorkFrameStatus,
   ): Promise<WorkFrame | undefined> {
     try {
-      if (!this.projectIsAllowed()) {
-        log.debug("mesh project not present in consent allowlist", this.project);
+      const context = this.projectContext?.(episode) ?? (
+        this.projectIsAllowed(this.project)
+          ? { project: this.project, repoRoot: process.cwd() }
+          : undefined
+      );
+      if (!context) {
+        log.debug("mesh episode has no explicitly consented workspace project");
         return undefined;
       }
 
       const frame = episodeToWorkFrame(episode, {
         person: this.person,
         device: this.device,
-        project: this.project,
+        project: context.project,
         store: this.store,
         status,
+        repoRoot: context.repoRoot,
+        ...(context.sessionKey ? { sessionKey: context.sessionKey } : {}),
       });
       try {
         await this.publish(frame);
@@ -283,11 +346,11 @@ export class MeshPublisher {
    * and match exactly. With no configured list, explicit env activation is
    * sufficient consent and publishing remains enabled.
    */
-  private projectIsAllowed(): boolean {
+  private projectIsAllowed(project: string): boolean {
     if (this.projects === undefined) return true;
-    const normalizedProject = normalizeRepoUrl(this.project);
+    const normalizedProject = normalizeRepoUrl(project);
     return this.projects.some((allowed) =>
-      allowed === this.project || normalizeRepoUrl(allowed) === normalizedProject
+      allowed === project || normalizeRepoUrl(allowed) === normalizedProject
     );
   }
 

@@ -9,6 +9,7 @@ import {
   PrivacyControlStore,
 } from "../privacy/control.ts";
 import { resourceCaptureDecision, RuntimeStatusStore } from "./runtimeStatus.ts";
+import { filterSensitiveCapture } from "../privacy/contentFilter.ts";
 
 /**
  * The single normalizing entry point for the ledger. Every capture source goes
@@ -35,6 +36,7 @@ export function makeIngest(store: Store, opts: IngestOptions = {}): Ingest {
   const runtime = opts.runtime ?? RuntimeStatusStore.forStore(store);
 
   function ingest(input: RawEventInput): RawEvent {
+    input = filterSensitiveCapture(input);
     const ts = input.ts ?? nowIso();
     const decision = capturePolicyDecision(privacy.read(), input);
     const resourceDecision = resourceCaptureDecision(runtime.read().resources, input.source);

@@ -112,7 +112,7 @@ function usage(): void {
       `  ${green("status")}       Show ledger counts\n` +
       `  ${green("reset")}        Clear derived data (or everything with --all) + vacuum\n` +
       `  ${green("doctor")}       Check DB/WAL/blobs/permissions/spools  [--repair]\n` +
-      `  ${green("backup")}       Create and verify an encrypted store backup  [--out=PATH]\n` +
+      `  ${green("backup")}       Create same-install encrypted rollback backup  [--out=PATH]\n` +
       `  ${green("restore")}      Verify + restore a backup with rollback  --from=PATH\n` +
       `  ${green("rotate-key")}   Rotate the local master key and re-encrypt stored content\n` +
       `  ${green("profile")}      Show your consolidated profile  [--all]\n` +
@@ -145,7 +145,12 @@ function cmdBackup(): void {
     const path = createBackup(store, flagVal("--out"));
     const verification = verifyBackup(path);
     if (!verification.ok) throw new Error(verification.errors.join("; "));
-    process.stdout.write(`${green("✓")} backup verified: ${path}\n`);
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      path,
+      verified: true,
+      recoveryScope: "same_install",
+    })}\n`);
   } finally {
     store.close();
   }

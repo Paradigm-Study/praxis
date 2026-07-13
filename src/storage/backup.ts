@@ -31,6 +31,8 @@ export interface BackupManifest {
   encryptionKeyVersions: number[];
   encryptionKeyFingerprints: Record<string, string>;
   activeEncryptionVersion: number;
+  /** Keys are excluded: this is rollback for the same install/keyring only. */
+  recoveryScope: "same_install";
   files: BackupFileRecord[];
 }
 
@@ -85,6 +87,7 @@ function makeManifest(
     encryptionKeyVersions: [...keyVersions].sort((a, b) => a - b),
     encryptionKeyFingerprints: { ...keyFingerprints },
     activeEncryptionVersion: activeVersion,
+    recoveryScope: "same_install",
     files: filesUnder(root).map((path) => {
       const bytes = readFileSync(path);
       return {
@@ -118,7 +121,11 @@ function finalize(stage: string, output: string, manifest: BackupManifest): stri
   return output;
 }
 
-/** Consistent SQLite + encrypted-blob backup. Master keys are deliberately excluded. */
+/**
+ * Consistent SQLite + encrypted-blob rollback snapshot. Master keys are
+ * deliberately excluded, so it is recoverable only while the same install's
+ * keyring is retained; this must not be presented as a portable export.
+ */
 export function createBackup(store: Store, output?: string): string {
   if (store.paths.db === ":memory:") throw new Error("cannot back up an in-memory Praxis store");
   const base = dirname(store.paths.db);
@@ -160,6 +167,9 @@ export function verifyBackup(path: string): BackupVerification {
     manifest = JSON.parse(readFileSync(join(path, "manifest.json"), "utf8")) as BackupManifest;
     if (manifest.format !== 1 || !Array.isArray(manifest.files)) {
       throw new Error("unsupported backup manifest");
+    }
+    if (manifest.recoveryScope !== "same_install") {
+      errors.push("unsupported or missing recovery scope");
     }
   } catch (error) {
     return { ok: false, errors: [`manifest: ${String(error)}`] };

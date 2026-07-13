@@ -60,6 +60,14 @@ final class ClipboardCapture {
             return
         }
         lastChangeCount = change
+        if SensitiveContentFilter.looksSensitive(text) {
+            Emitter.shared.emit(
+                source: "clipboard", app: appName, window: window,
+                type: "clipboard_changed",
+                payload: ["op": "copy", "length": text.count, "contentRedacted": true]
+            )
+            return
+        }
         if text.count > 256, let data = text.data(using: .utf8) {
             let blob = Emitter.shared.writeBlob(data, kind: "text", ext: "txt")
             Emitter.shared.emit(

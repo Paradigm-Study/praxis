@@ -61,6 +61,21 @@ test("Studio health is minimal while reads and mutations require bearer auth", a
     });
     assert.equal(mutation.status, 200);
     assert.equal((await mutation.json() as { mode: string }).mode, "private");
+
+    const projectMutation = await fetch(`${base}/api/mesh/projects`, {
+      method: "PUT",
+      headers: { ...authorized, "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        projects: [{ workspaceRoot: "/Users/alice/work/app/", project: "https://github.com/acme/app" }],
+      }),
+    });
+    assert.equal(projectMutation.status, 200);
+    assert.deepEqual(await projectMutation.json(), {
+      projects: [{ workspaceRoot: "/Users/alice/work/app", project: "https://github.com/acme/app" }],
+    });
+    assert.deepEqual(await (await fetch(`${base}/api/mesh/projects`, { headers: authorized })).json(), {
+      projects: [{ workspaceRoot: "/Users/alice/work/app", project: "https://github.com/acme/app" }],
+    });
   } finally {
     await close(server);
     store.close();

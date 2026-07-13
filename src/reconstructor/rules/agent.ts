@@ -61,7 +61,7 @@ export function agentEditedFile(ctx: RuleContext): ActionEvent[] {
         endTs: result?.ts ?? e.ts,
         text: filePath,
         scored: score(toolSignals(e, result)),
-        payload: { filePath, tool, sessionKey },
+        payload: { filePath, tool, cwd: str(e, "cwd"), sessionKey },
         reconstructedBy: "agent.agentEditedFile",
       }),
     );
@@ -150,7 +150,7 @@ export function agentCompletedTask(ctx: RuleContext): ActionEvent[] {
           { id: lastToolUse.id, p: 0.4, tag: "prior_tool_activity" },
         ]),
         uncertainty: ["completion inferred from transcript tail"],
-        payload: { sessionKey, textHash },
+        payload: { sessionKey, cwd: str(finalEvent, "cwd"), textHash },
         reconstructedBy: "agent.agentCompletedTask",
       }),
     );
