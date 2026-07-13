@@ -1,11 +1,15 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import {
+  closeSync,
   chmodSync,
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -73,6 +77,22 @@ function filesUnder(root: string): string[] {
   return out.sort();
 }
 
+function checksumFile(path: string): string {
+  const hash = createHash("sha256");
+  const handle = openSync(path, "r");
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    for (;;) {
+      const bytes = readSync(handle, chunk, 0, chunk.length, null);
+      if (bytes === 0) break;
+      hash.update(chunk.subarray(0, bytes));
+    }
+  } finally {
+    closeSync(handle);
+  }
+  return hash.digest("hex");
+}
+
 function makeManifest(
   root: string,
   schemaVersion: number,
@@ -89,11 +109,11 @@ function makeManifest(
     activeEncryptionVersion: activeVersion,
     recoveryScope: "same_install",
     files: filesUnder(root).map((path) => {
-      const bytes = readFileSync(path);
+      const bytes = statSync(path).size;
       return {
         path: relative(root, path).split("\\").join("/"),
-        bytes: bytes.byteLength,
-        sha256: sha256(bytes),
+        bytes,
+        sha256: checksumFile(path),
       };
     }),
   };
@@ -187,9 +207,8 @@ export function verifyBackup(path: string): BackupVerification {
       errors.push(`missing ${file.path}`);
       continue;
     }
-    const bytes = readFileSync(full);
-    if (bytes.byteLength !== file.bytes) errors.push(`size mismatch ${file.path}`);
-    if (sha256(bytes) !== file.sha256) errors.push(`checksum mismatch ${file.path}`);
+    if (statSync(full).size !== file.bytes) errors.push(`size mismatch ${file.path}`);
+    if (checksumFile(full) !== file.sha256) errors.push(`checksum mismatch ${file.path}`);
   }
   if (!manifest.files.some((file) => file.path === "praxis.db")) errors.push("missing database record");
   return { ok: errors.length === 0, manifest, errors };
