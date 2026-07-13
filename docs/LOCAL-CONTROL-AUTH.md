@@ -35,7 +35,9 @@ owner-only runtime file and sets:
 - `PRAXIS_DATA_KEY_VERSION`: positive integer, initially `1`.
 
 Praxis prefers this key over its development keyring and never copies it into
-the data directory or a backup. During future rotation/recovery, old keys may
+the data directory or a rollback backup. Praxis backups deliberately exclude
+keys and are recoverable only by the same install while its keyring remains.
+They are not portable exports. During future rotation/recovery, old keys may
 be supplied temporarily as comma-separated `version:path` entries through
 `PRAXIS_PREVIOUS_DATA_KEY_FILES`.
 
