@@ -22,6 +22,7 @@ import { nowIso } from "../core/time.ts";
 import { buildPlaybook } from "../transfer/transfer.ts";
 import { buildBrief } from "./brief.ts";
 import { buildTeamGate } from "./teamGate.ts";
+import { acknowledgeSteeringDirective, claimSteeringDirective } from "./directives.ts";
 import { handleBrowserIngest } from "./browserIngest.ts";
 import { createMcpRouter } from "../mcp/router.ts";
 import { isAllowedOrigin } from "../mcp/protocol.ts";
@@ -164,8 +165,8 @@ export function startStudio(store: Store, port = 4319): Server {
       if (req.method === "GET" && path === "/api/health") {
         return json(res, 200, { ok: true });
       }
-      if (path === "/api/mesh/gate" && !localToken) {
-        return json(res, 403, { error: "team gate requires local authentication" });
+      if ((path === "/api/mesh/gate" || path.startsWith("/api/mesh/directives")) && !localToken) {
+        return json(res, 403, { error: "team agent endpoints require local authentication" });
       }
       if (
         (path.startsWith("/api/") || path === "/mcp" || path.startsWith("/mcp/")) &&
@@ -781,6 +782,18 @@ function handleApi(
 ): void {
   // --- reads ---
   if (req.method === "GET") {
+    if (path === "/api/mesh/directives/claim") {
+      const sessionKey = url.searchParams.get("sessionKey");
+      const cwd = url.searchParams.get("cwd");
+      if (!sessionKey || !cwd) return json(res, 400, { error: "sessionKey and cwd are required" });
+      void claimSteeringDirective(store, { sessionKey, cwd })
+        .then((result) => json(res, 200, result))
+        .catch((error) => {
+          log.debug("directive claim failed open", String(error));
+          json(res, 200, { directive: null });
+        });
+      return;
+    }
     if (path === "/api/mesh/gate") {
       const cwd = url.searchParams.get("cwd");
       const targetPath = url.searchParams.get("path");
@@ -823,6 +836,10 @@ function handleApi(
       case "/api/mesh/projects":
         return json(res, 200, {
           projects: PrivacyControlStore.forStore(store).read().meshProjectConsents,
+        });
+      case "/api/mesh/sources":
+        return json(res, 200, {
+          sources: PrivacyControlStore.forStore(store).read().meshContextSourceConsents,
         });
       case "/api/egress":
         return json(
@@ -996,6 +1013,34 @@ function handleApi(
       });
       return json(res, 200, { projects: control.meshProjectConsents });
     });
+  }
+  if (req.method === "PUT" && path === "/api/mesh/sources") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      if (!data || !Array.isArray(data.sources)) {
+        return json(res, 400, { error: "sources must be an array" });
+      }
+      const control = PrivacyControlStore.forStore(store).update({
+        meshContextSourceConsents: data.sources as PrivacyControl["meshContextSourceConsents"],
+      });
+      return json(res, 200, { sources: control.meshContextSourceConsents });
+    });
+  }
+  const directiveAck = /^\/api\/mesh\/directives\/([^/]+)\/ack$/.exec(path);
+  if (req.method === "POST" && directiveAck?.[1]) {
+    let id: string;
+    try {
+      id = decodeURIComponent(directiveAck[1]);
+    } catch {
+      return json(res, 400, { error: "invalid directive id" });
+    }
+    void acknowledgeSteeringDirective(store, id)
+      .then((result) => json(res, 200, result))
+      .catch((error) => {
+        log.debug("directive ack reporting failed open", String(error));
+        json(res, 200, { ok: true });
+      });
+    return;
   }
   if (req.method === "PUT" && path === "/api/runtime/resources") {
     return readBody(req, res, (body) => {

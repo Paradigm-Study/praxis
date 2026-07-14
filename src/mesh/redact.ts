@@ -6,7 +6,7 @@
  * the second fence, not the first.
  */
 
-import type { MeshFrame, WorkFrame } from "./types.ts";
+import type { ContextFrame, MeshFrame, WorkFrame } from "./types.ts";
 
 export interface RedactOptions {
   /** Hard cap on output length (redactor may truncate). */
@@ -102,9 +102,69 @@ export function redactWorkFrame(frame: WorkFrame): WorkFrame {
   };
 }
 
+/** Explicit v1 whitelist projection. Local consent selectors can never cross it. */
+export function redactContextFrame(frame: ContextFrame): ContextFrame {
+  const sessionKey = safeOpaqueId(frame.sessionKey);
+  const sourceId = safeOpaqueId(frame.source.id) ?? "invalid";
+  return {
+    v: 1,
+    id: frame.id,
+    kind: "context_frame",
+    person: frame.person,
+    device: frame.device,
+    ts: frame.ts,
+    source: {
+      kind: frame.source.kind,
+      id: sourceId,
+      ...(frame.source.label
+        ? { label: redactText(frame.source.label, { maxChars: 200 }) }
+        : {}),
+    },
+    signal: frame.signal,
+    summary: redactText(frame.summary, { maxChars: 500 }),
+    status: frame.status,
+    entities: frame.entities.slice(0, 32).flatMap((entity) => {
+      const key = safeOpaqueId(entity.key);
+      return key
+        ? [{
+            kind: entity.kind,
+            key,
+            ...(entity.label
+              ? { label: redactText(entity.label, { maxChars: 200 }) }
+              : {}),
+          }]
+        : [];
+    }),
+    artifacts: frame.artifacts.slice(0, 64)
+      .filter((artifact) => !isSecretArtifactPath(artifact.path))
+      .map((artifact) => ({
+        repo: artifact.repo,
+        path: artifact.path,
+        ...(safeBranch(artifact.branch) ? { branch: safeBranch(artifact.branch) } : {}),
+      })),
+    links: frame.links.slice(0, 32).flatMap((link) => {
+      const targetId = safeOpaqueId(link.targetId);
+      return targetId
+        ? [{
+            relation: link.relation,
+            targetId,
+            reason: redactText(link.reason, { maxChars: 240 }),
+          }]
+        : [];
+    }),
+    uncertainty: frame.uncertainty.slice(0, 16)
+      .map((value) => redactText(value, { maxChars: 240 })),
+    claimsTouched: frame.claimsTouched.slice(0, 64).filter(isSafeReference),
+    evidenceRefs: frame.evidenceRefs.slice(0, 64)
+      .filter((value) => /^[a-f0-9]{64}$/.test(value)),
+    ...(sessionKey ? { sessionKey } : {}),
+  };
+}
+
 /** Whitelist and redact either v0 relay frame before network OR retry disk. */
 export function redactMeshFrame(frame: MeshFrame): MeshFrame {
   if (frame.kind === "workframe") return redactWorkFrame(frame);
+  if (frame.kind === "context_frame") return redactContextFrame(frame);
   return {
     v: 0,
     kind: "card_event",

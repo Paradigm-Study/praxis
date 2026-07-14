@@ -81,8 +81,88 @@ export interface BoardroomLifecycle {
   specCriteria: SpecCriterion[];
 }
 
+// ---------------------------------------------------------------------------
+// ContextFrame v1 — source-neutral, privacy-minimized team knowledge
+// ---------------------------------------------------------------------------
+
+export type ContextFrameSourceKind =
+  | "meeting"
+  | "document"
+  | "agent_session";
+
+/** Read models may fold legacy repository frames alongside v1 sources. */
+export type ContextSourceKind = "repository" | ContextFrameSourceKind;
+
+export type ContextFrameStatus = "active" | "done";
+
+export type ContextSignalKind =
+  | "activity"
+  | "decision"
+  | "requirement"
+  | "risk"
+  | "question"
+  | "handoff";
+
+export type ContextEntityKind =
+  | "initiative"
+  | "goal"
+  | "ticket"
+  | "topic"
+  | "customer"
+  | "feature";
+
+export type ContextLinkKind =
+  | "supports"
+  | "depends_on"
+  | "blocks"
+  | "updates"
+  | "duplicates";
+
+export interface ContextSourceRef {
+  kind: ContextFrameSourceKind;
+  /** Stable opaque source identity. Never a raw URL, local path, or title. */
+  id: string;
+  label?: string;
+}
+
+export interface ContextEntityRef {
+  kind: ContextEntityKind;
+  key: string;
+  label?: string;
+}
+
+export interface ContextLink {
+  relation: ContextLinkKind;
+  targetId: string;
+  reason: string;
+}
+
+/**
+ * Additive v1 record for work that is not safely correlated by repository
+ * identity alone. Local source selectors are deliberately absent.
+ */
+export interface ContextFrame {
+  v: 1;
+  id: string;
+  kind: "context_frame";
+  person: string;
+  device: string;
+  ts: string;
+  source: ContextSourceRef;
+  signal: ContextSignalKind;
+  summary: string;
+  status: ContextFrameStatus;
+  entities: ContextEntityRef[];
+  artifacts: WorkFrameArtifact[];
+  links: ContextLink[];
+  uncertainty: string[];
+  claimsTouched: string[];
+  evidenceRefs: string[];
+  sessionKey?: string;
+}
+
 /** Anything POSTable to the relay's /outbox/:person. */
-export type MeshFrame = WorkFrame | BoardroomLifecycle;
+export type MeshFrame = WorkFrame | BoardroomLifecycle | ContextFrame;
 
 // ---------------------------------------------------------------------------
 // BriefPayload — GET /brief response (relay) / GET /api/brief (studio)
@@ -116,6 +196,75 @@ export interface BriefPayload {
   teammates: BriefTeammate[];
   lockedSpecs: BriefLockedSpec[];
   recentDecisions: BriefRecentDecision[];
+}
+
+// ---------------------------------------------------------------------------
+// Cross-source coordination read model (GET /v1/coordination)
+// ---------------------------------------------------------------------------
+
+export interface KnowledgeActivity {
+  id: string;
+  seq: number;
+  person: string;
+  ts: string;
+  sourceKinds: ContextSourceKind[];
+  sourceId: string;
+  sourceLabel?: string;
+  signal: ContextSignalKind;
+  summary: string;
+  status: WorkFrameStatus;
+  entities: ContextEntityRef[];
+  artifacts: WorkFrameArtifact[];
+  sessionKey?: string;
+}
+
+export interface KnowledgeRelationship {
+  id: string;
+  fromId: string;
+  toId: string;
+  kind: "related" | "overlap" | "dependency" | "impact" | "duplicate";
+  score: number;
+  reasons: Array<{
+    kind: "shared_entity" | "shared_terms" | "artifact_overlap" | "explicit_link";
+    detail: string;
+    weight: number;
+  }>;
+  ts: string;
+}
+
+export interface KnowledgeInitiative {
+  id: string;
+  label: string;
+  activityIds: string[];
+  people: string[];
+  sourceKinds: ContextSourceKind[];
+  updatedAt: string;
+}
+
+export interface CoordinationAction {
+  id: number;
+  person: string;
+  targets: string[];
+  triggerClass: string;
+  ts: string;
+  severity: "info" | "warn" | "urgent";
+  message: string;
+  evidence: string[];
+  receipts: Array<{
+    channel: "team_feed" | "boardroom" | "agent";
+    status: "delivered" | "failed" | "skipped";
+    attemptedAt: string;
+    error?: string;
+  }>;
+  verdict?: string;
+}
+
+export interface CoordinationPayload {
+  generatedAt: string;
+  activities: KnowledgeActivity[];
+  relationships: KnowledgeRelationship[];
+  initiatives: KnowledgeInitiative[];
+  actions: CoordinationAction[];
 }
 
 // ---------------------------------------------------------------------------

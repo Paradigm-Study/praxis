@@ -46,6 +46,8 @@ test("Studio health is minimal while reads and mutations require bearer auth", a
     assert.deepEqual(await health.json(), { ok: true });
 
     assert.equal((await fetch(`${base}/api/status`)).status, 401);
+    assert.equal((await fetch(`${base}/api/mesh/sources`)).status, 401);
+    assert.equal((await fetch(`${base}/api/mesh/directives/claim?sessionKey=session-1&cwd=/tmp`)).status, 401);
     assert.equal((await fetch(`${base}/api/mesh/gate?cwd=/tmp&path=/tmp/file.ts`)).status, 401);
     assert.equal((await fetch(`${base}/api/mesh/gate?cwd=/tmp&path=/tmp/file.ts`, {
       headers: { authorization: "Bearer wrong-token" },
@@ -81,6 +83,50 @@ test("Studio health is minimal while reads and mutations require bearer auth", a
     assert.deepEqual(await (await fetch(`${base}/api/mesh/projects`, { headers: authorized })).json(), {
       projects: [{ workspaceRoot: "/Users/alice/work/app", project: "acme/app" }],
     });
+
+    const sourceMutation = await fetch(`${base}/api/mesh/sources`, {
+      method: "PUT",
+      headers: { ...authorized, "content-type": "application/json", origin: base },
+      body: JSON.stringify({
+        sources: [{
+          id: "meeting-1",
+          kind: "meeting",
+          localSelector: "Secret local title",
+          sharedLabel: "Team sync",
+          initiativeIds: ["initiative-1"],
+          enabled: true,
+        }],
+      }),
+    });
+    assert.equal(sourceMutation.status, 200);
+    const expectedSources = {
+      sources: [{
+        id: "meeting-1",
+        kind: "meeting",
+        localSelector: "Secret local title",
+        sharedLabel: "Team sync",
+        initiativeIds: ["initiative-1"],
+        enabled: true,
+      }],
+    };
+    assert.deepEqual(await sourceMutation.json(), expectedSources);
+    assert.deepEqual(
+      await (await fetch(`${base}/api/mesh/sources`, { headers: authorized })).json(),
+      expectedSources,
+    );
+
+    const emptyClaim = await fetch(
+      `${base}/api/mesh/directives/claim?sessionKey=session-1&cwd=/Users/alice/work/app`,
+      { headers: authorized },
+    );
+    assert.equal(emptyClaim.status, 200);
+    assert.deepEqual(await emptyClaim.json(), { directive: null });
+    const ack = await fetch(`${base}/api/mesh/directives/coordination%3A1/ack`, {
+      method: "POST",
+      headers: { ...authorized, origin: base },
+    });
+    assert.equal(ack.status, 200);
+    assert.deepEqual(await ack.json(), { ok: true });
   } finally {
     await close(server);
     store.close();
@@ -98,6 +144,10 @@ test("team gate stays disabled when Studio has no local bearer token", async () 
   try {
     assert.equal(
       (await fetch(`http://127.0.0.1:${port}/api/mesh/gate?cwd=/tmp&path=/tmp/file.ts`)).status,
+      403,
+    );
+    assert.equal(
+      (await fetch(`http://127.0.0.1:${port}/api/mesh/directives/claim?sessionKey=session-1&cwd=/tmp`)).status,
       403,
     );
   } finally {

@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import type { Store } from "../storage/index.ts";
 import type { Claim } from "../core/types.ts";
-import type { BriefPayload, LifecycleStage } from "../mesh/types.ts";
+import type { BriefPayload, CoordinationPayload, LifecycleStage } from "../mesh/types.ts";
 import { retrieveForTask } from "../agent/retrieveForTask.ts";
 import { redactText } from "../mesh/redact.ts";
 import { logger } from "../core/log.ts";
@@ -16,6 +16,7 @@ import {
   safeRepoRelativePath,
 } from "../mesh/projectConsent.ts";
 import { normalizeRepoUrl } from "../mesh/workframe.ts";
+import { normalizeCoordinationPayload } from "../mesh/coordination.ts";
 import {
   decisionHasSubstantiveEvidence,
   questionWasResolved,
@@ -73,6 +74,8 @@ export interface StudioBrief extends BriefPayload {
   episodeGoal: string;
   topClaims: Claim[];
   openQuestions: BriefOpenQuestion[];
+  /** Additive v1 cross-source read model; omitted when sharing is disabled. */
+  coordination?: CoordinationPayload;
 }
 
 const EMPTY_MESH: BriefPayload = { teammates: [], lockedSpecs: [], recentDecisions: [] };
@@ -88,16 +91,73 @@ export async function buildBrief(
   opts: BriefOptions = {},
 ): Promise<StudioBrief> {
   const episodeGoal = latestEpisodeGoal(store);
+  const project = resolveBriefProject(store, opts);
+  const auditor = EgressAuditor.forStore(store);
+  const coordinationEnabled = PrivacyControlStore.forStore(store).read()
+    .meshContextSourceConsents.some((consent) => consent.enabled);
+  const [mesh, coordination] = await Promise.all([
+    fetchMeshBrief(opts, auditor, project),
+    coordinationEnabled && project
+      ? fetchMeshCoordination(opts, auditor)
+      : Promise.resolve(undefined),
+  ]);
   return {
-    ...(await fetchMeshBrief(
-      opts,
-      EgressAuditor.forStore(store),
-      resolveBriefProject(store, opts),
-    )),
+    ...mesh,
+    ...(coordination ? { coordination } : {}),
     episodeGoal,
     topClaims: relevantClaims(store, episodeGoal, opts.cwd),
     openQuestions: undeliveredQuestions(store),
   };
+}
+
+async function fetchMeshCoordination(
+  opts: BriefOptions,
+  auditor: EgressAuditor,
+): Promise<CoordinationPayload | undefined> {
+  const rawUrl = process.env.PRAXIS_MESH_URL;
+  const token = process.env.PRAXIS_MESH_TOKEN;
+  const person = safeMeshWireIdentity(process.env.PRAXIS_PERSON);
+  const teamId = safeMeshWireIdentity(process.env.PRAXIS_MESH_TEAM_ID);
+  const deviceId = safeMeshWireIdentity(process.env.PRAXIS_MESH_DEVICE_ID);
+  if (!rawUrl || !token || !person || !teamId || !deviceId) return undefined;
+  const url = safeMeshRelayBaseUrl(rawUrl);
+  if (!url) return undefined;
+  const params = new URLSearchParams({ person });
+  const fetchFn = opts.fetchFn ?? fetch;
+  try {
+    const response = await fetchFn(`${url.replace(/\/+$/, "")}/v1/coordination?${params}`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-mesh-team-id": teamId,
+        "x-mesh-device-id": deviceId,
+      },
+      signal: AbortSignal.timeout(2_000),
+      redirect: "error",
+    });
+    if (!response.ok) throw new Error(`http ${response.status}`);
+    const coordination = normalizeCoordinationPayload(await boundedMeshJson(response));
+    if (!coordination) throw new Error("invalid coordination response");
+    auditor.record({
+      destination: url,
+      purpose: "mesh_coordination",
+      categories: ["person", "work_metadata"],
+      bytes: Buffer.byteLength(params.toString()),
+      outcome: "succeeded",
+      status: response.status,
+    });
+    return coordination;
+  } catch (error) {
+    auditor.record({
+      destination: url,
+      purpose: "mesh_coordination",
+      categories: ["person", "work_metadata"],
+      bytes: Buffer.byteLength(params.toString()),
+      outcome: "failed",
+      error: String(error),
+    });
+    log.debug(`relay /v1/coordination unavailable (${String(error)})`);
+    return undefined;
+  }
 }
 
 /** Resolve a hook/API hint to exactly one currently consented mesh project. */

@@ -26,6 +26,21 @@ export interface MeshProjectConsent {
   project: string;
 }
 
+export type MeshContextSourceKind = "meeting" | "document" | "agent_session";
+
+/**
+ * Active-team sharing grant. `localSelector` is evaluated only on this device
+ * and is intentionally not part of any mesh wire type or egress audit body.
+ */
+export interface MeshContextSourceConsent {
+  id: string;
+  kind: MeshContextSourceKind;
+  localSelector: string;
+  sharedLabel?: string;
+  initiativeIds: string[];
+  enabled: boolean;
+}
+
 export interface PrivacyControl {
   version: typeof PRIVACY_CONTROL_VERSION;
   mode: PrivacyMode;
@@ -38,6 +53,8 @@ export interface PrivacyControl {
   screenshotConsent: boolean;
   meshProjects: string[];
   meshProjectConsents: MeshProjectConsent[];
+  /** Default-off grants projected by Desktop for the currently active team. */
+  meshContextSourceConsents: MeshContextSourceConsent[];
   updatedAt: string;
 }
 
@@ -82,6 +99,7 @@ export function defaultPrivacyControl(now = new Date().toISOString()): PrivacyCo
     screenshotConsent: false,
     meshProjects: [],
     meshProjectConsents: [],
+    meshContextSourceConsents: [],
     updatedAt: now,
   };
 }
@@ -130,6 +148,53 @@ function grantedMeshProjectConsents(value: unknown): MeshProjectConsent[] {
   }));
 }
 
+function safeOpaque(value: unknown, max = 120): string | undefined {
+  if (typeof value !== "string" || value.length > max) return undefined;
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) ? value : undefined;
+}
+
+function meshContextSourceConsents(value: unknown): MeshContextSourceConsent[] {
+  if (!Array.isArray(value)) return [];
+  const out: MeshContextSourceConsent[] = [];
+  const seen = new Set<string>();
+  for (const item of value.slice(0, 256)) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    const id = safeOpaque(raw.id);
+    const kind = raw.kind;
+    const selector = typeof raw.localSelector === "string"
+      ? raw.localSelector.trim()
+      : "";
+    if (
+      !id
+      || (kind !== "meeting" && kind !== "document" && kind !== "agent_session")
+      || selector === ""
+      || selector.length > 2_048
+      || /[\u0000-\u001f\u007f]/.test(selector)
+      || seen.has(id)
+    ) continue;
+    seen.add(id);
+    const sharedLabel = typeof raw.sharedLabel === "string"
+      ? raw.sharedLabel.replace(/\s+/g, " ").trim().slice(0, 200)
+      : "";
+    const initiativeIds = Array.isArray(raw.initiativeIds)
+      ? [...new Set(raw.initiativeIds.flatMap((entry) => {
+          const safe = safeOpaque(entry);
+          return safe ? [safe] : [];
+        }))].slice(0, 32)
+      : [];
+    out.push({
+      id,
+      kind,
+      localSelector: selector,
+      ...(sharedLabel ? { sharedLabel } : {}),
+      initiativeIds,
+      enabled: raw.enabled === true,
+    });
+  }
+  return out;
+}
+
 /** Parse a persisted/user-supplied control without letting missing fields weaken defaults. */
 export function normalizePrivacyControl(
   value: unknown,
@@ -168,6 +233,9 @@ export function normalizePrivacyControl(
     // are deliberately dropped and must be confirmed once under V2.
     meshProjectConsents: input.version === PRIVACY_CONTROL_VERSION
       ? meshProjectConsents(input.meshProjectConsents)
+      : [],
+    meshContextSourceConsents: input.version === PRIVACY_CONTROL_VERSION
+      ? meshContextSourceConsents(input.meshContextSourceConsents)
       : [],
     updatedAt: typeof input.updatedAt === "string" ? input.updatedAt : now,
   };
@@ -270,6 +338,9 @@ export class PrivacyControlStore {
       meshProjectConsents: patch.meshProjectConsents === undefined
         ? current.meshProjectConsents
         : grantedMeshProjectConsents(patch.meshProjectConsents),
+      meshContextSourceConsents: patch.meshContextSourceConsents === undefined
+        ? current.meshContextSourceConsents
+        : meshContextSourceConsents(patch.meshContextSourceConsents),
     });
   }
 }

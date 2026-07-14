@@ -20,6 +20,7 @@ import { defaultDataDir, type Store } from "../storage/index.ts";
 import { redactMeshFrame } from "./redact.ts";
 import type { MeshFrame, WorkFrame, WorkFrameStatus } from "./types.ts";
 import { episodeToWorkFrame, normalizeRepoUrl } from "./workframe.ts";
+import { episodeToContextFrames, isContextFrameCurrentlyConsented } from "./contextFrame.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
 import { PrivacyControlStore } from "../privacy/control.ts";
 import { sha256 } from "../core/hash.ts";
@@ -73,6 +74,8 @@ export interface MeshPublisherOptions {
    * allowlist (or explicit activation when no allowlist exists).
    */
   currentProjectConsent?: (project: string) => boolean;
+  /** Re-check the source grant for v1 records immediately before send/retry. */
+  currentContextConsent?: (frame: Extract<MeshFrame, { kind: "context_frame" }>) => boolean;
   /** Defaults to ~/.config/praxis/mesh.json. */
   configPath?: string;
   /** Defaults to the Praxis data directory's mesh outbox spool. */
@@ -165,11 +168,11 @@ function parseMeshFrame(value: unknown): MeshFrame | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const candidate = value as Record<string, unknown>;
   if (
-    candidate.v !== 0
-    || (candidate.kind !== "workframe" && candidate.kind !== "card_event")
+    (candidate.v !== 0 && candidate.v !== 1)
+    || (candidate.kind !== "workframe" && candidate.kind !== "card_event" && candidate.kind !== "context_frame")
     || typeof candidate.person !== "string"
     || typeof candidate.device !== "string"
-    || typeof candidate.project !== "string"
+    || (candidate.kind !== "context_frame" && typeof candidate.project !== "string")
   ) {
     return undefined;
   }
@@ -224,6 +227,9 @@ function sameSpoolScope(left: MeshSpoolScope, right: MeshSpoolScope): boolean {
 }
 
 function idempotencyKeyForFrame(frame: MeshFrame, body: string): string {
+  if (frame.kind === "context_frame" && /^[A-Za-z0-9._:-]{1,120}$/.test(frame.id)) {
+    return `praxis:context:${frame.id}`;
+  }
   if (frame.kind === "workframe" && /^[A-Za-z0-9._:-]{1,120}$/.test(frame.id)) {
     return `praxis:${frame.id}`;
   }
@@ -316,6 +322,7 @@ export class MeshPublisher {
   protected projects: string[] | undefined;
   protected projectContext: ((episode: Episode) => MeshEpisodeProject | undefined) | undefined;
   protected currentProjectConsent: (project: string) => boolean;
+  protected currentContextConsent: (frame: Extract<MeshFrame, { kind: "context_frame" }>) => boolean;
   protected spoolPath: string;
   protected spoolScope: MeshSpoolScope;
   protected requestTimeoutMs: number;
@@ -370,6 +377,7 @@ export class MeshPublisher {
           }
         : (project) => this.projectIsAllowed(project)
     );
+    this.currentContextConsent = opts.currentContextConsent ?? (() => false);
     this.spoolScope = {
       teamId: this.teamId ?? null,
       person: this.person,
@@ -419,6 +427,13 @@ export class MeshPublisher {
             project,
           )
         : () => false,
+      currentContextConsent: store
+        ? (frame) => process.env.PRAXIS_MESH_TEAM_ID !== undefined
+          && isContextFrameCurrentlyConsented(
+            PrivacyControlStore.forStore(store).read(),
+            frame,
+          )
+        : () => false,
       ...(process.env.PRAXIS_MESH_TEAM_ID && {
         teamId: process.env.PRAXIS_MESH_TEAM_ID,
       }),
@@ -457,26 +472,43 @@ export class MeshPublisher {
           ? { project: this.project, repoRoot: process.cwd() }
           : undefined
       );
-      if (!context) {
+      let frame: WorkFrame | undefined;
+      if (context) {
+        frame = episodeToWorkFrame(episode, {
+          person: this.person,
+          device: this.device,
+          project: context.project,
+          store: this.store,
+          status,
+          repoRoot: context.repoRoot,
+          ...(context.sessionKey ? { sessionKey: context.sessionKey } : {}),
+        });
+        try {
+          await this.publish(frame);
+        } catch (error) {
+          log.warn("mesh frame publish unexpectedly threw", errorMessage(error));
+        }
+      } else {
         log.debug("mesh episode has no explicitly consented workspace project");
-        return undefined;
       }
 
-      const frame = episodeToWorkFrame(episode, {
-        person: this.person,
-        device: this.device,
-        project: context.project,
-        store: this.store,
-        status,
-        repoRoot: context.repoRoot,
-        ...(context.sessionKey ? { sessionKey: context.sessionKey } : {}),
-      });
-      try {
-        await this.publish(frame);
-      } catch (error) {
-        // publish itself is fail-open, but keep the episode hook safe even if
-        // an injected implementation violates that contract.
-        log.warn("mesh frame publish unexpectedly threw", errorMessage(error));
+      if (this.store) {
+        const control = PrivacyControlStore.forStore(this.store).read();
+        const contextFrames = episodeToContextFrames(episode, {
+          person: this.person,
+          device: this.device,
+          store: this.store,
+          control,
+          status: status === "active" ? "active" : "done",
+          ...(context ? { project: context } : {}),
+        });
+        for (const contextFrame of contextFrames) {
+          try {
+            await this.publish(contextFrame);
+          } catch (error) {
+            log.warn("mesh context frame publish unexpectedly threw", errorMessage(error));
+          }
+        }
       }
       return frame;
     } catch (error) {
@@ -510,7 +542,7 @@ export class MeshPublisher {
         person: this.person,
         device: this.device,
       }));
-      if (!outbound) return { ok: false, error: "frame has an unsafe project or artifact path" };
+      if (!outbound) return { ok: false, error: "frame has an unsafe identity or artifact path" };
       try {
         await this.flushSpool();
       } catch (error) {
@@ -519,8 +551,8 @@ export class MeshPublisher {
         log.warn("mesh spool flush failed open", errorMessage(error));
       }
 
-      if (!this.currentProjectConsent(outbound.project)) {
-        return { ok: false, error: "project is not currently consented" };
+      if (!this.frameIsCurrentlyConsented(outbound)) {
+        return { ok: false, error: "frame is not currently consented" };
       }
 
       const attempt = await this.postFrame(outbound);
@@ -552,6 +584,12 @@ export class MeshPublisher {
   private projectIsAllowed(project: string): boolean {
     if (this.projects === undefined) return true;
     return projectInList(project, this.projects);
+  }
+
+  private frameIsCurrentlyConsented(frame: MeshFrame): boolean {
+    return frame.kind === "context_frame"
+      ? this.currentContextConsent(frame)
+      : this.currentProjectConsent(frame.project);
   }
 
   private async flushSpool(): Promise<void> {
@@ -586,8 +624,8 @@ export class MeshPublisher {
         retained.push(record);
         continue;
       }
-      if (!this.currentProjectConsent(frame.project)) {
-        log.debug("dropping spooled mesh frame whose project consent was revoked");
+      if (!this.frameIsCurrentlyConsented(frame)) {
+        log.debug("dropping spooled mesh frame whose consent was revoked");
         continue;
       }
 
@@ -625,7 +663,7 @@ export class MeshPublisher {
     // fields and secret-shaped strings never serialize).
     const outbound = this.safeOutboundFrame(redactMeshFrame(frame));
     if (!outbound) {
-      return { ok: false, error: "frame has an unsafe project or artifact path", networkFailure: false };
+      return { ok: false, error: "frame has an unsafe identity or artifact path", networkFailure: false };
     }
     const body = JSON.stringify(outbound);
     if (Buffer.byteLength(body) > MAX_MESH_FRAME_BYTES) {
@@ -639,7 +677,7 @@ export class MeshPublisher {
         categories: ["work_metadata", "artifact_paths", "evidence_hashes"],
         bytes: Buffer.byteLength(body),
         digest: sha256(body),
-        redaction: "mesh-v0",
+        redaction: outbound.kind === "context_frame" ? "mesh-v1" : "mesh-v0",
         outcome,
         ...(status !== undefined ? { status } : {}),
         ...(error ? { error } : {}),
@@ -727,8 +765,39 @@ export class MeshPublisher {
   }
 
   private safeOutboundFrame(frame: MeshFrame): MeshFrame | undefined {
+    if (!Number.isFinite(Date.parse(frame.ts)) || frame.ts.length > 64) return undefined;
+    if (frame.kind === "context_frame") {
+      const safeOpaque = (value: string, max = 120): boolean =>
+        value.length <= max && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value);
+      const sourceKinds = new Set(["meeting", "document", "agent_session"]);
+      const signals = new Set(["activity", "decision", "requirement", "risk", "question", "handoff"]);
+      const statuses = new Set(["active", "done"]);
+      const entityKinds = new Set(["initiative", "goal", "ticket", "topic", "customer", "feature"]);
+      const linkKinds = new Set(["supports", "depends_on", "blocks", "updates", "duplicates"]);
+      if (
+        !safeOpaque(frame.id)
+        || !safeOpaque(frame.source.id)
+        || !sourceKinds.has(frame.source.kind)
+        || !signals.has(frame.signal)
+        || !statuses.has(frame.status)
+        || frame.summary.length > 500
+        || frame.entities.some((entity) => !entityKinds.has(entity.kind) || !safeOpaque(entity.key))
+        || frame.links.some((link) =>
+          !linkKinds.has(link.relation) || !safeOpaque(link.targetId) || link.reason.length > 240
+        )
+      ) return undefined;
+      const artifacts: typeof frame.artifacts = [];
+      for (const artifact of frame.artifacts) {
+        const repo = normalizeMeshProjectIdentity(artifact.repo);
+        const path = safeRepoRelativePath(artifact.path);
+        if (!repo || !path) return undefined;
+        artifacts.push({ ...artifact, repo, path });
+      }
+      return { ...frame, artifacts };
+    }
+
     const project = normalizeMeshProjectIdentity(frame.project);
-    if (!project || !Number.isFinite(Date.parse(frame.ts)) || frame.ts.length > 64) return undefined;
+    if (!project) return undefined;
     if (frame.kind === "workframe") {
       if (
         !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(frame.id)
