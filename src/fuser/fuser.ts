@@ -120,6 +120,18 @@ function summarize(actions: ActionEvent[]): string {
   const c = countBy(actions);
   const parts: string[] = [];
   const n = (k: string) => c.get(k) ?? 0;
+  const spans = (count: number) => `${count} ${count === 1 ? "span" : "spans"}`;
+
+  // Voice is timeline activity, not background corroboration. Keep it at the
+  // front of the factual summary so a meeting remains visible even when screen,
+  // agent, or filesystem actions happened at the same time. Audio actions are
+  // spans, not distinct meetings: silence can split one call into many actions.
+  if (n("attended_meeting"))
+    parts.push(`meeting conversation (${spans(n("attended_meeting"))})`);
+  if (n("spoke_aloud"))
+    parts.push(`nearby speech (${spans(n("spoke_aloud"))})`);
+  if (n("listened_audio"))
+    parts.push(`listened to audio (${spans(n("listened_audio"))})`);
 
   if (n("submitted_message"))
     parts.push(`submitted ${n("submitted_message")} message(s)`);

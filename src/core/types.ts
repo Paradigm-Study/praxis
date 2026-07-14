@@ -127,6 +127,7 @@ export type ActionType =
   | "answered_question"
   | "taught_learner"
   | "attended_meeting"
+  | "spoke_aloud"
   | "listened_audio";
 
 export const ACTION_TYPES: readonly ActionType[] = [
@@ -152,6 +153,7 @@ export const ACTION_TYPES: readonly ActionType[] = [
   "answered_question",
   "taught_learner",
   "attended_meeting",
+  "spoke_aloud",
   "listened_audio",
 ];
 
