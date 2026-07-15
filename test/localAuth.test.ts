@@ -150,6 +150,14 @@ test("team gate stays disabled when Studio has no local bearer token", async () 
       (await fetch(`http://127.0.0.1:${port}/api/mesh/directives/claim?sessionKey=session-1&cwd=/tmp`)).status,
       403,
     );
+    assert.equal(
+      (await fetch(`http://127.0.0.1:${port}/api/mesh/verify`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project: "acme/app" }),
+      })).status,
+      403,
+    );
   } finally {
     await close(server);
     store.close();

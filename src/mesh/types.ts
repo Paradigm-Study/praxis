@@ -3,10 +3,11 @@
  * (praxis, boardroom, mesh) implements EXACTLY. Do not extend these shapes
  * without bumping `v`; the relay and conductor parse them as-is.
  *
- * Privacy invariant (non-negotiable): nothing in a WorkFrame or
- * BoardroomLifecycle may carry raw events, blobs, screen/audio content, or
- * prompt/response bodies. `intent` is redacted text; `evidenceRefs` are bare
- * sha256 hashes that resolve ONLY on the owner's machine.
+ * Privacy invariant (non-negotiable): nothing in a WorkFrame,
+ * BoardroomLifecycle, or SyncVerification may carry raw events, blobs,
+ * screen/audio content, or prompt/response bodies. `intent` is redacted text;
+ * `evidenceRefs` are bare sha256 hashes that resolve ONLY on the owner's
+ * machine.
  */
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,24 @@ export interface WorkFrame {
   evidenceRefs: string[];
   /** Optional agent session id. */
   sessionKey?: string;
+}
+
+// ---------------------------------------------------------------------------
+// SyncVerification — content-free proof that one credential reached the relay
+// ---------------------------------------------------------------------------
+
+/**
+ * This deliberately carries no project, intent, artifacts, evidence, or local
+ * consent selector. Praxis gates it against a saved project locally; the relay
+ * only needs the authenticated person/device and receipt timestamp.
+ */
+export interface SyncVerification {
+  v: 0;
+  kind: "sync_verification";
+  person: string;
+  device: string;
+  /** ISO-8601. */
+  ts: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +181,7 @@ export interface ContextFrame {
 }
 
 /** Anything POSTable to the relay's /outbox/:person. */
-export type MeshFrame = WorkFrame | BoardroomLifecycle | ContextFrame;
+export type MeshFrame = WorkFrame | BoardroomLifecycle | ContextFrame | SyncVerification;
 
 // ---------------------------------------------------------------------------
 // BriefPayload — GET /brief response (relay) / GET /api/brief (studio)

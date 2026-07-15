@@ -6,7 +6,7 @@
  * the second fence, not the first.
  */
 
-import type { ContextFrame, MeshFrame, WorkFrame } from "./types.ts";
+import type { ContextFrame, MeshFrame, SyncVerification, WorkFrame } from "./types.ts";
 
 export interface RedactOptions {
   /** Hard cap on output length (redactor may truncate). */
@@ -161,10 +161,22 @@ export function redactContextFrame(frame: ContextFrame): ContextFrame {
   };
 }
 
+/** Exact content-free whitelist for the first-sync readiness receipt. */
+export function redactSyncVerification(frame: SyncVerification): SyncVerification {
+  return {
+    v: 0,
+    kind: "sync_verification",
+    person: frame.person,
+    device: frame.device,
+    ts: frame.ts,
+  };
+}
+
 /** Whitelist and redact either v0 relay frame before network OR retry disk. */
 export function redactMeshFrame(frame: MeshFrame): MeshFrame {
   if (frame.kind === "workframe") return redactWorkFrame(frame);
   if (frame.kind === "context_frame") return redactContextFrame(frame);
+  if (frame.kind === "sync_verification") return redactSyncVerification(frame);
   return {
     v: 0,
     kind: "card_event",

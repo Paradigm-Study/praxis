@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
-import type { Store } from "../storage/index.ts";
+import { defaultDataDir, type Store } from "../storage/index.ts";
 import type {
   ActionEvent,
   BoundaryReason,
@@ -26,6 +26,11 @@ import { acknowledgeSteeringDirective, claimSteeringDirective } from "./directiv
 import { handleBrowserIngest } from "./browserIngest.ts";
 import { createMcpRouter } from "../mcp/router.ts";
 import { isAllowedOrigin } from "../mcp/protocol.ts";
+import { MeshPublisher } from "../mesh/publisher.ts";
+import {
+  isMeshProjectConsented,
+  normalizeMeshProjectIdentity,
+} from "../mesh/projectConsent.ts";
 import { buildGraph } from "../memory/graph.ts";
 import { applyCorrections } from "../memory/consolidate.ts";
 import { logger } from "../core/log.ts";
@@ -91,6 +96,11 @@ const CLAIM_PROVENANCES = new Set<ClaimProvenance>([
   "human_reviewed",
 ]);
 
+export interface StudioOptions {
+  /** Injectable for focused local-API tests; undefined uses the live env. */
+  meshPublisher?: MeshPublisher | null;
+}
+
 function correctionTargetExists(
   store: Store,
   targetKind: CorrectionTarget,
@@ -152,11 +162,19 @@ const MIME: Record<string, string> = {
 };
 
 /** Launch Praxis Studio: a JSON API over the ledger + a static web UI. */
-export function startStudio(store: Store, port = 4319): Server {
+export function startStudio(store: Store, port = 4319, options: StudioOptions = {}): Server {
   const webDir = join(import.meta.dirname, "web");
   const clients = new Set<ServerResponse>();
   const mcpRouter = createMcpRouter(store);
   const localToken = validateLocalToken(process.env.PRAXIS_LOCAL_TOKEN);
+  const meshPublisher = options.meshPublisher === undefined
+    ? MeshPublisher.fromEnv(store, {
+        // Studio and capture are separate processes. A dedicated spool keeps
+        // their atomic NDJSON rewrites from racing while retaining the same
+        // bounded/redacted retry behavior for verification requests.
+        spoolPath: join(defaultDataDir(), "mesh-verification-outbox.ndjson"),
+      })
+    : options.meshPublisher ?? undefined;
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
@@ -165,7 +183,12 @@ export function startStudio(store: Store, port = 4319): Server {
       if (req.method === "GET" && path === "/api/health") {
         return json(res, 200, { ok: true });
       }
-      if ((path === "/api/mesh/gate" || path.startsWith("/api/mesh/directives")) && !localToken) {
+      if (
+        (path === "/api/mesh/gate"
+          || path === "/api/mesh/verify"
+          || path.startsWith("/api/mesh/directives"))
+        && !localToken
+      ) {
         return json(res, 403, { error: "team agent endpoints require local authentication" });
       }
       if (
@@ -184,7 +207,7 @@ export function startStudio(store: Store, port = 4319): Server {
         return;
       }
       if (path === "/api/stream") return handleStream(req, res, clients);
-      if (path.startsWith("/api/")) return handleApi(store, req, res, path, url);
+      if (path.startsWith("/api/")) return handleApi(store, req, res, path, url, meshPublisher);
       return serveStatic(webDir, path, res);
     } catch (err) {
       json(res, 500, { error: String(err) });
@@ -779,6 +802,7 @@ function handleApi(
   res: ServerResponse,
   path: string,
   url: URL,
+  meshPublisher?: MeshPublisher,
 ): void {
   // --- reads ---
   if (req.method === "GET") {
@@ -991,6 +1015,42 @@ function handleApi(
   }
 
   // --- writes: privacy/capture control -----------------------------------
+  if (req.method === "POST" && path === "/api/mesh/verify") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      if (!data || typeof data.project !== "string") {
+        return json(res, 400, { ok: false, error: "project is required" });
+      }
+      if (
+        typeof data.teamId !== "string"
+        || typeof data.deviceId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,120}$/.test(data.teamId)
+        || !/^[A-Za-z0-9._:-]{1,120}$/.test(data.deviceId)
+      ) {
+        return json(res, 400, { ok: false, error: "team relay scope is required" });
+      }
+      const project = normalizeMeshProjectIdentity(data.project);
+      if (!project) {
+        return json(res, 400, { ok: false, error: "project identity is invalid" });
+      }
+      const consents = PrivacyControlStore.forStore(store).read().meshProjectConsents;
+      if (!isMeshProjectConsented(consents, project)) {
+        return json(res, 403, { ok: false, error: "project is not currently consented" });
+      }
+      if (!meshPublisher) {
+        return json(res, 503, { ok: false, error: "team relay is not configured" });
+      }
+      if (meshPublisher.teamId !== data.teamId || meshPublisher.device !== data.deviceId) {
+        return json(res, 409, { ok: false, error: "team relay scope changed; restart required" });
+      }
+      void meshPublisher.publishVerification(project, { teamId: data.teamId, deviceId: data.deviceId })
+        .then((result) => json(res, result.ok ? 200 : 502, result))
+        .catch((error) => {
+          log.debug("mesh verification publish failed open", String(error));
+          json(res, 502, { ok: false, error: "team relay did not confirm verification" });
+        });
+    });
+  }
   if (req.method === "PUT" && path === "/api/privacy") {
     return readBody(req, res, (body) => {
       const data = safeParse(body);

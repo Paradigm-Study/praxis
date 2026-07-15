@@ -18,7 +18,7 @@ import type { Episode } from "../core/types.ts";
 import { logger } from "../core/log.ts";
 import { defaultDataDir, type Store } from "../storage/index.ts";
 import { redactMeshFrame } from "./redact.ts";
-import type { MeshFrame, WorkFrame, WorkFrameStatus } from "./types.ts";
+import type { MeshFrame, SyncVerification, WorkFrame, WorkFrameStatus } from "./types.ts";
 import { episodeToWorkFrame, normalizeRepoUrl } from "./workframe.ts";
 import { episodeToContextFrames, isContextFrameCurrentlyConsented } from "./contextFrame.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
@@ -86,6 +86,11 @@ export interface MeshPublisherOptions {
   auditor?: EgressAuditor;
 }
 
+export interface MeshPublisherEnvironmentOptions {
+  /** Optional dedicated retry spool for another publisher process/surface. */
+  spoolPath?: string;
+}
+
 export interface MeshEpisodeProject {
   project: string;
   repoRoot: string;
@@ -123,9 +128,16 @@ interface MeshSpoolRecord {
   spoolVersion: 1;
   scope: MeshSpoolScope;
   frame: MeshFrame;
+  /** Local-only selector used to re-check consent for a content-free receipt. */
+  consentProject?: string;
 }
 
 type MeshSpoolLine = MeshSpoolRecord | MeshFrame;
+
+interface PendingMeshFrame {
+  frame: MeshFrame;
+  consentProject?: string;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -169,10 +181,20 @@ function parseMeshFrame(value: unknown): MeshFrame | undefined {
   const candidate = value as Record<string, unknown>;
   if (
     (candidate.v !== 0 && candidate.v !== 1)
-    || (candidate.kind !== "workframe" && candidate.kind !== "card_event" && candidate.kind !== "context_frame")
+    || (
+      candidate.kind !== "workframe"
+      && candidate.kind !== "card_event"
+      && candidate.kind !== "context_frame"
+      && candidate.kind !== "sync_verification"
+    )
     || typeof candidate.person !== "string"
     || typeof candidate.device !== "string"
-    || (candidate.kind !== "context_frame" && typeof candidate.project !== "string")
+    || (
+      candidate.kind !== "context_frame"
+      && candidate.kind !== "sync_verification"
+      && typeof candidate.project !== "string"
+    )
+    || (candidate.kind === "sync_verification" && candidate.v !== 0)
   ) {
     return undefined;
   }
@@ -209,6 +231,15 @@ function parseSpoolLine(value: unknown): MeshSpoolLine | undefined {
   }
   const frame = parseMeshFrame(candidate.frame);
   if (!frame || frame.person !== scope.person || frame.device !== scope.device) return undefined;
+  const consentProject = typeof candidate.consentProject === "string"
+    ? normalizeMeshProjectIdentity(candidate.consentProject)
+    : undefined;
+  if (
+    (frame.kind === "sync_verification" && !consentProject)
+    || (frame.kind !== "sync_verification" && candidate.consentProject !== undefined)
+  ) {
+    return undefined;
+  }
   return {
     spoolVersion: 1,
     scope: {
@@ -217,6 +248,7 @@ function parseSpoolLine(value: unknown): MeshSpoolLine | undefined {
       device: scope.device,
     },
     frame,
+    ...(consentProject ? { consentProject } : {}),
   };
 }
 
@@ -226,7 +258,17 @@ function sameSpoolScope(left: MeshSpoolScope, right: MeshSpoolScope): boolean {
     && left.device === right.device;
 }
 
-function idempotencyKeyForFrame(frame: MeshFrame, body: string): string {
+function idempotencyKeyForFrame(
+  frame: MeshFrame,
+  body: string,
+  credentialFingerprint: string,
+): string {
+  if (frame.kind === "sync_verification") {
+    // Readiness is tied to the rotating credential that actually reached the
+    // relay. The raw token is never persisted or sent in this metadata header;
+    // rotating it necessarily produces a distinct retry namespace.
+    return `praxis:sync:${sha256(`${credentialFingerprint}\0${body}`)}`;
+  }
   if (frame.kind === "context_frame" && /^[A-Za-z0-9._:-]{1,120}$/.test(frame.id)) {
     return `praxis:context:${frame.id}`;
   }
@@ -323,6 +365,7 @@ export class MeshPublisher {
   protected projectContext: ((episode: Episode) => MeshEpisodeProject | undefined) | undefined;
   protected currentProjectConsent: (project: string) => boolean;
   protected currentContextConsent: (frame: Extract<MeshFrame, { kind: "context_frame" }>) => boolean;
+  protected credentialFingerprint: string;
   protected spoolPath: string;
   protected spoolScope: MeshSpoolScope;
   protected requestTimeoutMs: number;
@@ -335,6 +378,7 @@ export class MeshPublisher {
    */
   #queue: Promise<unknown> = Promise.resolve();
   #spoolRecordCount: number | undefined;
+  #verificationFrames = new Map<string, SyncVerification>();
 
   constructor(opts: MeshPublisherOptions) {
     const configPath = opts.configPath
@@ -383,6 +427,12 @@ export class MeshPublisher {
       person: this.person,
       device: this.device,
     };
+    this.credentialFingerprint = sha256(JSON.stringify({
+      teamId: this.teamId ?? null,
+      person: this.person,
+      device: this.device,
+      token: this.token,
+    }));
     const spoolScopeId = sha256(JSON.stringify(this.spoolScope)).slice(0, 16);
     this.spoolPath = opts.spoolPath
       ?? join(defaultDataDir(), `mesh-outbox-spool-${spoolScopeId}.ndjson`);
@@ -396,7 +446,10 @@ export class MeshPublisher {
    * PRAXIS_MESH_DEVICE_ID.
    * Returns undefined when any of the three is unset (feature off).
    */
-  static fromEnv(store?: Store): MeshPublisher | undefined {
+  static fromEnv(
+    store?: Store,
+    options: MeshPublisherEnvironmentOptions = {},
+  ): MeshPublisher | undefined {
     const url = process.env.PRAXIS_MESH_URL;
     const token = process.env.PRAXIS_MESH_TOKEN;
     const person = process.env.PRAXIS_PERSON;
@@ -434,6 +487,7 @@ export class MeshPublisher {
             frame,
           )
         : () => false,
+      ...(options.spoolPath ? { spoolPath: options.spoolPath } : {}),
       ...(process.env.PRAXIS_MESH_TEAM_ID && {
         teamId: process.env.PRAXIS_MESH_TEAM_ID,
       }),
@@ -460,6 +514,40 @@ export class MeshPublisher {
    */
   async onEpisodeActive(episode: Episode): Promise<WorkFrame | undefined> {
     return this.publishEpisode(episode, "active");
+  }
+
+  /**
+   * Publish a content-free receipt proving this credential reached the relay.
+   * `project` remains a local consent selector and is retained only alongside
+   * a retry spool record; it is never part of the Mesh wire body.
+   */
+  async publishVerification(
+    project: string,
+    expectedScope: { teamId: string; deviceId: string },
+  ): Promise<PublishResult> {
+    const canonicalProject = normalizeMeshProjectIdentity(project);
+    if (!canonicalProject) {
+      return { ok: false, error: "project identity is invalid" };
+    }
+    if (!this.currentProjectConsent(canonicalProject)) {
+      return { ok: false, error: "project is not currently consented" };
+    }
+    if (this.teamId !== expectedScope.teamId || this.device !== expectedScope.deviceId) {
+      return { ok: false, error: "team relay scope changed; restart required" };
+    }
+
+    let frame = this.#verificationFrames.get(canonicalProject);
+    if (!frame) {
+      frame = this.findSpooledVerification(canonicalProject) ?? {
+        v: 0,
+        kind: "sync_verification",
+        person: this.person,
+        device: this.device,
+        ts: new Date().toISOString(),
+      };
+      this.#verificationFrames.set(canonicalProject, frame);
+    }
+    return this.publishWithConsent(frame, canonicalProject);
   }
 
   private async publishEpisode(
@@ -532,7 +620,19 @@ export class MeshPublisher {
     return run;
   }
 
-  private async publishNow(frame: MeshFrame): Promise<PublishResult> {
+  private async publishWithConsent(
+    frame: SyncVerification,
+    consentProject: string,
+  ): Promise<PublishResult> {
+    const run = this.#queue.then(() => this.publishNow(frame, consentProject));
+    this.#queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async publishNow(frame: MeshFrame, consentProject?: string): Promise<PublishResult> {
     try {
       // The credential is bound to this publisher's person/device identity.
       // Canonicalize the wire record to the same identity as the relay path and
@@ -551,7 +651,7 @@ export class MeshPublisher {
         log.warn("mesh spool flush failed open", errorMessage(error));
       }
 
-      if (!this.frameIsCurrentlyConsented(outbound)) {
+      if (!this.frameIsCurrentlyConsented(outbound, consentProject)) {
         return { ok: false, error: "frame is not currently consented" };
       }
 
@@ -560,7 +660,7 @@ export class MeshPublisher {
         try {
           // Persist the exact redacted wire projection, never the richer caller
           // object. Retry storage is itself a privacy boundary.
-          this.appendToSpool(outbound);
+          this.appendToSpool(outbound, consentProject);
         } catch (error) {
           log.warn("mesh frame could not be written to spool", errorMessage(error));
         }
@@ -586,10 +686,13 @@ export class MeshPublisher {
     return projectInList(project, this.projects);
   }
 
-  private frameIsCurrentlyConsented(frame: MeshFrame): boolean {
-    return frame.kind === "context_frame"
-      ? this.currentContextConsent(frame)
-      : this.currentProjectConsent(frame.project);
+  private frameIsCurrentlyConsented(frame: MeshFrame, consentProject?: string): boolean {
+    if (frame.kind === "context_frame") return this.currentContextConsent(frame);
+    if (frame.kind === "sync_verification") {
+      const project = consentProject && normalizeMeshProjectIdentity(consentProject);
+      return project !== undefined && this.currentProjectConsent(project);
+    }
+    return this.currentProjectConsent(frame.project);
   }
 
   private async flushSpool(): Promise<void> {
@@ -617,19 +720,19 @@ export class MeshPublisher {
     const retained: MeshSpoolLine[] = [];
     for (let index = 0; index < records.length; index += 1) {
       const record = records[index]!;
-      const frame = this.frameForCurrentScope(record);
-      if (!frame) {
+      const pending = this.frameForCurrentScope(record);
+      if (!pending) {
         // Another team/person/device owns this durable record. Keep it intact;
         // the matching credential scope may flush it in a later process.
         retained.push(record);
         continue;
       }
-      if (!this.frameIsCurrentlyConsented(frame)) {
+      if (!this.frameIsCurrentlyConsented(pending.frame, pending.consentProject)) {
         log.debug("dropping spooled mesh frame whose consent was revoked");
         continue;
       }
 
-      const attempt = await this.postFrame(frame);
+      const attempt = await this.postFrame(pending.frame);
       if (!attempt.ok && attempt.networkFailure) {
         this.replaceSpool([...retained, ...records.slice(index)]);
         return;
@@ -642,9 +745,14 @@ export class MeshPublisher {
     this.replaceSpool(retained);
   }
 
-  private frameForCurrentScope(record: MeshSpoolLine): MeshFrame | undefined {
+  private frameForCurrentScope(record: MeshSpoolLine): PendingMeshFrame | undefined {
     if (isMeshSpoolRecord(record)) {
-      return sameSpoolScope(record.scope, this.spoolScope) ? record.frame : undefined;
+      return sameSpoolScope(record.scope, this.spoolScope)
+        ? {
+            frame: record.frame,
+            ...(record.consentProject ? { consentProject: record.consentProject } : {}),
+          }
+        : undefined;
     }
 
     // Legacy v0 spool lines had no credential scope. They are only safe to
@@ -652,8 +760,10 @@ export class MeshPublisher {
     // A hosted team must leave them quarantined because their tenant is
     // unknowable; guessing would recreate the cross-team leak this fence fixes.
     if (this.teamId !== undefined) return undefined;
-    return record.person === this.person && record.device === this.device
-      ? record
+    return record.kind !== "sync_verification"
+      && record.person === this.person
+      && record.device === this.device
+      ? { frame: record }
       : undefined;
   }
 
@@ -669,15 +779,21 @@ export class MeshPublisher {
     if (Buffer.byteLength(body) > MAX_MESH_FRAME_BYTES) {
       return { ok: false, error: "frame exceeds mesh size limit", networkFailure: false };
     }
-    const idempotencyKey = idempotencyKeyForFrame(outbound, body);
+    const idempotencyKey = idempotencyKeyForFrame(outbound, body, this.credentialFingerprint);
     const audit = (outcome: "succeeded" | "failed", status?: number, error?: string) =>
       this.auditor.record({
         destination: this.url,
         purpose: "mesh_publish",
-        categories: ["work_metadata", "artifact_paths", "evidence_hashes"],
+        categories: outbound.kind === "sync_verification"
+          ? ["sync_metadata"]
+          : ["work_metadata", "artifact_paths", "evidence_hashes"],
         bytes: Buffer.byteLength(body),
         digest: sha256(body),
-        redaction: outbound.kind === "context_frame" ? "mesh-v1" : "mesh-v0",
+        redaction: outbound.kind === "context_frame"
+          ? "mesh-v1"
+          : outbound.kind === "sync_verification"
+            ? "mesh-sync-v0"
+            : "mesh-v0",
         outcome,
         ...(status !== undefined ? { status } : {}),
         ...(error ? { error } : {}),
@@ -766,6 +882,7 @@ export class MeshPublisher {
 
   private safeOutboundFrame(frame: MeshFrame): MeshFrame | undefined {
     if (!Number.isFinite(Date.parse(frame.ts)) || frame.ts.length > 64) return undefined;
+    if (frame.kind === "sync_verification") return frame;
     if (frame.kind === "context_frame") {
       const safeOpaque = (value: string, max = 120): boolean =>
         value.length <= max && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value);
@@ -871,12 +988,42 @@ export class MeshPublisher {
     return lines;
   }
 
-  private appendToSpool(frame: MeshFrame): void {
+  /** Reuse one pending receipt body so repeated retries cannot grow the queue. */
+  private findSpooledVerification(consentProject: string): SyncVerification | undefined {
+    if (!existsSync(this.spoolPath)) return undefined;
+    for (const line of this.readBoundedSpoolLines().reverse()) {
+      try {
+        const record = parseSpoolLine(JSON.parse(line) as unknown);
+        if (
+          record
+          && isMeshSpoolRecord(record)
+          && sameSpoolScope(record.scope, this.spoolScope)
+          && record.consentProject === consentProject
+          && record.frame.kind === "sync_verification"
+        ) {
+          return record.frame;
+        }
+      } catch {
+        // Corrupt records remain isolated until the normal bounded rewrite.
+      }
+    }
+    return undefined;
+  }
+
+  private appendToSpool(frame: MeshFrame, consentProject?: string): void {
+    if (
+      frame.kind === "sync_verification"
+      && consentProject
+      && this.findSpooledVerification(consentProject)
+    ) {
+      return;
+    }
     this.prepareSpoolDir();
     const record: MeshSpoolRecord = {
       spoolVersion: 1,
       scope: { ...this.spoolScope },
       frame,
+      ...(frame.kind === "sync_verification" && consentProject ? { consentProject } : {}),
     };
     const line = `${JSON.stringify(record)}\n`;
     const lineBytes = Buffer.byteLength(line);

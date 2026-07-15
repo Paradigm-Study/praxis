@@ -16,8 +16,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Episode } from "../src/core/types.ts";
 import { MeshPublisher, resolveEpisodeProject } from "../src/mesh/publisher.ts";
-import type { BoardroomLifecycle, WorkFrame } from "../src/mesh/types.ts";
+import type { BoardroomLifecycle, SyncVerification, WorkFrame } from "../src/mesh/types.ts";
 import { PrivacyControlStore } from "../src/privacy/control.ts";
+import { EgressAuditor } from "../src/privacy/egress.ts";
 import { action, freshStore } from "./helpers.ts";
 
 interface RequestRecord {
@@ -243,6 +244,228 @@ test("publish posts a frame with the relay path and bearer token", async () => {
     });
   } finally {
     await close(server, relay.bound);
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("verification publishes the exact consent-gated content-free wire record", async () => {
+  const paths = tempPaths();
+  const store = freshStore();
+  const requests: RequestRecord[] = [];
+  let consented = false;
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push(fetchRequestRecord(input, init));
+    return jsonResponse({ ok: true, seq: 17 });
+  }) as typeof fetch;
+
+  try {
+    const publisher = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "secret-token",
+      person: "alice",
+      teamId: "team-praxis",
+      device: "device-praxis",
+      store,
+      fetchFn,
+      currentProjectConsent: (project) => consented && project === "acme/app",
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+
+    const scope = { teamId: "team-praxis", deviceId: "device-praxis" };
+    assert.deepEqual(await publisher.publishVerification("/Users/alice/private", scope), {
+      ok: false,
+      error: "project identity is invalid",
+    });
+    assert.deepEqual(await publisher.publishVerification("acme/app", scope), {
+      ok: false,
+      error: "project is not currently consented",
+    });
+    assert.equal(requests.length, 0, "no relay request is attempted before current consent");
+
+    consented = true;
+    assert.deepEqual(
+      await publisher.publishVerification("git@github.com:Acme/App.git", scope),
+      { ok: true, seq: 17 },
+    );
+    assert.equal(requests.length, 1);
+
+    assert.deepEqual(
+      await publisher.publishVerification("acme/app", { ...scope, teamId: "team-other" }),
+      { ok: false, error: "team relay scope changed; restart required" },
+    );
+    assert.equal(requests.length, 1, "a stale process scope cannot egress another team's project");
+    const request = requests[0]!;
+    const body = JSON.parse(request.body) as SyncVerification;
+    assert.match(request.idempotencyKey ?? "", /^praxis:sync:[a-f0-9]{64}$/);
+    assert.deepEqual(body, {
+      v: 0,
+      kind: "sync_verification",
+      person: "alice",
+      device: "device-praxis",
+      ts: body.ts,
+    });
+    assert.deepEqual(Object.keys(body).sort(), ["device", "kind", "person", "ts", "v"]);
+    assert.equal(request.body.includes("acme/app"), false, "the local consent selector never reaches the wire");
+    assert.equal(request.body.includes("secret-token"), false);
+    assert.ok(Number.isFinite(Date.parse(body.ts)));
+    assert.equal(request.teamId, "team-praxis");
+    assert.equal(request.deviceId, "device-praxis");
+    assert.equal(
+      EgressAuditor.forStore(store).recent(10).some((entry) =>
+        entry.purpose === "mesh_publish"
+        && entry.outcome === "succeeded"
+        && entry.redaction === "mesh-sync-v0"
+        && entry.categories.length === 1
+        && entry.categories[0] === "sync_metadata"
+      ),
+      true,
+    );
+    assert.equal(JSON.stringify(EgressAuditor.forStore(store).recent(10)).includes("secret-token"), false);
+  } finally {
+    store.close();
+    rmSync(paths.dir, { recursive: true, force: true });
+  }
+});
+
+test("verification retry keys survive restart and separate credential rotations without persisting tokens", async () => {
+  for (const rotateCredential of [false, true]) {
+    const paths = tempPaths();
+    const firstToken = "first-credential-secret";
+    const retryToken = rotateCredential ? "rotated-credential-secret" : firstToken;
+    const attempts: Array<{
+      body: SyncVerification;
+      key: string | null;
+      authorization: string | null;
+    }> = [];
+    const recordAttempt = (init?: RequestInit): void => {
+      attempts.push({
+        body: JSON.parse(String(init?.body)) as SyncVerification,
+        key: new Headers(init?.headers).get("idempotency-key"),
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+    };
+    const consent = (project: string): boolean => project === "acme/app" || project === "praxis";
+
+    try {
+      const offline = new MeshPublisher({
+        url: "https://relay.invalid",
+        token: firstToken,
+        person: "alice",
+        teamId: "team-praxis",
+        device: "device-praxis",
+        currentProjectConsent: consent,
+        fetchFn: (async (_input, init) => {
+          recordAttempt(init);
+          throw new Error("offline");
+        }) as typeof fetch,
+        configPath: paths.configPath,
+        spoolPath: paths.spoolPath,
+      });
+      const scope = { teamId: "team-praxis", deviceId: "device-praxis" };
+      assert.equal((await offline.publishVerification("acme/app", scope)).ok, false);
+      assert.equal((await offline.publishVerification("acme/app", scope)).ok, false);
+
+      const spoolText = readFileSync(paths.spoolPath, "utf8");
+      assert.equal(
+        spoolText.split(/\r?\n/).filter(Boolean).length,
+        1,
+        "repeated transient failures retain one verification receipt",
+      );
+      assert.equal(spoolText.includes(firstToken), false, "raw relay credential never reaches retry disk");
+      const queued = JSON.parse(spoolText.trim()) as {
+        consentProject: string;
+        frame: SyncVerification & Record<string, unknown>;
+      };
+      assert.equal(queued.consentProject, "acme/app", "local selector is retained for retry consent");
+      assert.deepEqual(queued.frame, attempts[0]!.body, "the exact redacted wire body is retained");
+      assert.equal("project" in queued.frame, false, "project never enters the wire frame");
+
+      const restarted = new MeshPublisher({
+        url: "https://relay.invalid",
+        token: retryToken,
+        person: "alice",
+        teamId: "team-praxis",
+        device: "device-praxis",
+        currentProjectConsent: consent,
+        fetchFn: (async (_input, init) => {
+          recordAttempt(init);
+          return jsonResponse({ ok: true, seq: attempts.length });
+        }) as typeof fetch,
+        configPath: paths.configPath,
+        spoolPath: paths.spoolPath,
+      });
+      assert.equal((await restarted.publishVerification("acme/app", scope)).ok, true);
+
+      assert.equal(attempts.length, 5);
+      assert.equal(
+        attempts.every((attempt) => JSON.stringify(attempt.body) === JSON.stringify(attempts[0]!.body)),
+        true,
+        "repeat and restart retries reuse the identical content-free body",
+      );
+      assert.match(attempts[0]!.key ?? "", /^praxis:sync:[a-f0-9]{64}$/);
+      assert.equal(new Set(attempts.slice(0, 3).map((attempt) => attempt.key)).size, 1);
+      assert.equal(new Set(attempts.slice(3).map((attempt) => attempt.key)).size, 1);
+      assert.equal(
+        attempts[3]!.key === attempts[0]!.key,
+        !rotateCredential,
+        "only credential rotation changes the verification retry namespace",
+      );
+      assert.equal(attempts[0]!.authorization, `Bearer ${firstToken}`);
+      assert.equal(attempts[3]!.authorization, `Bearer ${retryToken}`);
+      assert.equal((attempts[0]!.key ?? "").includes(firstToken), false);
+      assert.equal((attempts[3]!.key ?? "").includes(retryToken), false);
+      assert.equal(existsSync(paths.spoolPath), false);
+    } finally {
+      rmSync(paths.dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("verification spool retry re-checks its local project consent", async () => {
+  const paths = tempPaths();
+  let consented = true;
+  const delivered: Array<WorkFrame | SyncVerification> = [];
+  const currentConsent = (project: string): boolean =>
+    project === "other" || (consented && project === "acme/app");
+
+  try {
+    const offline = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "credential",
+      person: "alice",
+      teamId: "team-praxis",
+      device: "device-praxis",
+      currentProjectConsent: currentConsent,
+      fetchFn: (async () => { throw new Error("offline"); }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.equal((await offline.publishVerification("acme/app", {
+      teamId: "team-praxis",
+      deviceId: "device-praxis",
+    })).ok, false);
+    assert.equal(existsSync(paths.spoolPath), true);
+
+    consented = false;
+    const restarted = new MeshPublisher({
+      url: "https://relay.invalid",
+      token: "credential",
+      person: "alice",
+      teamId: "team-praxis",
+      device: "device-praxis",
+      currentProjectConsent: currentConsent,
+      fetchFn: (async (_input, init) => {
+        delivered.push(JSON.parse(String(init?.body)) as WorkFrame | SyncVerification);
+        return jsonResponse({ ok: true, seq: delivered.length });
+      }) as typeof fetch,
+      configPath: paths.configPath,
+      spoolPath: paths.spoolPath,
+    });
+    assert.equal((await restarted.publish({ ...frame("allowed-trigger"), project: "other" })).ok, true);
+    assert.deepEqual(delivered.map((item) => item.kind), ["workframe"]);
+    assert.equal(existsSync(paths.spoolPath), false, "revoked verification receipt is dropped");
+  } finally {
     rmSync(paths.dir, { recursive: true, force: true });
   }
 });
