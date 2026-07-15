@@ -5,9 +5,9 @@ import { MockObserver } from "../src/observer/observer.ts";
 import { decide } from "../src/agent/policy.ts";
 import { AgentLoop } from "../src/agent/loop.ts";
 import { makeSeededIdGen } from "../src/core/ids.ts";
-import { fullPipeline, freshStore, ingestFixtures } from "./helpers.ts";
+import { action, fullPipeline, freshStore, ingestFixtures } from "./helpers.ts";
 
-test("agent loop persists actionable decisions (not keep_observing) for the Studio", async () => {
+test("offline loop does not manufacture actionable decisions for the Studio", async () => {
   const store = freshStore();
   await ingestFixtures(store);
   // Wide window so the (dated) fixtures are reconstructed; mock observer.
@@ -18,10 +18,14 @@ test("agent loop persists actionable decisions (not keep_observing) for the Stud
   });
   const r = await loop.tick();
   assert.ok(r, "first tick should observe (not throttled)");
-  assert.notEqual(r.decision.kind, "keep_observing");
+  assert.notEqual(r.decision.kind, "ask_expert");
+  assert.notEqual(r.decision.kind, "mark_uncertainty");
   const recent = store.decisions.recent(5);
-  assert.ok(recent.length >= 1, "expected a persisted decision");
-  assert.equal(recent[0]!.kind, r.decision.kind);
+  assert.equal(
+    recent.some((decision) => decision.kind === "ask_expert" || decision.kind === "mark_uncertainty"),
+    false,
+    "offline reconstruction must not manufacture questions",
+  );
 
   // Idle/duplicate ticks must not pile up decision rows (throttle + stable ids).
   await loop.tick();
@@ -78,22 +82,62 @@ test("observer output is evidence-linked, never raw fact", async () => {
   assert.ok(obs.evidence.length >= 1, "observation must cite evidence");
   assert.equal(obs.model, "mock");
   assert.ok(obs.intent && obs.intent.length > 0);
-  assert.ok(obs.rejectedOptions.includes("video-only inference"));
-  assert.ok(obs.suggestedQuestion?.startsWith("I think you"));
+  assert.deepEqual(obs.acceptedOptions, []);
+  assert.deepEqual(obs.rejectedOptions, []);
+  assert.equal(obs.suggestedQuestion, undefined);
 });
 
-test("policy asks the expert when an action is uncertain", async () => {
-  const { store, episodes, graph, newId } = await fullPipeline();
-  const ep = episodes[0]!;
-  const bundle = bundleForEpisode(store, ep, newId);
-  const obs = await new MockObserver().observe(bundle, { episodeId: ep.id, newId });
+test("policy asks only when a semantic observation cites consequential activity", () => {
+  const grounded = action({
+    id: "action_decision",
+    action: "corrected_agent",
+    startTs: "2026-06-10T12:00:00.000Z",
+    text: "Use the evidence-backed approach",
+  });
+  const obs = {
+    id: "obs_semantic",
+    bundleId: "bundle_semantic",
+    acceptedOptions: [],
+    rejectedOptions: [],
+    uncertainty: ["The intended rollout order is unclear"],
+    suggestedQuestion: "Should the rollout happen before or after the migration?",
+    evidence: [grounded.id],
+    model: "semantic-test-observer",
+    createdTs: "2026-06-10T12:01:00.000Z",
+  };
   const decision = decide({
     observation: obs,
-    actions: store.actions.byIds(ep.actions),
-    claims: graph.claims,
+    actions: [grounded],
+    claims: [],
   });
   assert.equal(decision.kind, "ask_expert");
-  assert.ok(decision.question?.includes("Correct?"));
+  assert.equal(decision.question, obs.suggestedQuestion);
+});
+
+test("policy does not surface mock-observer uncertainty", () => {
+  const uncertain = action({
+    action: "edited_file",
+    startTs: "2026-06-10T12:00:00.000Z",
+    text: "src/index.ts",
+    confidence: 0.5,
+    uncertainty: ["weak evidence"],
+  });
+  const decision = decide({
+    observation: {
+      id: "obs_mock",
+      bundleId: "bundle_mock",
+      acceptedOptions: [],
+      rejectedOptions: [],
+      uncertainty: ["weak evidence"],
+      suggestedQuestion: "Was this file edit classified correctly?",
+      evidence: [uncertain.id],
+      model: "mock",
+      createdTs: "2026-06-10T12:01:00.000Z",
+    },
+    actions: [uncertain],
+    claims: [],
+  });
+  assert.equal(decision.kind, "keep_observing");
 });
 
 test("policy intervenes in learner mode when advisories exist", async () => {

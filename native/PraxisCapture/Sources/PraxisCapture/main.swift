@@ -12,9 +12,18 @@ func argValue(_ name: String, _ def: Double) -> Double {
 }
 
 func printPermissionStatus() {
-    let value: [String: Bool] = [
+    let transcription = Permissions.onDeviceTranscriptionState()
+    var onDeviceTranscription = ["status": transcription.status]
+    if let reason = transcription.reason {
+        onDeviceTranscription["reason"] = reason
+    }
+    let value: [String: Any] = [
         "screenRecording": Permissions.screenRecordingAllowed(),
         "accessibility": Permissions.accessibilityTrusted(),
+        "microphone": Permissions.microphoneAuthorization(),
+        "speechRecognition": Permissions.speechRecognitionAuthorization(),
+        "onDeviceSpeechLocales": transcription.locales,
+        "onDeviceTranscription": onDeviceTranscription,
     ]
     let data = try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
     FileHandle.standardOutput.write(data)

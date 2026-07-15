@@ -6,12 +6,27 @@ import type { StorageCipher } from "./crypto.ts";
 export interface EpisodeStore {
   put(e: Episode): void;
   putMany(episodes: Episode[]): void;
+  /** Atomically replace the complete derived episode projection. */
+  reconcileAll(episodes: Episode[]): void;
   get(id: string): Episode | undefined;
   all(): Episode[];
   byIds(ids: string[]): Episode[];
   latest(n?: number): Episode[];
+  /** Recent episode summaries for UI projection; payload_json is never read. */
+  recentProjection(n: number): Episode[];
+  /** Newest-first stable keyset page; payload_json is never read. */
+  pageAfter(limit: number, cursor?: EpisodeCursor): Episode[];
   count(): number;
 }
+
+export interface EpisodeCursor {
+  startTs: string;
+  id: string;
+}
+
+const PROJECTION_COLUMNS = `id, start_ts, end_ts, summary, goal,
+  evidence_action_ids, artifacts, decision_points, rejected_paths,
+  uncertainty, boundary_reason`;
 
 function rowToEpisode(row: Record<string, unknown>, cipher?: StorageCipher): Episode {
   return {
@@ -40,6 +55,20 @@ export function makeEpisodeStore(db: DatabaseSync, cipher?: StorageCipher): Epis
   );
   const byId = db.prepare(`SELECT * FROM episodes WHERE id = ?`);
   const counter = db.prepare(`SELECT COUNT(*) AS n FROM episodes`);
+  const remove = db.prepare(`DELETE FROM episodes WHERE id = ?`);
+  const firstPage = db.prepare(
+    `SELECT ${PROJECTION_COLUMNS}
+       FROM episodes
+      ORDER BY start_ts DESC, id DESC
+      LIMIT ?`,
+  );
+  const pageAfter = db.prepare(
+    `SELECT ${PROJECTION_COLUMNS}
+       FROM episodes
+      WHERE start_ts < ? OR (start_ts = ? AND id < ?)
+      ORDER BY start_ts DESC, id DESC
+      LIMIT ?`,
+  );
 
   function put(e: Episode): void {
     insert.run(
@@ -70,6 +99,23 @@ export function makeEpisodeStore(db: DatabaseSync, cipher?: StorageCipher): Epis
         throw err;
       }
     },
+    reconcileAll(episodes) {
+      const desired = new Set(episodes.map((episode) => episode.id));
+      db.exec("SAVEPOINT praxis_episode_reconcile");
+      try {
+        const existing = db.prepare(`SELECT id FROM episodes`).all() as Array<{ id: string }>;
+        for (const episode of episodes) put(episode);
+        for (const row of existing) if (!desired.has(row.id)) remove.run(row.id);
+        db.exec("RELEASE praxis_episode_reconcile");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK TO praxis_episode_reconcile; RELEASE praxis_episode_reconcile");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        throw error;
+      }
+    },
     get(id) {
       const row = byId.get(id) as Record<string, unknown> | undefined;
       return row ? rowToEpisode(row, cipher) : undefined;
@@ -92,6 +138,19 @@ export function makeEpisodeStore(db: DatabaseSync, cipher?: StorageCipher): Epis
         .prepare(`SELECT * FROM episodes ORDER BY start_ts DESC LIMIT ?`)
         .all(Math.floor(n)) as Record<string, unknown>[];
       return rows.map((row) => rowToEpisode(row, cipher)).reverse();
+    },
+    recentProjection(n) {
+      const rows = db
+        .prepare(`SELECT ${PROJECTION_COLUMNS} FROM episodes ORDER BY start_ts DESC, id DESC LIMIT ?`)
+        .all(Math.max(0, Math.floor(n))) as Record<string, unknown>[];
+      return rows.map((row) => rowToEpisode(row, cipher)).reverse();
+    },
+    pageAfter(limit, cursor) {
+      const bounded = Math.max(0, Math.floor(limit));
+      const rows = (cursor
+        ? pageAfter.all(cursor.startTs, cursor.startTs, cursor.id, bounded)
+        : firstPage.all(bounded)) as Record<string, unknown>[];
+      return rows.map((row) => rowToEpisode(row, cipher));
     },
     count() {
       return (counter.get() as { n: number }).n;

@@ -2,9 +2,11 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { fullPipeline, type Pipeline } from "./helpers.ts";
+import { freshStore, fullPipeline, type Pipeline } from "./helpers.ts";
 import { createMcpRouter } from "../src/mcp/router.ts";
 import {
+  handleMcpMessage,
+  isAllowedOrigin,
   isLoopback,
   PROTOCOL_VERSION,
   METHOD_NOT_FOUND,
@@ -14,6 +16,7 @@ import {
   type JsonRpcResponse,
   type ToolCallResult,
 } from "../src/mcp/protocol.ts";
+import { applyCorrections } from "../src/memory/consolidate.ts";
 
 /**
  * Full JSON-RPC round-trips over real HTTP against a seeded store: the router
@@ -138,6 +141,40 @@ test("get_playbook returns the same playbook the studio serves", async () => {
   assert.ok(pb.decisionRules.some((r) => /evidence-backed/.test(r.text)));
 });
 
+test("get_playbook exposes curated unresolved decision questions", () => {
+  const store = freshStore();
+  try {
+    const evidence = {
+      id: "mcp_question_action", type: "user_action" as const, action: "answered_question",
+      app: "Test", startTs: "2026-07-13T11:59:00.000Z", endTs: "2026-07-13T11:59:01.000Z",
+      confidence: 0.98, evidence: ["raw_mcp_question"],
+    };
+    store.actions.put(evidence);
+    store.decisions.put({
+      id: "decision_mcp_open",
+      kind: "ask_expert",
+      reason: "Needs human judgment",
+      question: "Should the installer include automatic updates?",
+      evidence: [evidence.id],
+      createdTs: "2026-07-13T12:00:00.000Z",
+    });
+    const result = handleMcpMessage(store, {
+      jsonrpc: "2.0",
+      id: 99,
+      method: "tools/call",
+      params: { name: "get_playbook", arguments: {} },
+    });
+    assert.equal(result.status, 200);
+    const toolResult = result.body?.result as ToolCallResult;
+    const playbook = toolJson(toolResult) as { openQuestions: string[] };
+    assert.deepEqual(playbook.openQuestions, [
+      "Should the installer include automatic updates?",
+    ]);
+  } finally {
+    store.close();
+  }
+});
+
 test("get_claims returns claims, respects kind filter and limit", async () => {
   const all = toolJson(await callTool("get_claims")) as Array<{ id: string; kind: string }>;
   assert.equal(all.length, pipeline.store.claims.count());
@@ -184,14 +221,34 @@ test("get_episodes returns the latest fused episodes", async () => {
 
 test("record_correction on a claim persists a confirmed Correction", async () => {
   const claim = pipeline.store.claims.all()[0]!;
-  const rec = toolJson(
-    await callTool("record_correction", {
-      claimId: claim.id,
-      verdict: "confirm",
-      note: "checked by hand",
-    }),
-  ) as { id: string; targetKind: string; targetId: string; verdict: string; note?: string };
+  let validationInWriterTransaction = false;
+  const getClaim = pipeline.store.claims.get;
+  pipeline.store.claims.get = (id) => {
+    if (id === claim.id) {
+      validationInWriterTransaction = pipeline.store.db.isTransaction;
+    }
+    return getClaim(id);
+  };
+  let rec: {
+    id: string;
+    targetKind: string;
+    targetId: string;
+    verdict: string;
+    note?: string;
+  };
+  try {
+    rec = toolJson(
+      await callTool("record_correction", {
+        claimId: claim.id,
+        verdict: "confirm",
+        note: "checked by hand",
+      }),
+    ) as typeof rec;
+  } finally {
+    pipeline.store.claims.get = getClaim;
+  }
 
+  assert.equal(validationInWriterTransaction, true);
   assert.match(rec.id, /^corr_/);
   assert.equal(rec.targetKind, "claim");
   assert.equal(rec.targetId, claim.id);
@@ -202,15 +259,70 @@ test("record_correction on a claim persists a confirmed Correction", async () =>
   assert.ok(stored, "correction not persisted");
   assert.equal(stored.targetId, claim.id);
   assert.equal(stored.verdict, "confirmed");
+  assert.equal(stored.origin, "agent");
+  const effective = applyCorrections([claim], [stored]);
+  assert.deepEqual(
+    effective,
+    [claim],
+    "an agent-reported confirmation cannot promote or rewrite its own claim",
+  );
+
+  const rejected = toolJson(
+    await callTool("record_correction", { claimId: claim.id, verdict: "reject" }),
+  ) as { id: string };
+  assert.equal(pipeline.store.corrections.get(rejected.id)?.origin, "agent");
+  const visible = toolJson(await callTool("get_claims", { limit: 100 })) as Array<{ id: string }>;
+  assert.equal(
+    visible.some((item) => item.id === claim.id),
+    true,
+    "an agent-reported rejection cannot suppress human-visible memory",
+  );
 });
 
 test("record_correction on an observation maps reject -> rejected", async () => {
+  pipeline.store.observations.put({
+    id: "obs_test1",
+    bundleId: "bundle_test1",
+    acceptedOptions: [],
+    rejectedOptions: [],
+    uncertainty: [],
+    evidence: [],
+    model: "test-observer",
+    createdTs: "2026-07-13T00:00:00.000Z",
+  });
   const rec = toolJson(
     await callTool("record_correction", { observationId: "obs_test1", verdict: "reject" }),
   ) as { id: string; targetKind: string; verdict: string };
   assert.equal(rec.targetKind, "observation");
   assert.equal(rec.verdict, "rejected");
   assert.equal(pipeline.store.corrections.get(rec.id)?.verdict, "rejected");
+  assert.equal(pipeline.store.corrections.get(rec.id)?.origin, "agent");
+});
+
+test("record_correction rejects nonexistent and ambiguous targets", async () => {
+  const missingClaim = await callTool("record_correction", {
+    claimId: "missing_claim",
+    verdict: "confirm",
+  });
+  assert.equal(missingClaim.isError, true);
+  assert.match(missingClaim.content[0]!.text, /not found/);
+
+  const missingObservation = await callTool("record_correction", {
+    observationId: "missing_observation",
+    verdict: "reject",
+  });
+  assert.equal(missingObservation.isError, true);
+  assert.match(missingObservation.content[0]!.text, /not found/);
+  assert.equal(pipeline.store.db.isTransaction, false, "missing targets roll back the writer lock");
+
+  const claim = pipeline.store.claims.all()[0]!;
+  const ambiguous = await callTool("record_correction", {
+    claimId: claim.id,
+    observationId: "obs_test1",
+    verdict: "confirm",
+  });
+  assert.equal(ambiguous.isError, true);
+  assert.match(ambiguous.content[0]!.text, /exactly one/);
 });
 
 // ---------------------------------------------------------------------------
@@ -334,6 +446,16 @@ test("a non-local Origin is refused with 403; local origins and no Origin pass",
   });
   assert.equal(local.status, 200);
   // No Origin at all (native MCP clients): covered by every other test here.
+});
+
+test("origin validation accepts only exact localhost or loopback IP literals", () => {
+  assert.equal(isAllowedOrigin("http://localhost:5173"), true);
+  assert.equal(isAllowedOrigin("https://127.0.0.1:7777"), true);
+  assert.equal(isAllowedOrigin("http://127.42.9.3"), true);
+  assert.equal(isAllowedOrigin("http://[::1]:5173"), true);
+  assert.equal(isAllowedOrigin("http://127.attacker.example"), false);
+  assert.equal(isAllowedOrigin("http://127.0.0.1.attacker.example"), false);
+  assert.equal(isAllowedOrigin("http://attacker.example"), false);
 });
 
 test("multibyte UTF-8 split across chunk boundaries is not corrupted", async () => {

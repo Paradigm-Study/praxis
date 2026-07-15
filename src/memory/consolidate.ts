@@ -1,4 +1,10 @@
 import type { Claim, Correction } from "../core/types.ts";
+import { explicitDirectiveConflict } from "../core/textOpposition.ts";
+
+/** Only an authenticated human-facing surface can author durable feedback. */
+export function isHumanCorrection(correction: Correction): boolean {
+  return correction.origin === "human";
+}
 
 /**
  * Consolidate raw claims into a tight profile — WITHOUT losing signal.
@@ -73,8 +79,10 @@ export interface ConsolidateOptions {
    * table is never touched:
    *   verdict "rejected" → the claim is dropped from the profile.
    *   verdict "edited"   → its text is replaced with the user's wording and its
-   *                        confidence floored to 0.9 (user-authored = strong).
-   *   verdict "confirmed"→ its confidence is floored to 0.9.
+   *                        confidence floored to 0.9 (user-authored = strong),
+   *                        and effective provenance becomes human-reviewed.
+   *   verdict "confirmed"→ its confidence is floored to 0.9 and effective
+   *                        provenance becomes human-reviewed.
    * Matched by `targetId === claim.id`.
    */
   corrections?: Correction[];
@@ -87,12 +95,13 @@ export interface ConsolidateOptions {
  * profile view and the evidence-coverage check apply exactly the same filter.
  */
 export function applyCorrections(claims: Claim[], corrections: Correction[] = []): Claim[] {
-  if (!corrections.length) return claims;
+  const humanCorrections = corrections.filter(isHumanCorrection);
+  if (!humanCorrections.length) return claims;
   const rejected = new Set<string>();
   const edited = new Map<string, string>();
   const confirmed = new Set<string>();
   // Last verdict per target wins (corrections are time-ordered).
-  for (const c of corrections) {
+  for (const c of humanCorrections) {
     if (c.verdict === "rejected") {
       rejected.add(c.targetId);
       edited.delete(c.targetId);
@@ -100,9 +109,11 @@ export function applyCorrections(claims: Claim[], corrections: Correction[] = []
     } else if (c.verdict === "edited" && c.correctedText) {
       edited.set(c.targetId, c.correctedText);
       rejected.delete(c.targetId);
+      confirmed.delete(c.targetId);
     } else if (c.verdict === "confirmed") {
       confirmed.add(c.targetId);
       rejected.delete(c.targetId);
+      edited.delete(c.targetId);
     }
   }
   const out: Claim[] = [];
@@ -110,14 +121,49 @@ export function applyCorrections(claims: Claim[], corrections: Correction[] = []
     if (rejected.has(claim.id)) continue; // suppressed from the view
     const newText = edited.get(claim.id);
     if (newText) {
-      out.push({ ...claim, text: newText, confidence: Math.max(claim.confidence, 0.9) });
+      out.push({
+        ...claim,
+        text: newText,
+        confidence: Math.max(claim.confidence, 0.9),
+        provenance: "human_reviewed",
+      });
     } else if (confirmed.has(claim.id)) {
-      out.push({ ...claim, confidence: Math.max(claim.confidence, 0.9) });
+      out.push({
+        ...claim,
+        confidence: Math.max(claim.confidence, 0.9),
+        provenance: "human_reviewed",
+      });
     } else {
       out.push(claim);
     }
   }
   return out;
+}
+
+/**
+ * Claims safe to use as agent guidance. Provisional one-episode inferences stay
+ * visible in Memory for review, but cannot steer future work as established
+ * behavior. Repeated evidence and explicit human corrections are trusted.
+ */
+export function trustedClaims(
+  claims: Claim[],
+  corrections: Correction[] = [],
+): Claim[] {
+  const claimCorrections = corrections.filter(
+    (item) => item.targetKind === "claim" && isHumanCorrection(item),
+  );
+  const latest = new Map<string, Correction>();
+  for (const correction of claimCorrections) latest.set(correction.targetId, correction);
+  return applyCorrections(claims, claimCorrections).filter((claim) => {
+    const reviewed = latest.get(claim.id);
+    return (
+      new Set(claim.evidenceEpisodes).size >= 2 ||
+      claim.provenance === "explicit_user_rule" ||
+      claim.provenance === "human_reviewed" ||
+      reviewed?.verdict === "confirmed" ||
+      reviewed?.verdict === "edited"
+    );
+  });
 }
 
 const STOP = new Set([
@@ -133,15 +179,18 @@ const STOP = new Set([
  * ("logs"/"log", "inspecting"/"inspection" → "insp") without a full stemmer.
  * Distinct claims share ~no content words, so they stay apart regardless.
  */
-function contentWords(text: string): Set<string> {
-  const words = text
+function contentTerms(text: string): string[] {
+  return text
     .toLowerCase()
     .replace(/^(prefers?|avoids?)\s*:?\s*/i, "")
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
     .filter((w) => w.length > 2 && !STOP.has(w))
-    .map((w) => w.slice(0, 4)); // crude stem
-  return new Set(words);
+    .map((w) => (w.length <= 5 ? w.replace(/s$/, "") : w).slice(0, 4)); // crude stem
+}
+
+function contentWords(text: string): Set<string> {
+  return new Set(contentTerms(text));
 }
 
 function jaccard(a: Set<string>, b: Set<string>): number {
@@ -149,6 +198,55 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   let inter = 0;
   for (const w of a) if (b.has(w)) inter++;
   return inter / (a.size + b.size - inter);
+}
+
+function orderedOverlap(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) return 0;
+  const rows = Array.from({ length: left.length + 1 }, () =>
+    Array<number>(right.length + 1).fill(0),
+  );
+  for (let i = 1; i <= left.length; i += 1) {
+    for (let j = 1; j <= right.length; j += 1) {
+      rows[i]![j] = left[i - 1] === right[j - 1]
+        ? rows[i - 1]![j - 1]! + 1
+        : Math.max(rows[i - 1]![j]!, rows[i]![j - 1]!);
+    }
+  }
+  return rows[left.length]![right.length]! / Math.max(left.length, right.length);
+}
+
+/** Conservative lexical + ordered similarity for recurring memory claims. */
+export function claimTextSimilarity(left: string, right: string): number {
+  if (explicitDirectiveConflict(left, right)) return 0;
+  const polarity = (value: string): -1 | 0 | 1 => {
+    const withoutNotOnly = value.replace(/\bnot\s+only\b/gi, "");
+    if (/\b(?:avoid(?:s|ed)?|never|not|cannot|can't)\b/i.test(withoutNotOnly)) return -1;
+    if (/\b(?:prefer(?:s|red)?|always|require(?:s|d)?|use(?:s|d)?|choose(?:s|n)?)\b/i.test(value)) return 1;
+    return 0;
+  };
+  const leftPolarity = polarity(left);
+  const rightPolarity = polarity(right);
+  if (leftPolarity !== 0 && rightPolarity !== 0 && leftPolarity !== rightPolarity) return 0;
+  const directional = (value: string): [string, string] | undefined => {
+    const match = value.toLowerCase().match(
+      /\b(?:prefer(?:s|red)?|choose(?:s)?|use(?:s)?)\s+([a-z0-9._+-]+)[\s\S]{0,80}?\b(?:over|instead of|rather than)\s+([a-z0-9._+-]+)/i,
+    );
+    return match ? [match[1]!, match[2]!] : undefined;
+  };
+  const leftDirection = directional(left);
+  const rightDirection = directional(right);
+  if (
+    leftDirection &&
+    rightDirection &&
+    leftDirection[0] === rightDirection[1] &&
+    leftDirection[1] === rightDirection[0]
+  ) return 0;
+  const leftTerms = contentTerms(left);
+  const rightTerms = contentTerms(right);
+  return Math.min(
+    jaccard(new Set(leftTerms), new Set(rightTerms)),
+    orderedOverlap(leftTerms, rightTerms),
+  );
 }
 
 function noisyOr(ps: number[]): number {
@@ -162,7 +260,7 @@ interface Cluster {
 }
 
 export function consolidate(claims: Claim[], opts: ConsolidateOptions = {}): ProfileEntry[] {
-  const threshold = opts.threshold ?? 0.45;
+  const threshold = opts.threshold ?? 0.6;
   const durableEpisodes = opts.durableEpisodes ?? 2;
 
   // Fold in the user's corrections (drop rejected, strengthen edited/confirmed)
@@ -181,7 +279,8 @@ export function consolidate(claims: Claim[], opts: ConsolidateOptions = {}): Pro
     let bestSim = 0;
     for (const c of clusters) {
       if (c.kind !== claim.kind) continue;
-      const sim = jaccard(words, c.words);
+      const representative = c.members[0]?.text ?? "";
+      const sim = claimTextSimilarity(claim.text, representative);
       if (sim > bestSim) {
         bestSim = sim;
         best = c;

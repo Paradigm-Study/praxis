@@ -166,6 +166,7 @@ const RENDER = {
     for (const x of list) {
       c.appendChild(h(`<div class="row">
         <span class="pill">${esc(x.verdict)}</span>
+        <span class="atype">${esc(x.origin === "human" ? "human review" : x.origin === "agent" ? "agent suggestion" : "legacy receipt")}</span>
         <span class="atype">${esc(x.targetKind)}</span>
         <span class="atext">${esc(x.targetId)} ${x.note ? "· " + esc(x.note) : ""}</span>
         <span class="app">${esc(x.createdTs)}</span>

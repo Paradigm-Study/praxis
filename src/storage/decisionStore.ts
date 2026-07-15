@@ -5,6 +5,8 @@ import type { StorageCipher } from "./crypto.ts";
 
 export interface DecisionStore {
   put(d: StoredDecision): void;
+  get(id: string): StoredDecision | undefined;
+  all(): StoredDecision[];
   recent(n?: number): StoredDecision[];
   maxRowid(): number;
   sinceRowid(rowid: number, limit?: number): { maxRowid: number; decisions: StoredDecision[] };
@@ -29,6 +31,7 @@ export function makeDecisionStore(db: DatabaseSync, cipher?: StorageCipher): Dec
        (id, kind, reason, question, evidence, observation_id, claim_id, created_ts)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
+  const byId = db.prepare(`SELECT * FROM decisions WHERE id = ?`);
 
   return {
     put(d) {
@@ -42,6 +45,16 @@ export function makeDecisionStore(db: DatabaseSync, cipher?: StorageCipher): Dec
         d.claimId ?? null,
         d.createdTs,
       );
+    },
+    get(id) {
+      const row = byId.get(id) as Record<string, unknown> | undefined;
+      return row ? rowToDecision(row, cipher) : undefined;
+    },
+    all() {
+      const rows = db
+        .prepare(`SELECT * FROM decisions ORDER BY created_ts ASC, id ASC`)
+        .all() as Record<string, unknown>[];
+      return rows.map((row) => rowToDecision(row, cipher));
     },
     recent(n = 50) {
       const rows = db

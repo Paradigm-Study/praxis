@@ -127,6 +127,7 @@ export type ActionType =
   | "answered_question"
   | "taught_learner"
   | "attended_meeting"
+  | "spoke_aloud"
   | "listened_audio";
 
 export const ACTION_TYPES: readonly ActionType[] = [
@@ -152,6 +153,7 @@ export const ACTION_TYPES: readonly ActionType[] = [
   "answered_question",
   "taught_learner",
   "attended_meeting",
+  "spoke_aloud",
   "listened_audio",
 ];
 
@@ -305,6 +307,13 @@ export const CLAIM_KINDS: readonly ClaimKind[] = [
   "unresolved_question",
 ];
 
+export type ClaimProvenance =
+  | "observed_pattern"
+  | "model_inference"
+  | "explicit_user_rule"
+  | "user_answer"
+  | "human_reviewed";
+
 export interface Claim {
   /** `claim_...` */
   id: string;
@@ -313,6 +322,8 @@ export interface Claim {
   confidence: number;
   /** Episode ids that evidence this claim. */
   evidenceEpisodes: string[];
+  /** How the canonical claim entered memory; never infer trust from wording. */
+  provenance?: ClaimProvenance;
   createdTs: string;
   updatedTs: string;
 }
@@ -372,11 +383,17 @@ export type CorrectionTarget =
   | "observation"
   | "decision";
 export type CorrectionVerdict = "confirmed" | "rejected" | "edited";
+/**
+ * Trust boundary for correction receipts. Only `human` receipts may alter
+ * derived memory. `agent` receipts are auditable suggestions; `legacy` rows
+ * predate origin tracking and fail closed until a person reviews them again.
+ */
+export type CorrectionOrigin = "human" | "agent" | "legacy";
 
 /**
- * A user's verdict on an interpretation. This is the "I think you did X because
- * Y — correct?" loop. Corrections feed back into the graph (a rejection becomes
- * a `contradicted_by_correction` edge; a confirmation raises confidence).
+ * A verdict receipt on an interpretation. Human receipts power the "I think
+ * you did X because Y — correct?" loop and may feed back into the graph. Agent
+ * suggestions and ambiguous legacy receipts are retained for audit only.
  */
 export interface Correction {
   /** `corr_...` */
@@ -384,6 +401,8 @@ export interface Correction {
   targetKind: CorrectionTarget;
   targetId: string;
   verdict: CorrectionVerdict;
+  /** Who authored the verdict; missing/unknown values are never human trust. */
+  origin?: CorrectionOrigin;
   /** Replacement text when verdict is "edited". */
   correctedText?: string;
   note?: string;

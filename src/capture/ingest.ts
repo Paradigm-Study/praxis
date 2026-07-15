@@ -36,9 +36,12 @@ export function makeIngest(store: Store, opts: IngestOptions = {}): Ingest {
   const runtime = opts.runtime ?? RuntimeStatusStore.forStore(store);
 
   function ingest(input: RawEventInput): RawEvent {
+    // Evaluate path/app/window privacy against the original source shape. The
+    // content redactor may replace an excluded diff/URL with a marker, but that
+    // must never make an otherwise blocked event eligible for persistence.
+    const decision = capturePolicyDecision(privacy.read(), input);
     input = filterSensitiveCapture(input);
     const ts = input.ts ?? nowIso();
-    const decision = capturePolicyDecision(privacy.read(), input);
     const resourceDecision = resourceCaptureDecision(runtime.read().resources, input.source);
     if (!decision.allowed || !resourceDecision.allowed) {
       // Preserve the long-standing EventSink return contract while ensuring

@@ -71,6 +71,9 @@ private struct NativeAcquisitionPolicy: Decodable {
     let cloudScreenshotEgressConsent: Bool
     let excludedApps: [String]
     let excludedWindows: [String]
+    /// Added compatibly to wire v1. Older snapshots decode as no path rules;
+    /// every current publisher includes the complete array.
+    let excludedPaths: [String]?
     let resources: Resources
 }
 
@@ -143,6 +146,13 @@ public final class NativePolicyGate: NativePolicyChecking {
         }
         if contains(app, any: policy.excludedApps) { return .deny("excluded_app") }
         if contains(window, any: policy.excludedWindows) { return .deny("excluded_window") }
+        // Native capture has only visible app/window metadata before pixels or
+        // AX text are read. Match path exclusions against both contexts so
+        // editor titles such as `project/.env — Code` fail before acquisition.
+        let pathPatterns = policy.excludedPaths ?? []
+        if contains(app, any: pathPatterns) || contains(window, any: pathPatterns) {
+            return .deny("excluded_path")
+        }
         return .allow
     }
 

@@ -208,15 +208,18 @@ public actor ClipBuffer {
         }
         let width = ClipMath.evenDimension(firstImage.width)
         let height = ClipMath.evenDimension(firstImage.height)
-        let url = Emitter.shared.blobDir
-            .appendingPathComponent(UUID().uuidString + ".mp4")
+        let name = UUID().uuidString
+        let url = Emitter.shared.blobDir.appendingPathComponent(name + ".mp4")
+        let stagingURL = Emitter.shared.blobDir
+            .appendingPathComponent(".praxis-\(name).staging.mp4")
+        defer { try? FileManager.default.removeItem(at: stagingURL) }
 
         do {
             try await Self.writeMp4(frames: frames, width: width, height: height,
-                                    to: url, ciContext: ciContext)
+                                    to: stagingURL, ciContext: ciContext)
+            try NativeBlobFileSecurity.publishStagedFile(at: stagingURL, to: url)
         } catch {
             log("clip: mp4 write failed: \(error)")
-            try? FileManager.default.removeItem(at: url)
             return nil
         }
 

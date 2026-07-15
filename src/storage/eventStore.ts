@@ -18,6 +18,8 @@ export interface EventStore {
   get(id: string): RawEvent | undefined;
   getByHash(hash: string): RawEvent | undefined;
   range(range?: EventRange): RawEvent[];
+  /** Newest first, bounded in SQL for desktop snapshot surfaces. */
+  recent(limit: number): RawEvent[];
   count(): number;
   /** Highest implicit rowid — a monotonic cursor for live tailing. */
   maxRowid(): number;
@@ -107,6 +109,12 @@ export function makeEventStore(db: DatabaseSync, cipher?: StorageCipher): EventS
       const rows = db
         .prepare(`SELECT * FROM raw_events ${clause} ORDER BY ts ASC ${limit}`)
         .all(...params) as Record<string, unknown>[];
+      return rows.map((row) => rowToEvent(row, cipher));
+    },
+    recent(limit) {
+      const rows = db
+        .prepare(`SELECT * FROM raw_events ORDER BY ts DESC, id DESC LIMIT ?`)
+        .all(Math.max(0, Math.floor(limit))) as Record<string, unknown>[];
       return rows.map((row) => rowToEvent(row, cipher));
     },
     count() {

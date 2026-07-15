@@ -8,11 +8,16 @@ export interface GraphStore {
   putEdge(e: GraphEdge): void;
   getNode(id: string): GraphNode | undefined;
   findNode(kind: string, label: string): GraphNode | undefined;
-  nodes(): GraphNode[];
-  edges(): GraphEdge[];
+  nodes(limit?: number): GraphNode[];
+  edges(limit?: number): GraphEdge[];
   /** Edges incident on a node (either direction). */
   incident(nodeId: string): GraphEdge[];
   hasEdge(from: string, to: string, kind: string): boolean;
+  findEdge(from: string, to: string, kind: string): GraphEdge | undefined;
+  removeEdge(id: string): void;
+  removeNode(id: string): void;
+  clearEdges(): void;
+  removeClaimNode(claimId: string): void;
   counts(): { nodes: number; edges: number };
 }
 
@@ -56,8 +61,14 @@ export function makeGraphStore(db: DatabaseSync, cipher?: StorageCipher): GraphS
     `SELECT * FROM graph_nodes WHERE kind = ? AND label = ? LIMIT 1`,
   );
   const edgeDup = db.prepare(
-    `SELECT 1 FROM graph_edges WHERE from_id = ? AND to_id = ? AND kind = ? LIMIT 1`,
+    `SELECT * FROM graph_edges WHERE from_id = ? AND to_id = ? AND kind = ? LIMIT 1`,
   );
+  const deleteEdge = db.prepare(`DELETE FROM graph_edges WHERE id = ?`);
+  const deleteAllEdges = db.prepare(`DELETE FROM graph_edges`);
+  const deleteNode = db.prepare(`DELETE FROM graph_nodes WHERE id = ?`);
+  const nodesByClaim = db.prepare(`SELECT id FROM graph_nodes WHERE claim_id = ?`);
+  const removeIncidentEdges = db.prepare(`DELETE FROM graph_edges WHERE from_id = ? OR to_id = ?`);
+  const removeNodesByClaim = db.prepare(`DELETE FROM graph_nodes WHERE claim_id = ?`);
 
   return {
     putNode(n) {
@@ -92,16 +103,18 @@ export function makeGraphStore(db: DatabaseSync, cipher?: StorageCipher): GraphS
         | undefined;
       return row ? rowToNode(row, cipher) : undefined;
     },
-    nodes() {
-      const rows = db
-        .prepare(`SELECT * FROM graph_nodes ORDER BY confidence DESC`)
-        .all() as Record<string, unknown>[];
+    nodes(limit) {
+      const rows = limit === undefined
+        ? db.prepare(`SELECT * FROM graph_nodes ORDER BY confidence DESC, updated_ts DESC, id DESC`).all()
+        : db.prepare(`SELECT * FROM graph_nodes ORDER BY confidence DESC, updated_ts DESC, id DESC LIMIT ?`)
+          .all(Math.max(0, Math.floor(limit)));
       return rows.map((row) => rowToNode(row, cipher));
     },
-    edges() {
-      const rows = db
-        .prepare(`SELECT * FROM graph_edges`)
-        .all() as Record<string, unknown>[];
+    edges(limit) {
+      const rows = limit === undefined
+        ? db.prepare(`SELECT * FROM graph_edges ORDER BY created_ts DESC, id DESC`).all()
+        : db.prepare(`SELECT * FROM graph_edges ORDER BY created_ts DESC, id DESC LIMIT ?`)
+          .all(Math.max(0, Math.floor(limit)));
       return rows.map((row) => rowToEdge(row, cipher));
     },
     incident(nodeId) {
@@ -112,6 +125,25 @@ export function makeGraphStore(db: DatabaseSync, cipher?: StorageCipher): GraphS
     },
     hasEdge(from, to, kind) {
       return edgeDup.get(from, to, kind) !== undefined;
+    },
+    findEdge(from, to, kind) {
+      const row = edgeDup.get(from, to, kind) as Record<string, unknown> | undefined;
+      return row ? rowToEdge(row, cipher) : undefined;
+    },
+    removeEdge(id) {
+      deleteEdge.run(id);
+    },
+    removeNode(id) {
+      removeIncidentEdges.run(id, id);
+      deleteNode.run(id);
+    },
+    clearEdges() {
+      deleteAllEdges.run();
+    },
+    removeClaimNode(claimId) {
+      const rows = nodesByClaim.all(claimId) as Array<{ id: string }>;
+      for (const row of rows) removeIncidentEdges.run(row.id, row.id);
+      removeNodesByClaim.run(claimId);
     },
     counts() {
       const n = db.prepare(`SELECT COUNT(*) AS n FROM graph_nodes`).get() as {

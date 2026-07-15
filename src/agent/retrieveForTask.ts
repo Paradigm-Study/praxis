@@ -1,6 +1,7 @@
 import type { Claim, Episode } from "../core/types.ts";
 import type { Store } from "../storage/index.ts";
 import { defaultProvider } from "../core/similarity.ts";
+import { trustedClaims } from "../memory/consolidate.ts";
 
 /**
  * Task-scoped long-term retrieval: "what do we already know that bears on this
@@ -133,8 +134,7 @@ export function retrieveForTask(
   // Episodes are shared across claims; resolve each id at most once.
   const episodeCache = new Map<string, Episode | undefined>();
 
-  return store.claims
-    .all()
+  return trustedClaims(store.claims.all(), store.corrections.all())
     .filter((c) => c.confidence >= MIN_CONFIDENCE)
     .map((c) => {
       const relevance = defaultProvider.similarity(taskText, c.text);

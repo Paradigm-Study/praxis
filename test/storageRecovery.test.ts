@@ -172,6 +172,92 @@ test("schema migration failure restores the startup snapshot atomically", () => 
   }
 });
 
+test("schema v2 adds claim provenance and fail-closed correction origin without losing rows", () => {
+  const dir = tempDir("praxis-schema-provenance-");
+  const dbPath = join(dir, "praxis.db");
+  try {
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE claims (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        evidence_episode_ids TEXT NOT NULL DEFAULT '[]',
+        created_ts TEXT NOT NULL,
+        updated_ts TEXT NOT NULL
+      );
+      INSERT INTO claims
+        (id, kind, text, confidence, evidence_episode_ids, created_ts, updated_ts)
+      VALUES
+        ('legacy_claim', 'decision_rule', 'Verify the backup first.', 0.91, '["episode_legacy"]',
+         '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+      CREATE TABLE corrections (
+        id TEXT PRIMARY KEY,
+        target_kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        corrected_text TEXT,
+        note TEXT,
+        created_ts TEXT NOT NULL
+      );
+      INSERT INTO corrections
+        (id, target_kind, target_id, verdict, created_ts)
+      VALUES
+        ('legacy_receipt', 'claim', 'legacy_claim', 'confirmed', '2026-07-12T01:00:00.000Z'),
+        ('human_action_receipt', 'action', 'action_legacy', 'rejected', '2026-07-12T01:01:00.000Z'),
+        ('human_workflow_receipt', 'episode', 'episode_legacy', 'edited', '2026-07-12T01:02:00.000Z'),
+        ('human_answer_receipt', 'decision', 'decision_legacy', 'edited', '2026-07-12T01:03:00.000Z');
+      PRAGMA user_version = 2;
+    `);
+    legacy.close();
+
+    const migrated = openStore({ dir, encryption: false });
+    const version = migrated.db.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(version.user_version, 4);
+    const columns = migrated.db.prepare("PRAGMA table_info(claims)").all() as Array<{ name: string }>;
+    assert.equal(columns.some((column) => column.name === "provenance"), true);
+    const correctionColumns = migrated.db.prepare("PRAGMA table_info(corrections)").all() as Array<{ name: string }>;
+    assert.equal(correctionColumns.some((column) => column.name === "origin"), true);
+    assert.deepEqual(migrated.claims.get("legacy_claim"), {
+      id: "legacy_claim",
+      kind: "decision_rule",
+      text: "Verify the backup first.",
+      confidence: 0.91,
+      evidenceEpisodes: ["episode_legacy"],
+      provenance: undefined,
+      createdTs: "2026-07-12T00:00:00.000Z",
+      updatedTs: "2026-07-12T00:00:00.000Z",
+    });
+    assert.equal(
+      migrated.corrections.get("legacy_receipt")?.origin,
+      "legacy",
+      "ambiguous pre-origin receipts remain visible but cannot manufacture human trust",
+    );
+    assert.equal(migrated.corrections.get("human_action_receipt")?.origin, "human");
+    assert.equal(migrated.corrections.get("human_workflow_receipt")?.origin, "human");
+    assert.equal(migrated.corrections.get("human_answer_receipt")?.origin, "human");
+    migrated.claims.put({
+      id: "explicit_claim",
+      kind: "decision_rule",
+      text: "Require a verified backup.",
+      confidence: 0.98,
+      evidenceEpisodes: ["episode_legacy"],
+      provenance: "explicit_user_rule",
+      createdTs: "2026-07-13T00:00:00.000Z",
+      updatedTs: "2026-07-13T00:00:00.000Z",
+    });
+    assert.equal(migrated.claims.get("explicit_claim")?.provenance, "explicit_user_rule");
+    migrated.close();
+    assert.ok(
+      readdirSync(join(dir, "backups", "startup")).some((name) => name.startsWith("schema-v2-")),
+      "opening a legacy database preserves a pre-migration snapshot",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("key rotation re-encrypts rows and blobs under the new active version", () => {
   const dir = tempDir("praxis-key-rotation-");
   try {

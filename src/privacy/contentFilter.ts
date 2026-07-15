@@ -56,14 +56,34 @@ function filterValue(value: unknown, key?: string): { value: unknown; redacted: 
 
 /** Final content fence before sensitive native/user text can reach storage. */
 export function filterSensitiveCapture(input: RawEventInput): RawEventInput {
-  if (input.source !== "clipboard" && input.source !== "accessibility") return input;
-  const payload = filterValue(input.payload ?? {}) as {
+  const filterPayload = input.source === "clipboard"
+    || input.source === "accessibility"
+    || input.source === "browser_dom"
+    || input.source === "terminal"
+    || input.source === "audio"
+    || input.source === "screen_video";
+  const filterBlob = (kind: string): boolean => {
+    if (input.source === "clipboard" || input.source === "accessibility") {
+      return kind === "text";
+    }
+    if (input.source === "browser_dom") return kind === "text" || kind === "diff";
+    if (input.source === "filesystem") {
+      return kind === "text" || kind === "file" || kind === "diff";
+    }
+    return input.source === "git" && kind === "diff";
+  };
+  if (!filterPayload && !(input.blobs ?? []).some((blob) => filterBlob(blob.kind))) {
+    return input;
+  }
+  const payload = (filterPayload
+    ? filterValue(input.payload ?? {})
+    : { value: input.payload ?? {}, redacted: false }) as {
     value: Record<string, unknown>;
     redacted: boolean;
   };
   let redacted = payload.redacted;
-  const blobs = (input.blobs ?? []).map((blob) => {
-    if (blob.kind !== "text") return blob;
+  let blobs = (input.blobs ?? []).map((blob) => {
+    if (!filterBlob(blob.kind)) return blob;
     const text = typeof blob.data === "string"
       ? blob.data
       : Buffer.from(blob.data).toString("utf8");
@@ -71,9 +91,17 @@ export function filterSensitiveCapture(input: RawEventInput): RawEventInput {
     redacted = true;
     return { kind: blob.kind, data: REDACTED };
   });
+  const redactScreenPixels = input.source === "screen_video" && payload.redacted;
+  if (redactScreenPixels) {
+    // Redacting OCR while retaining the source screenshot would preserve the
+    // same secret in pixels. Drop only media from that sensitive frame; normal
+    // frames and non-media evidence remain unchanged.
+    blobs = blobs.filter((blob) => blob.kind !== "image" && blob.kind !== "video");
+  }
   return {
     ...input,
     payload: redacted ? { ...payload.value, contentRedacted: true } : payload.value,
+    ...(redactScreenPixels && input.blobRefs ? { blobRefs: [] } : {}),
     ...(input.blobs ? { blobs } : {}),
   };
 }

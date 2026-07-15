@@ -23,6 +23,6 @@ enum OCR {
             return []
         }
         guard let results = request.results else { return [] }
-        return results.compactMap { $0.topCandidates(1).first?.string }
+        return results.prefix(200).compactMap { $0.topCandidates(1).first?.string }
     }
 }

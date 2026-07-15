@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { freshStore } from "./helpers.ts";
+import { action, freshStore } from "./helpers.ts";
 import { buildBrief } from "../src/studio/brief.ts";
 import type { Episode, StoredDecision } from "../src/core/types.ts";
 import type { Store } from "../src/storage/index.ts";
@@ -110,11 +110,13 @@ describe("buildBrief — local half", () => {
 
   test("openQuestions = undelivered ask_expert only (answered + other kinds excluded)", async () => {
     const store = freshStore();
+    const evidence = action({ id: "brief_question_action", action: "answered_question", startTs: "2026-06-09T09:59:00.000Z" });
+    store.actions.put(evidence);
     store.decisions.put(
-      decision({ id: "decision_open", question: "Postgres or SQLite for the cache?" }),
+      decision({ id: "decision_open", question: "Postgres or SQLite for the cache?", evidence: [evidence.id] }),
     );
     store.decisions.put(
-      decision({ id: "decision_answered", question: "Tabs or spaces?" }),
+      decision({ id: "decision_answered", question: "Tabs or spaces?", evidence: [evidence.id] }),
     );
     store.decisions.put(
       decision({ id: "decision_intervene", kind: "intervene", question: "Stop the deploy?" }),
@@ -125,6 +127,7 @@ describe("buildBrief — local half", () => {
       targetKind: "decision",
       targetId: "decision_answered",
       verdict: "edited",
+      origin: "human",
       correctedText: "spaces",
       createdTs: "2026-06-09T10:05:00.000Z",
     });
@@ -158,12 +161,14 @@ describe("buildBrief — local half", () => {
 
   test("local brief text is capped before it reaches the hook response", async () => {
     const store = freshStore();
+    const evidence = action({ id: "brief_large_action", action: "answered_question", startTs: "2026-07-12T12:00:00.000Z" });
+    store.actions.put(evidence);
     store.episodes.put(episode({
       id: "episode_large",
       startTs: "2026-07-12T12:00:00.000Z",
       goal: "g".repeat(2_000_000),
     }));
-    store.decisions.put(decision({ id: "decision_large", question: "q".repeat(2_000_000) }));
+    store.decisions.put(decision({ id: "decision_large", question: "q".repeat(2_000_000), evidence: [evidence.id] }));
     const brief = await buildBrief(store);
     assert.equal(brief.episodeGoal.length, 320);
     assert.equal(brief.openQuestions[0]!.question.length, 320);

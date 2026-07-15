@@ -66,3 +66,29 @@ test("single-display frames keep untagged OCR text", () => {
   const bundle = buildBundle(store, { windowSeconds: 60 });
   assert.deepEqual(bundle.frameText, ["just one screen"]);
 });
+
+test("native display attribution tells the observer active versus reference context", () => {
+  const store = freshStore();
+  const ingest = makeIngest(store);
+  ingest.ingest({
+    source: "screen_video",
+    app: "Preview",
+    window: "Architecture.pdf",
+    type: "frame",
+    ts: "2026-06-08T12:00:00.000Z",
+    payload: {
+      ocrText: "consumer readiness notes",
+      displayID: 2,
+      displayIndex: 1,
+      displays: 2,
+      attribution: "reference-window",
+      visibleApps: ["Preview", "Safari"],
+    },
+    blobs: [{ kind: "image", data: png(10) }],
+  });
+  const bundle = buildBundle(store, { windowSeconds: 60 });
+  assert.deepEqual(bundle.frameText, [
+    "[display 2 of 2; context reference-window; attributed app Preview; window Architecture.pdf; visible apps Preview, Safari] consumer readiness notes",
+  ]);
+  assert.match(renderBundle(bundle), /reference-display text is context, not user action/);
+});

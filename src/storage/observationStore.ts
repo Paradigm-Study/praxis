@@ -7,6 +7,7 @@ export interface ObservationStore {
   put(o: Observation): void;
   get(id: string): Observation | undefined;
   all(): Observation[];
+  recent(limit: number): Observation[];
   byEpisode(episodeId: string): Observation[];
 }
 
@@ -72,6 +73,12 @@ export function makeObservationStore(db: DatabaseSync, cipher?: StorageCipher): 
         .prepare(`SELECT * FROM observations ORDER BY created_ts ASC`)
         .all() as Record<string, unknown>[];
       return rows.map((row) => rowToObs(row, cipher));
+    },
+    recent(limit) {
+      const rows = db
+        .prepare(`SELECT * FROM observations ORDER BY created_ts DESC, id DESC LIMIT ?`)
+        .all(Math.max(0, Math.floor(limit))) as Record<string, unknown>[];
+      return rows.map((row) => rowToObs(row, cipher)).reverse();
     },
     byEpisode(episodeId) {
       const rows = byEp.all(episodeId) as Record<string, unknown>[];

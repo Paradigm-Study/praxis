@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { redactMeshFrame, redactText, redactWorkFrame } from "../src/mesh/redact.ts";
-import type { BoardroomLifecycle, WorkFrame } from "../src/mesh/types.ts";
+import type { BoardroomLifecycle, SyncVerification, WorkFrame } from "../src/mesh/types.ts";
 
 test("redactText removes email addresses", () => {
   assert.equal(
@@ -36,6 +36,26 @@ test("redactMeshFrame whitelists and redacts card lifecycle frames", () => {
   assert.deepEqual(result.artifacts, [{ repo: "praxis", path: "src/index.ts" }]);
   assert.equal(result.specCriteria[0]?.behavior, "email [redacted]");
   assert.ok(!("promptBody" in result));
+});
+
+test("redactMeshFrame projects sync verification to its exact content-free contract", () => {
+  const frame = {
+    v: 0,
+    kind: "sync_verification",
+    person: "alice",
+    device: "laptop",
+    ts: "2026-07-14T00:00:00.000Z",
+    project: "must-not-cross",
+    token: "must-not-cross",
+    intent: "must-not-cross",
+  } as SyncVerification;
+  assert.deepEqual(redactMeshFrame(frame), {
+    v: 0,
+    kind: "sync_verification",
+    person: "alice",
+    device: "laptop",
+    ts: "2026-07-14T00:00:00.000Z",
+  });
 });
 
 test("redactText removes supported API key and token forms", () => {

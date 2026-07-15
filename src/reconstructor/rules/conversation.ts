@@ -3,13 +3,43 @@ import type { RuleContext } from "../evidence.ts";
 import { after, before, payloadText } from "../evidence.ts";
 import { P, score, type Signal } from "../confidence.ts";
 import { mkAction } from "../rule.ts";
-
-const CORRECTIVE =
-  /\b(no|nope|don'?t|do not|instead|actually|that'?s wrong|not quite|stop|avoid|rather than|incorrect|wrong)\b/i;
+import { isExplicitCorrectionText } from "../correctionText.ts";
 
 function role(e: RawEvent): string | undefined {
   const r = (e.payload as Record<string, unknown>).role;
-  return typeof r === "string" ? r : undefined;
+  return typeof r === "string" ? r.trim().toLowerCase() : undefined;
+}
+
+const CONVERSATION_CONTEXT_KEYS = [
+  "sessionKey",
+  "sessionId",
+  "conversationId",
+  "threadId",
+] as const;
+
+function conversationContextId(e: RawEvent): string | undefined {
+  const payload = e.payload as Record<string, unknown>;
+  for (const key of CONVERSATION_CONTEXT_KEYS) {
+    const value = payload[key];
+    if (typeof value === "string" && value.length > 0) return `${key}:${value}`;
+  }
+  return undefined;
+}
+
+/**
+ * AX bubbles have no global identity. Pair them only inside one visible chat
+ * context: the same app plus either an explicit matching conversation/session
+ * id or the exact same window. This deliberately refuses one-sided ids rather
+ * than borrowing a nearby response from another tab/session.
+ */
+function sameConversationContext(a: RawEvent, b: RawEvent): boolean {
+  if (a.app !== b.app) return false;
+  const aContext = conversationContextId(a);
+  const bContext = conversationContextId(b);
+  if (aContext !== undefined || bContext !== undefined) {
+    return aContext !== undefined && aContext === bContext;
+  }
+  return a.window === b.window;
 }
 
 // Empty chat composers expose their placeholder as the AX value, which would
@@ -21,6 +51,100 @@ function isPlaceholder(text: string | undefined): boolean {
   if (!text) return true;
   const t = text.trim();
   return t.length === 0 || PLACEHOLDER_RE.test(t);
+}
+
+function isConversationBubble(e: RawEvent): boolean {
+  return e.source === "accessibility" && e.type === "conversation_bubble_added";
+}
+
+function isRolelessBubble(e: RawEvent): boolean {
+  const value = role(e);
+  return value === undefined || value === "unknown";
+}
+
+function normalizedConversationText(value: string | undefined): string {
+  return (value ?? "")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase();
+}
+
+/**
+ * Native AX capture cannot label bubble ownership. A role-less bubble is the
+ * user's only when it echoes a real draft and follows that draft's Enter in the
+ * exact same conversation context. Enter alone is deliberately insufficient:
+ * a fast assistant response can also arrive shortly after it.
+ */
+interface UserBubbleInference {
+  explicit: boolean;
+  draft?: RawEvent;
+  enter?: RawEvent;
+}
+
+function inferUserBubble(
+  ctx: RuleContext,
+  bubble: RawEvent,
+  bubbleIndex: number,
+): UserBubbleInference | undefined {
+  if (!isConversationBubble(bubble)) return undefined;
+  const bubbleRole = role(bubble);
+  if (bubbleRole === "user") return { explicit: true };
+  if (!isRolelessBubble(bubble)) return undefined;
+
+  const bubbleText = normalizedConversationText(payloadText(ctx, bubble));
+  if (!bubbleText || isPlaceholder(bubbleText)) return undefined;
+
+  const bubbleMs = ctx.ms[bubbleIndex]!;
+  let draft: RawEvent | undefined;
+  let draftIndex = -1;
+  for (let j = bubbleIndex - 1; j >= 0; j--) {
+    if (bubbleMs - ctx.ms[j]! > 12_000) break;
+    const candidate = ctx.events[j]!;
+    if (
+      candidate.source !== "accessibility" ||
+      candidate.type !== "focused_text_changed" ||
+      !sameConversationContext(bubble, candidate)
+    ) {
+      continue;
+    }
+    const draftText = normalizedConversationText(payloadText(ctx, candidate));
+    if (!draftText || isPlaceholder(draftText) || draftText !== bubbleText) continue;
+    draft = candidate;
+    draftIndex = j;
+    break;
+  }
+  if (!draft) return undefined;
+
+  for (let j = bubbleIndex - 1; j > draftIndex; j--) {
+    const candidate = ctx.events[j]!;
+    if (bubbleMs - ctx.ms[j]! > 4_000) break;
+    if (
+      candidate.source === "input_events" &&
+      candidate.type === "key_down" &&
+      (candidate.payload as Record<string, unknown>).key === "Enter" &&
+      !(((candidate.payload as Record<string, unknown>).mods as string[] | undefined) ?? []).includes("shift") &&
+      sameConversationContext(bubble, candidate)
+    ) {
+      return { explicit: false, draft, enter: candidate };
+    }
+  }
+  return undefined;
+}
+
+function userInferenceSignals(
+  bubble: RawEvent,
+  inference: UserBubbleInference,
+  tag: string,
+): Signal[] {
+  const signals: Signal[] = [{ id: bubble.id, p: P.userBubble, tag }];
+  if (inference.draft) {
+    signals.push({ id: inference.draft.id, p: P.draftText, tag: "matching_draft" });
+  }
+  if (inference.enter) {
+    signals.push({ id: inference.enter.id, p: P.enterKey, tag: "submit_enter" });
+  }
+  return signals;
 }
 
 /**
@@ -40,26 +164,16 @@ export function submittedMessage(ctx: RuleContext): ActionEvent[] {
       source: "accessibility",
       type: "focused_text_changed",
       app: e.app,
-      where: (ev) => !isPlaceholder(payloadText(ctx, ev)),
+      where: (ev) =>
+        sameConversationContext(e, ev) && !isPlaceholder(payloadText(ctx, ev)),
     });
-    // The user's bubble: an explicit role:"user", OR — for the universal AX
-    // scraper, which emits role-less bubbles — a bubble whose text matches the
-    // draft. This is what makes submit reconstruction work for any chat app.
-    const draftVal = draft ? payloadText(ctx, draft) : undefined;
     const bubble = after(ctx, i, 4000, {
       source: "accessibility",
       type: "conversation_bubble_added",
       app: e.app,
-      where: (ev) => {
-        const r = role(ev);
-        if (r === "user") return true;
-        if (r !== undefined && r !== "unknown") return false;
-        const bt = payloadText(ctx, ev);
-        return (
-          !!draftVal && !!bt &&
-          bt.toLowerCase().includes(draftVal.toLowerCase().slice(0, 24))
-        );
-      },
+      where: (ev) =>
+        sameConversationContext(e, ev) &&
+        inferUserBubble(ctx, ev, ctx.events.indexOf(ev)) !== undefined,
     });
     const request = after(ctx, i, 4000, {
       source: "ai_proxy",
@@ -171,38 +285,119 @@ export function typedDraft(ctx: RuleContext): ActionEvent[] {
   return out;
 }
 
+interface AssistantTurnInference {
+  event: RawEvent;
+  /** The confirmed preceding user turn that makes a role-less AX reply safe. */
+  priorUser?: RawEvent;
+}
+
+function looksLikeSubstantiveAssistantText(ctx: RuleContext, event: RawEvent): boolean {
+  const text = normalizedConversationText(payloadText(ctx, event));
+  if (!text || isPlaceholder(text)) return false;
+  const words = text.split(" ").filter(Boolean).length;
+  // A direct question supplies its own strong conversational cue; ordinary
+  // response prose must be longer to avoid treating newly-rendered UI labels
+  // as assistant turns.
+  if (endsWithQuestion(text)) return text.length >= 12 && words >= 3;
+  return text.length >= 24 && words >= 4;
+}
+
+function priorStrongUserTurn(
+  ctx: RuleContext,
+  candidate: RawEvent,
+  candidateIndex: number,
+): RawEvent | undefined {
+  const candidateMs = ctx.ms[candidateIndex]!;
+  for (let j = candidateIndex - 1; j >= 0; j--) {
+    if (candidateMs - ctx.ms[j]! > 120_000) break;
+    const event = ctx.events[j]!;
+    if (!sameConversationContext(candidate, event) || !isConversationBubble(event)) {
+      continue;
+    }
+    if (inferUserBubble(ctx, event, j)) return event;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve only the immediately preceding assistant turn. Explicitly-labelled
+ * assistant/AI-proxy events keep their source semantics. A native role-less AX
+ * bubble additionally needs substantial prose, a confirmed prior submitted
+ * user bubble, response-like ordering, and the exact same chat context.
+ */
+function priorAssistantTurn(
+  ctx: RuleContext,
+  currentUser: RawEvent,
+  currentIndex: number,
+  currentInference: UserBubbleInference,
+  withinMs: number,
+): AssistantTurnInference | undefined {
+  const currentMs = ctx.ms[currentIndex]!;
+  const currentDraftMs = currentInference.draft
+    ? Date.parse(currentInference.draft.ts)
+    : undefined;
+
+  for (let j = currentIndex - 1; j >= 0; j--) {
+    if (currentMs - ctx.ms[j]! > withinMs) break;
+    const event = ctx.events[j]!;
+    if (!sameConversationContext(currentUser, event)) continue;
+
+    if (event.source === "ai_proxy" && event.type === "ai_response") {
+      return { event };
+    }
+    if (!isConversationBubble(event)) continue;
+
+    // Never step past an intervening user turn to borrow an older response.
+    if (inferUserBubble(ctx, event, j)) return undefined;
+
+    const eventRole = role(event);
+    if (eventRole === "assistant" || eventRole === "teacher") return { event };
+    if (!isRolelessBubble(event) || !looksLikeSubstantiveAssistantText(ctx, event)) {
+      continue;
+    }
+
+    // A response arriving after the next draft began is not safely attributable
+    // as the turn that draft answers or corrects.
+    if (currentDraftMs !== undefined && ctx.ms[j]! >= currentDraftMs) continue;
+
+    const priorUser = priorStrongUserTurn(ctx, event, j);
+    if (!priorUser) continue;
+    const responseDelay = ctx.ms[j]! - Date.parse(priorUser.ts);
+    if (responseDelay < 500 || responseDelay > 120_000) continue;
+    return { event, priorUser };
+  }
+  return undefined;
+}
+
+function endsWithQuestion(text: string): boolean {
+  return /\?\s*["'\u2019)\]}]*$/.test(text.trim());
+}
+
 /** A user message that follows an assistant message ending in "?". */
 export function answeredQuestion(ctx: RuleContext): ActionEvent[] {
   const out: ActionEvent[] = [];
   ctx.events.forEach((e, i) => {
-    if (
-      e.source !== "accessibility" ||
-      e.type !== "conversation_bubble_added" ||
-      role(e) !== "user"
-    )
-      return;
-    const question =
-      before(ctx, i, 120_000, {
-        source: "accessibility",
-        type: "conversation_bubble_added",
-        where: (ev) => role(ev) === "assistant",
-      }) ??
-      before(ctx, i, 120_000, { source: "ai_proxy", type: "ai_response" });
-    const qText = question ? payloadText(ctx, question) : undefined;
-    if (!question || !qText || !qText.trim().endsWith("?")) return;
+    const user = inferUserBubble(ctx, e, i);
+    if (!user) return;
+    const question = priorAssistantTurn(ctx, e, i, user, 120_000);
+    const qText = question ? payloadText(ctx, question.event) : undefined;
+    if (!question || !qText || !endsWithQuestion(qText)) return;
+
+    const signals = userInferenceSignals(e, user, "user_answer");
+    signals.push({ id: question.event.id, p: 0.6, tag: "prior_question" });
+    if (question.priorUser) {
+      signals.push({ id: question.priorUser.id, p: 0.25, tag: "roleless_reply_order" });
+    }
 
     out.push(
       mkAction(ctx, {
         action: "answered_question",
         app: e.app,
         window: e.window,
-        startTs: question.ts,
+        startTs: question.event.ts,
         endTs: e.ts,
         text: payloadText(ctx, e),
-        scored: score([
-          { id: e.id, p: P.userBubble, tag: "user_answer" },
-          { id: question.id, p: 0.6, tag: "prior_question" },
-        ]),
+        scored: score(signals),
         payload: { question: qText },
         reconstructedBy: "answeredQuestion",
       }),
@@ -225,34 +420,28 @@ function extractRejected(text: string): string | undefined {
 export function correctedAgent(ctx: RuleContext): ActionEvent[] {
   const out: ActionEvent[] = [];
   ctx.events.forEach((e, i) => {
-    if (
-      e.source !== "accessibility" ||
-      e.type !== "conversation_bubble_added" ||
-      role(e) !== "user"
-    )
-      return;
+    const user = inferUserBubble(ctx, e, i);
+    if (!user) return;
     const text = payloadText(ctx, e);
-    if (!text || !CORRECTIVE.test(text)) return;
-    const prior =
-      before(ctx, i, 180_000, {
-        source: "accessibility",
-        type: "conversation_bubble_added",
-        where: (ev) => role(ev) === "assistant",
-      }) ?? before(ctx, i, 180_000, { source: "ai_proxy", type: "ai_response" });
+    if (!text || !isExplicitCorrectionText(text)) return;
+    const prior = priorAssistantTurn(ctx, e, i, user, 180_000);
     if (!prior) return;
+
+    const signals = userInferenceSignals(e, user, "corrective_message");
+    signals.push({ id: prior.event.id, p: 0.5, tag: "prior_assistant" });
+    if (prior.priorUser) {
+      signals.push({ id: prior.priorUser.id, p: 0.25, tag: "roleless_reply_order" });
+    }
 
     out.push(
       mkAction(ctx, {
         action: "corrected_agent",
         app: e.app,
         window: e.window,
-        startTs: prior.ts,
+        startTs: prior.event.ts,
         endTs: e.ts,
         text,
-        scored: score([
-          { id: e.id, p: P.userBubble, tag: "corrective_message" },
-          { id: prior.id, p: 0.5, tag: "prior_assistant" },
-        ]),
+        scored: score(signals),
         payload: { rejects: extractRejected(text) },
         reconstructedBy: "correctedAgent",
       }),
@@ -289,44 +478,24 @@ export function taughtLearner(ctx: RuleContext): ActionEvent[] {
   return out;
 }
 
-// Is this bubble the user's own message (vs. the assistant's reply)?
-function isUserBubble(ctx: RuleContext, bubble: RawEvent, i: number): boolean {
-  if (role(bubble) === "user") return true;
-  const bt = (payloadText(ctx, bubble) ?? "").toLowerCase();
-  if (!bt) return false;
-  const draft = before(ctx, i, 12_000, {
-    source: "accessibility",
-    type: "focused_text_changed",
-    app: bubble.app,
-    where: (ev) => !isPlaceholder(payloadText(ctx, ev)),
-  });
-  const dv = draft ? (payloadText(ctx, draft) ?? "").toLowerCase() : "";
-  if (dv && bt.includes(dv.slice(0, 24))) return true; // user's typed text echoed
-  // Fallback only for the bubble *immediately* after Enter (the echoed submit);
-  // a reply arriving a couple seconds later is the assistant, not the user.
-  return !!before(ctx, i, 2000, {
-    source: "input_events",
-    type: "key_down",
-    app: bubble.app,
-    where: (ev) => (ev.payload as Record<string, unknown>).key === "Enter",
-  });
-}
-
 // Only treat assistant text as a response if this app is an active conversation
 // (a recent Enter or real draft), so static page text isn't mistaken for replies.
-function inConversation(ctx: RuleContext, i: number, app: string): boolean {
+function inConversation(ctx: RuleContext, i: number, bubble: RawEvent): boolean {
   const enter = before(ctx, i, 600_000, {
     source: "input_events",
     type: "key_down",
-    app,
-    where: (ev) => (ev.payload as Record<string, unknown>).key === "Enter",
+    app: bubble.app,
+    where: (ev) =>
+      sameConversationContext(bubble, ev) &&
+      (ev.payload as Record<string, unknown>).key === "Enter",
   });
   if (enter) return true;
   return !!before(ctx, i, 600_000, {
     source: "accessibility",
     type: "focused_text_changed",
-    app,
-    where: (ev) => !isPlaceholder(payloadText(ctx, ev)),
+    app: bubble.app,
+    where: (ev) =>
+      sameConversationContext(bubble, ev) && !isPlaceholder(payloadText(ctx, ev)),
   });
 }
 
@@ -370,14 +539,18 @@ export function receivedResponse(ctx: RuleContext): ActionEvent[] {
       !!text &&
       text.trim().length >= 24 &&
       !isPlaceholder(text) &&
-      !isUserBubble(ctx, e, i) &&
-      inConversation(ctx, i, e.app);
+      !inferUserBubble(ctx, e, i) &&
+      inConversation(ctx, i, e);
     if (!assistant) {
       flush(); // a user turn (or non-reply) closes the assistant run
       return;
     }
     const prev = run[run.length - 1];
-    if (prev && (prev.app !== e.app || Date.parse(e.ts) - Date.parse(prev.ts) >= 30_000)) {
+    if (
+      prev &&
+      (!sameConversationContext(prev, e) ||
+        Date.parse(e.ts) - Date.parse(prev.ts) >= 30_000)
+    ) {
       flush();
     }
     run.push(e);

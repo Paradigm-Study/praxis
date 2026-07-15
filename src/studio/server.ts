@@ -1,20 +1,44 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join, extname } from "node:path";
-import type { Store } from "../storage/index.ts";
-import type { ActionEvent, RawEvent } from "../core/types.ts";
+import { defaultDataDir, type Store } from "../storage/index.ts";
+import type {
+  ActionEvent,
+  BoundaryReason,
+  Claim,
+  ClaimProvenance,
+  Correction,
+  CorrectionTarget,
+  CorrectionVerdict,
+  Episode,
+  GraphEdge,
+  GraphNode,
+  Observation,
+  RawEvent,
+  StoredDecision,
+} from "../core/types.ts";
 import { newId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
 import { buildPlaybook } from "../transfer/transfer.ts";
 import { buildBrief } from "./brief.ts";
 import { buildTeamGate } from "./teamGate.ts";
+import { acknowledgeSteeringDirective, claimSteeringDirective } from "./directives.ts";
 import { handleBrowserIngest } from "./browserIngest.ts";
 import { createMcpRouter } from "../mcp/router.ts";
 import { isAllowedOrigin } from "../mcp/protocol.ts";
+import { MeshPublisher } from "../mesh/publisher.ts";
+import {
+  isMeshProjectConsented,
+  normalizeMeshProjectIdentity,
+} from "../mesh/projectConsent.ts";
 import { buildGraph } from "../memory/graph.ts";
+import { applyCorrections } from "../memory/consolidate.ts";
 import { logger } from "../core/log.ts";
 import { PrivacyControlStore, type PrivacyControl } from "../privacy/control.ts";
-import { RuntimeStatusStore } from "../capture/runtimeStatus.ts";
+import {
+  RuntimeStatusStore,
+  type CaptureRuntimeStatus,
+} from "../capture/runtimeStatus.ts";
 import { publishNativeAcquisitionPolicy } from "../privacy/nativePolicy.ts";
 import { EgressAuditor } from "../privacy/egress.ts";
 import {
@@ -24,8 +48,109 @@ import {
   type RetentionPolicy,
 } from "../storage/maintenance.ts";
 import { authorizeLocalRequest, validateLocalToken } from "../security/localAuth.ts";
+import { parseWorkflowReview, WORKFLOW_REVIEW_NOTE } from "../workflow/review.ts";
+import {
+  DISMISSED_QUESTION_NOTE_PREFIX,
+  actionQuestionWasResolved,
+  decisionHasSubstantiveEvidence,
+  isActionQuestionWorthy,
+  isMeaningfulCorrection,
+  normalizeQuestion,
+  questionWasResolved,
+  sameQuestion,
+  uniqueQuestionDecisions,
+} from "../agent/questionQuality.ts";
 
 const log = logger("studio");
+
+const WORKFLOW_PAGE_LIMIT = 25;
+const EPISODE_SNAPSHOT_LIMIT = 200;
+const CLAIM_SNAPSHOT_LIMIT = 400;
+const GRAPH_NODE_SNAPSHOT_LIMIT = 400;
+const GRAPH_EDGE_SNAPSHOT_LIMIT = 400;
+const OBSERVATION_SNAPSHOT_LIMIT = 200;
+const CORRECTION_SNAPSHOT_LIMIT = 400;
+// Electron rejects daemon responses at 5,000,000 bytes. Leave room for headers,
+// future envelope fields, and small differences between serializers.
+const API_RESPONSE_MAX_BYTES = 4_500_000;
+// A corrupted episode must not produce an unbounded SQLite IN clause. Normal
+// episodes keep every referenced action; this ceiling is only a safety valve.
+const WORKFLOW_ACTION_SAFETY_LIMIT = 1_000;
+const WORKFLOW_TRUNCATION_FIELD_LIMIT = 80;
+const WORKFLOW_BOUNDARY_REASONS = new Set<BoundaryReason>([
+  "task_shift",
+  "app_window_shift",
+  "command_test_cycle",
+  "file_save_commit",
+  "conversation_turn",
+  "long_dwell_gap",
+  "user_correction",
+  "session_start",
+  "session_end",
+]);
+const CLAIM_PROVENANCES = new Set<ClaimProvenance>([
+  "observed_pattern",
+  "model_inference",
+  "explicit_user_rule",
+  "user_answer",
+  "human_reviewed",
+]);
+
+export interface StudioOptions {
+  /** Injectable for focused local-API tests; undefined uses the live env. */
+  meshPublisher?: MeshPublisher | null;
+}
+
+function correctionTargetExists(
+  store: Store,
+  targetKind: CorrectionTarget,
+  targetId: string,
+): boolean {
+  switch (targetKind) {
+    case "action": return store.actions.get(targetId) !== undefined;
+    case "episode": return store.episodes.get(targetId) !== undefined;
+    case "claim": return store.claims.get(targetId) !== undefined;
+    case "observation": return store.observations.get(targetId) !== undefined;
+    case "decision": return store.decisions.get(targetId) !== undefined;
+  }
+}
+
+interface WorkflowTruncation {
+  truncated: boolean;
+  fields: string[];
+  omittedFieldCount: number;
+  actionCounts: {
+    referenced: number;
+    included: number;
+    omitted: number;
+    missing: number;
+  };
+}
+
+interface WorkflowEvidenceItem {
+  episode: Omit<Episode, "payload">;
+  actions: Array<Omit<ActionEvent, "payload">>;
+  truncation: WorkflowTruncation;
+}
+
+interface WorkflowEvidencePage {
+  items: WorkflowEvidenceItem[];
+  nextCursor: string | null;
+}
+
+interface WorkflowCursor {
+  v: 1;
+  startTs: string;
+  id: string;
+}
+
+class InvalidWorkflowCursorError extends Error {}
+
+interface TruncationTracker {
+  fields: string[];
+  seen: Set<string>;
+  omittedFieldCount: number;
+}
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -37,11 +162,19 @@ const MIME: Record<string, string> = {
 };
 
 /** Launch Praxis Studio: a JSON API over the ledger + a static web UI. */
-export function startStudio(store: Store, port = 4319): Server {
+export function startStudio(store: Store, port = 4319, options: StudioOptions = {}): Server {
   const webDir = join(import.meta.dirname, "web");
   const clients = new Set<ServerResponse>();
   const mcpRouter = createMcpRouter(store);
   const localToken = validateLocalToken(process.env.PRAXIS_LOCAL_TOKEN);
+  const meshPublisher = options.meshPublisher === undefined
+    ? MeshPublisher.fromEnv(store, {
+        // Studio and capture are separate processes. A dedicated spool keeps
+        // their atomic NDJSON rewrites from racing while retaining the same
+        // bounded/redacted retry behavior for verification requests.
+        spoolPath: join(defaultDataDir(), "mesh-verification-outbox.ndjson"),
+      })
+    : options.meshPublisher ?? undefined;
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${port}`);
@@ -50,8 +183,13 @@ export function startStudio(store: Store, port = 4319): Server {
       if (req.method === "GET" && path === "/api/health") {
         return json(res, 200, { ok: true });
       }
-      if (path === "/api/mesh/gate" && !localToken) {
-        return json(res, 403, { error: "team gate requires local authentication" });
+      if (
+        (path === "/api/mesh/gate"
+          || path === "/api/mesh/verify"
+          || path.startsWith("/api/mesh/directives"))
+        && !localToken
+      ) {
+        return json(res, 403, { error: "team agent endpoints require local authentication" });
       }
       if (
         (path.startsWith("/api/") || path === "/mcp" || path.startsWith("/mcp/")) &&
@@ -69,7 +207,7 @@ export function startStudio(store: Store, port = 4319): Server {
         return;
       }
       if (path === "/api/stream") return handleStream(req, res, clients);
-      if (path.startsWith("/api/")) return handleApi(store, req, res, path, url);
+      if (path.startsWith("/api/")) return handleApi(store, req, res, path, url, meshPublisher);
       return serveStatic(webDir, path, res);
     } catch (err) {
       json(res, 500, { error: String(err) });
@@ -178,15 +316,508 @@ function serveStatic(webDir: string, path: string, res: ServerResponse): void {
   res.end(body);
 }
 
+function boundedQueryInteger(
+  value: string | null,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (value === null || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function encodeWorkflowCursor(episode: Pick<Episode, "startTs" | "id">): string {
+  const cursor: WorkflowCursor = { v: 1, startTs: episode.startTs, id: episode.id };
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeWorkflowCursor(value: string | null): WorkflowCursor | undefined {
+  if (value === null) return undefined;
+  if (
+    value.length < 1 ||
+    value.length > 2_048 ||
+    !/^[A-Za-z0-9_-]+$/.test(value)
+  ) throw new InvalidWorkflowCursorError("invalid workflow cursor");
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new InvalidWorkflowCursorError("invalid workflow cursor");
+    }
+    const raw = parsed as Record<string, unknown>;
+    const timestamp = typeof raw.startTs === "string" ? Date.parse(raw.startTs) : Number.NaN;
+    if (
+      raw.v !== 1 ||
+      typeof raw.startTs !== "string" ||
+      raw.startTs.length < 1 ||
+      raw.startTs.length > 128 ||
+      !Number.isFinite(timestamp) ||
+      new Date(timestamp).toISOString() !== raw.startTs ||
+      typeof raw.id !== "string" ||
+      raw.id.length < 1 ||
+      raw.id.length > 512
+    ) throw new InvalidWorkflowCursorError("invalid workflow cursor");
+    return { v: 1, startTs: raw.startTs, id: raw.id };
+  } catch (error) {
+    if (error instanceof InvalidWorkflowCursorError) throw error;
+    throw new InvalidWorkflowCursorError("invalid workflow cursor");
+  }
+}
+
+function truncationTracker(): TruncationTracker {
+  return { fields: [], seen: new Set(), omittedFieldCount: 0 };
+}
+
+function noteTruncation(tracker: TruncationTracker, field: string): void {
+  if (tracker.seen.has(field)) return;
+  tracker.seen.add(field);
+  if (tracker.fields.length < WORKFLOW_TRUNCATION_FIELD_LIMIT) tracker.fields.push(field);
+  else tracker.omittedFieldCount += 1;
+}
+
+function clippedString(
+  value: unknown,
+  maxChars: number,
+  field: string,
+  tracker: TruncationTracker,
+  fallback = "",
+): string {
+  if (typeof value !== "string") {
+    noteTruncation(tracker, field);
+    return fallback;
+  }
+  if (value.length > maxChars) noteTruncation(tracker, field);
+  return value.slice(0, maxChars);
+}
+
+function optionalClippedString(
+  value: unknown,
+  maxChars: number,
+  field: string,
+  tracker: TruncationTracker,
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    noteTruncation(tracker, field);
+    return undefined;
+  }
+  if (value.length > maxChars) noteTruncation(tracker, field);
+  return value.slice(0, maxChars);
+}
+
+function workflowBoundaryReason(
+  value: unknown,
+  tracker: TruncationTracker,
+): BoundaryReason | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string" && WORKFLOW_BOUNDARY_REASONS.has(value as BoundaryReason)) {
+    return value as BoundaryReason;
+  }
+  noteTruncation(tracker, "episode.boundaryReason");
+  return undefined;
+}
+
+function clippedStrings(
+  value: unknown,
+  maxItems: number,
+  maxChars: number,
+  field: string,
+  tracker: TruncationTracker,
+): string[] {
+  if (!Array.isArray(value)) {
+    noteTruncation(tracker, field);
+    return [];
+  }
+  if (value.length > maxItems) noteTruncation(tracker, field);
+  const result: string[] = [];
+  for (const item of value.slice(0, maxItems)) {
+    if (typeof item !== "string") {
+      noteTruncation(tracker, field);
+      continue;
+    }
+    if (item.length > maxChars) noteTruncation(tracker, field);
+    result.push(item.slice(0, maxChars));
+  }
+  return result;
+}
+
+function selectedActionIds(
+  episode: Episode,
+  limit: number,
+  tracker: TruncationTracker,
+): string[] {
+  const source: unknown[] = Array.isArray(episode.actions) ? episode.actions : [];
+  const selected: string[] = [];
+  for (const value of source.slice(0, limit)) {
+    // Oversized or malformed identifiers are omitted instead of becoming large
+    // SQLite parameters or ambiguous clipped joins.
+    if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+      noteTruncation(tracker, "episode.actions");
+      continue;
+    }
+    selected.push(value);
+  }
+  if (selected.length < source.length) noteTruncation(tracker, "episode.actions");
+  return selected;
+}
+
+function projectWorkflowAction(
+  action: ActionEvent,
+  index: number,
+  tracker: TruncationTracker,
+): Omit<ActionEvent, "payload"> {
+  const field = (name: string) => `actions[${index}].${name}`;
+  const rawConfidence = Number(action.confidence);
+  const confidence = Number.isFinite(rawConfidence)
+    ? Math.max(0, Math.min(1, rawConfidence))
+    : 0;
+  if (confidence !== rawConfidence) noteTruncation(tracker, field("confidence"));
+  const window = optionalClippedString(action.window, 500, field("window"), tracker);
+  const text = optionalClippedString(action.text, 2_000, field("text"), tracker);
+  const uncertainty = action.uncertainty === undefined
+    ? undefined
+    : clippedStrings(action.uncertainty, 12, 500, field("uncertainty"), tracker);
+  const reconstructedBy = action.reconstructedBy === undefined
+    ? undefined
+    : clippedStrings(action.reconstructedBy, 16, 160, field("reconstructedBy"), tracker);
+  return {
+    id: clippedString(action.id, 256, field("id"), tracker, `action-${index}`),
+    type: "user_action",
+    action: clippedString(action.action, 160, field("action"), tracker, "captured_action"),
+    app: clippedString(action.app, 240, field("app"), tracker),
+    ...(window !== undefined ? { window } : {}),
+    startTs: clippedString(action.startTs, 64, field("startTs"), tracker, "1970-01-01T00:00:00.000Z"),
+    endTs: clippedString(action.endTs, 64, field("endTs"), tracker, "1970-01-01T00:00:00.000Z"),
+    ...(text !== undefined ? { text } : {}),
+    confidence,
+    evidence: clippedStrings(action.evidence, 24, 160, field("evidence"), tracker),
+    ...(uncertainty !== undefined ? { uncertainty } : {}),
+    ...(reconstructedBy !== undefined ? { reconstructedBy } : {}),
+  };
+}
+
+function boundedHead<T>(items: T[], maxBytes = API_RESPONSE_MAX_BYTES): T[] {
+  const result: T[] = [];
+  let bytes = 2; // []
+  for (const item of items) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+    if (bytes + itemBytes + (result.length > 0 ? 1 : 0) > maxBytes) break;
+    result.push(item);
+    bytes += itemBytes + (result.length > 1 ? 1 : 0);
+  }
+  return result;
+}
+
+/** Keep the newest suffix while preserving the API's historical ASC order. */
+function boundedTail<T>(items: T[], maxBytes = API_RESPONSE_MAX_BYTES): T[] {
+  const result: T[] = [];
+  let bytes = 2; // []
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!;
+    const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+    if (bytes + itemBytes + (result.length > 0 ? 1 : 0) > maxBytes) break;
+    result.unshift(item);
+    bytes += itemBytes + (result.length > 1 ? 1 : 0);
+  }
+  return result;
+}
+
+function projectSnapshotEvent(event: RawEvent): RawEvent {
+  const tracker = truncationTracker();
+  return {
+    id: clippedString(event.id, 256, "event.id", tracker, "event"),
+    ts: clippedString(event.ts, 64, "event.ts", tracker, "1970-01-01T00:00:00.000Z"),
+    source: event.source,
+    app: clippedString(event.app, 240, "event.app", tracker),
+    window: clippedString(event.window, 500, "event.window", tracker),
+    type: clippedString(event.type, 160, "event.type", tracker, "captured_event"),
+    // The feed is a bounded timeline index. Full event payload remains
+    // available from /api/event/:id when a user drills into one receipt.
+    payload: {},
+    blobRefs: clippedStrings(event.blobRefs, 32, 256, "event.blobRefs", tracker),
+    hash: clippedString(event.hash, 256, "event.hash", tracker),
+  };
+}
+
+function projectSnapshotAction(action: ActionEvent, index: number): Omit<ActionEvent, "payload"> {
+  return projectWorkflowAction(action, index, truncationTracker());
+}
+
+function projectSnapshotEpisode(episode: Episode): Omit<Episode, "payload"> {
+  const tracker = truncationTracker();
+  const actions = selectedActionIds(episode, 128, tracker);
+  const id = clippedString(episode.id, 256, "episode.id", tracker, "episode");
+  const startTs = clippedString(episode.startTs, 64, "episode.startTs", tracker, "1970-01-01T00:00:00.000Z");
+  const endTs = clippedString(episode.endTs, 64, "episode.endTs", tracker, "1970-01-01T00:00:00.000Z");
+  const summary = clippedString(episode.summary, 2_000, "episode.summary", tracker);
+  const goal = optionalClippedString(episode.goal, 1_000, "episode.goal", tracker);
+  const boundaryReason = workflowBoundaryReason(episode.boundaryReason, tracker);
+  const artifacts = clippedStrings(episode.artifacts, 32, 500, "episode.artifacts", tracker);
+  const decisionPoints = clippedStrings(episode.decisionPoints, 16, 500, "episode.decisionPoints", tracker);
+  const rejectedPaths = clippedStrings(episode.rejectedPaths, 16, 500, "episode.rejectedPaths", tracker);
+  let uncertainty = clippedStrings(episode.uncertainty, 16, 500, "episode.uncertainty", tracker);
+  if (tracker.seen.size > 0) {
+    uncertainty = [
+      ...uncertainty.slice(0, 15),
+      "Episode snapshot was truncated for safe desktop display.",
+    ];
+  }
+  return {
+    id,
+    type: "context_episode",
+    startTs,
+    endTs,
+    summary,
+    ...(goal !== undefined ? { goal } : {}),
+    actions,
+    artifacts,
+    decisionPoints,
+    rejectedPaths,
+    uncertainty,
+    ...(boundaryReason !== undefined ? { boundaryReason } : {}),
+  };
+}
+
+function projectSnapshotClaim(claim: Claim): Claim {
+  const tracker = truncationTracker();
+  const confidence = Number.isFinite(claim.confidence)
+    ? Math.max(0, Math.min(1, claim.confidence))
+    : 0;
+  const provenance = claim.provenance !== undefined
+    && CLAIM_PROVENANCES.has(claim.provenance)
+    ? claim.provenance
+    : undefined;
+  return {
+    id: clippedString(claim.id, 256, "claim.id", tracker, "claim"),
+    kind: clippedString(claim.kind, 160, "claim.kind", tracker, "unknown"),
+    text: clippedString(claim.text, 4_000, "claim.text", tracker, "Unavailable claim"),
+    confidence,
+    evidenceEpisodes: clippedStrings(claim.evidenceEpisodes, 64, 256, "claim.evidenceEpisodes", tracker),
+    ...(provenance !== undefined ? { provenance } : {}),
+    createdTs: clippedString(claim.createdTs, 64, "claim.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+    updatedTs: clippedString(claim.updatedTs, 64, "claim.updatedTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotNode(node: GraphNode): Omit<GraphNode, "data"> {
+  const tracker = truncationTracker();
+  const confidence = Number.isFinite(node.confidence)
+    ? Math.max(0, Math.min(1, node.confidence))
+    : 0;
+  const claimId = optionalClippedString(node.claimId, 256, "node.claimId", tracker);
+  return {
+    id: clippedString(node.id, 256, "node.id", tracker, "node"),
+    kind: clippedString(node.kind, 160, "node.kind", tracker, "unknown"),
+    label: clippedString(node.label, 4_000, "node.label", tracker, "Unavailable node"),
+    confidence,
+    ...(claimId !== undefined ? { claimId } : {}),
+    createdTs: clippedString(node.createdTs, 64, "node.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+    updatedTs: clippedString(node.updatedTs, 64, "node.updatedTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotEdge(edge: GraphEdge): Omit<GraphEdge, "data"> {
+  const tracker = truncationTracker();
+  return {
+    id: clippedString(edge.id, 256, "edge.id", tracker, "edge"),
+    from: clippedString(edge.from, 256, "edge.from", tracker, "unknown"),
+    to: clippedString(edge.to, 256, "edge.to", tracker, "unknown"),
+    kind: clippedString(edge.kind, 160, "edge.kind", tracker, "unknown"),
+    createdTs: clippedString(edge.createdTs, 64, "edge.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotObservation(observation: Observation): Observation {
+  const tracker = truncationTracker();
+  const optionalText = (value: unknown, max: number, field: string) =>
+    optionalClippedString(value, max, field, tracker);
+  const episodeId = optionalText(observation.episodeId, 256, "observation.episodeId");
+  const intent = optionalText(observation.intent, 2_000, "observation.intent");
+  const task = optionalText(observation.task, 2_000, "observation.task");
+  const decisionPoint = optionalText(observation.decisionPoint, 2_000, "observation.decisionPoint");
+  const inferredPreference = optionalText(observation.inferredPreference, 2_000, "observation.inferredPreference");
+  const suggestedQuestion = optionalText(observation.suggestedQuestion, 2_000, "observation.suggestedQuestion");
+  const options = observation.options === undefined
+    ? undefined
+    : clippedStrings(observation.options, 16, 500, "observation.options", tracker);
+  return {
+    id: clippedString(observation.id, 256, "observation.id", tracker, "observation"),
+    bundleId: clippedString(observation.bundleId, 256, "observation.bundleId", tracker, "bundle"),
+    ...(episodeId !== undefined ? { episodeId } : {}),
+    ...(intent !== undefined ? { intent } : {}),
+    ...(task !== undefined ? { task } : {}),
+    ...(decisionPoint !== undefined ? { decisionPoint } : {}),
+    acceptedOptions: clippedStrings(observation.acceptedOptions, 16, 500, "observation.acceptedOptions", tracker),
+    rejectedOptions: clippedStrings(observation.rejectedOptions, 16, 500, "observation.rejectedOptions", tracker),
+    ...(inferredPreference !== undefined ? { inferredPreference } : {}),
+    uncertainty: clippedStrings(observation.uncertainty, 16, 500, "observation.uncertainty", tracker),
+    ...(suggestedQuestion !== undefined ? { suggestedQuestion } : {}),
+    ...(options !== undefined ? { options } : {}),
+    evidence: clippedStrings(observation.evidence, 64, 256, "observation.evidence", tracker),
+    model: clippedString(observation.model, 240, "observation.model", tracker, "unknown"),
+    createdTs: clippedString(observation.createdTs, 64, "observation.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotCorrection(correction: Correction): Correction {
+  const tracker = truncationTracker();
+  const correctedText = optionalClippedString(
+    correction.correctedText,
+    64 * 1024,
+    "correction.correctedText",
+    tracker,
+  );
+  const note = optionalClippedString(correction.note, 2_000, "correction.note", tracker);
+  return {
+    id: clippedString(correction.id, 256, "correction.id", tracker, "correction"),
+    targetKind: correction.targetKind,
+    targetId: clippedString(correction.targetId, 256, "correction.targetId", tracker, "unknown"),
+    verdict: correction.verdict,
+    origin:
+      correction.origin === "human" || correction.origin === "agent"
+        ? correction.origin
+        : "legacy",
+    ...(correctedText !== undefined ? { correctedText } : {}),
+    ...(note !== undefined ? { note } : {}),
+    createdTs: clippedString(correction.createdTs, 64, "correction.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectSnapshotDecision(decision: StoredDecision): StoredDecision {
+  const tracker = truncationTracker();
+  const question = optionalClippedString(decision.question, 2_000, "decision.question", tracker);
+  const observationId = optionalClippedString(decision.observationId, 256, "decision.observationId", tracker);
+  const claimId = optionalClippedString(decision.claimId, 256, "decision.claimId", tracker);
+  return {
+    id: clippedString(decision.id, 256, "decision.id", tracker, "decision"),
+    kind: clippedString(decision.kind, 160, "decision.kind", tracker, "unknown"),
+    reason: clippedString(decision.reason, 4_000, "decision.reason", tracker),
+    ...(question !== undefined ? { question } : {}),
+    evidence: clippedStrings(decision.evidence, 64, 256, "decision.evidence", tracker),
+    ...(observationId !== undefined ? { observationId } : {}),
+    ...(claimId !== undefined ? { claimId } : {}),
+    createdTs: clippedString(decision.createdTs, 64, "decision.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+  };
+}
+
+function projectWorkflowItem(
+  store: Store,
+  episode: Episode,
+  actionLimit: number,
+): WorkflowEvidenceItem {
+  const tracker = truncationTracker();
+  const sourceActionCount = Array.isArray(episode.actions) ? episode.actions.length : 0;
+  const actionIds = selectedActionIds(episode, actionLimit, tracker);
+  const sourceActions = store.actions.byIds(actionIds);
+  const existingActionIds = new Set(sourceActions.map((action) => action.id));
+  const missingActionCount = actionIds.filter((id) => !existingActionIds.has(id)).length;
+  const projectedActions = sourceActions.map((action, index) => projectWorkflowAction(action, index, tracker));
+  const episodeId = clippedString(episode.id, 256, "episode.id", tracker, "episode");
+  const startTs = clippedString(episode.startTs, 64, "episode.startTs", tracker, "1970-01-01T00:00:00.000Z");
+  const endTs = clippedString(episode.endTs, 64, "episode.endTs", tracker, "1970-01-01T00:00:00.000Z");
+  const summary = clippedString(episode.summary, 2_000, "episode.summary", tracker);
+  const goal = optionalClippedString(episode.goal, 1_000, "episode.goal", tracker);
+  const boundaryReason = workflowBoundaryReason(episode.boundaryReason, tracker);
+  const artifacts = clippedStrings(episode.artifacts, 64, 500, "episode.artifacts", tracker);
+  const decisionPoints = clippedStrings(episode.decisionPoints, 32, 500, "episode.decisionPoints", tracker);
+  const rejectedPaths = clippedStrings(episode.rejectedPaths, 32, 500, "episode.rejectedPaths", tracker);
+  let uncertainty = clippedStrings(episode.uncertainty, 32, 500, "episode.uncertainty", tracker);
+  const omittedActionCount = Math.max(0, sourceActionCount - actionIds.length);
+  if (tracker.seen.size > 0 || missingActionCount > 0) {
+    const warning = `Workflow evidence was truncated: included ${sourceActions.length} of ${sourceActionCount} referenced actions; shortened, omitted, or missing evidence may make this review incomplete.`;
+    uncertainty = [...uncertainty.slice(0, 31), warning.slice(0, 500)];
+  }
+  const item: WorkflowEvidenceItem = {
+    episode: {
+      id: episodeId,
+      type: "context_episode",
+      startTs,
+      endTs,
+      summary,
+      ...(goal !== undefined ? { goal } : {}),
+      actions: actionIds,
+      artifacts,
+      decisionPoints,
+      rejectedPaths,
+      uncertainty,
+      ...(boundaryReason !== undefined ? { boundaryReason } : {}),
+    },
+    actions: projectedActions,
+    truncation: {
+      truncated: false,
+      fields: tracker.fields,
+      omittedFieldCount: tracker.omittedFieldCount,
+      actionCounts: {
+        referenced: sourceActionCount,
+        included: sourceActions.length,
+        omitted: omittedActionCount,
+        missing: missingActionCount,
+      },
+    },
+  };
+  item.truncation.truncated = tracker.seen.size > 0 || missingActionCount > 0;
+  return item;
+}
+
+function workflowPageBytes(items: WorkflowEvidenceItem[], nextCursor: string | null): number {
+  return Buffer.byteLength(JSON.stringify({ items, nextCursor }), "utf8");
+}
+
+function workflowEvidencePage(store: Store, url: URL): WorkflowEvidencePage {
+  const limit = boundedQueryInteger(url.searchParams.get("limit"), WORKFLOW_PAGE_LIMIT, 1, WORKFLOW_PAGE_LIMIT);
+  const cursor = decodeWorkflowCursor(url.searchParams.get("cursor"));
+  // Fetch one extra row so continuation is exact without a separate COUNT.
+  const fetched = store.episodes.pageAfter(limit + 1, cursor);
+  const candidates = fetched.slice(0, limit);
+  const items: WorkflowEvidenceItem[] = [];
+
+  for (const episode of candidates) {
+    let actionLimit = Math.min(episode.actions.length, WORKFLOW_ACTION_SAFETY_LIMIT);
+    let item = projectWorkflowItem(store, episode, actionLimit);
+    let bytes = workflowPageBytes([...items, item], encodeWorkflowCursor(episode));
+
+    // Usually the page is shortened between episodes. If one episode alone is
+    // oversized, progressively omit its tail actions and report that omission.
+    while (items.length === 0 && bytes > API_RESPONSE_MAX_BYTES && actionLimit > 0) {
+      actionLimit = Math.floor(actionLimit / 2);
+      item = projectWorkflowItem(store, episode, actionLimit);
+      bytes = workflowPageBytes([item], encodeWorkflowCursor(episode));
+    }
+    if (bytes > API_RESPONSE_MAX_BYTES) {
+      if (items.length === 0) throw new Error("bounded workflow projection exceeds response limit");
+      break;
+    }
+    items.push(item);
+  }
+
+  const hasMore = items.length < candidates.length || fetched.length > limit;
+  const last = items.length > 0 ? candidates[items.length - 1] : undefined;
+  return { items, nextCursor: hasMore && last ? encodeWorkflowCursor(last) : null };
+}
+
 function handleApi(
   store: Store,
   req: IncomingMessage,
   res: ServerResponse,
   path: string,
   url: URL,
+  meshPublisher?: MeshPublisher,
 ): void {
   // --- reads ---
   if (req.method === "GET") {
+    if (path === "/api/mesh/directives/claim") {
+      const sessionKey = url.searchParams.get("sessionKey");
+      const cwd = url.searchParams.get("cwd");
+      if (!sessionKey || !cwd) return json(res, 400, { error: "sessionKey and cwd are required" });
+      void claimSteeringDirective(store, { sessionKey, cwd })
+        .then((result) => json(res, 200, result))
+        .catch((error) => {
+          log.debug("directive claim failed open", String(error));
+          json(res, 200, { directive: null });
+        });
+      return;
+    }
     if (path === "/api/mesh/gate") {
       const cwd = url.searchParams.get("cwd");
       const targetPath = url.searchParams.get("path");
@@ -230,6 +861,10 @@ function handleApi(
         return json(res, 200, {
           projects: PrivacyControlStore.forStore(store).read().meshProjectConsents,
         });
+      case "/api/mesh/sources":
+        return json(res, 200, {
+          sources: PrivacyControlStore.forStore(store).read().meshContextSourceConsents,
+        });
       case "/api/egress":
         return json(
           res,
@@ -249,26 +884,101 @@ function handleApi(
       case "/api/storage/retention":
         return json(res, 200, RetentionPolicyStore.forStore(store).read());
       case "/api/feed":
-        return json(res, 200, store.events.range({ limit: 300 }).reverse());
+        return json(
+          res,
+          200,
+          boundedHead(store.events.recent(300).map(projectSnapshotEvent)),
+        );
       case "/api/actions":
         // Newest first, bounded — the timeline grows forever; the browser
         // must not be handed (and animate) tens of thousands of rows.
-        return json(res, 200, store.actions.range().slice(-400).reverse());
-      case "/api/episodes":
-        return json(res, 200, store.episodes.all());
-      case "/api/claims":
-        return json(res, 200, store.claims.all());
-      case "/api/graph":
-        return json(res, 200, {
-          nodes: store.graph.nodes(),
-          edges: store.graph.edges(),
-        });
-      case "/api/observations":
-        return json(res, 200, store.observations.all());
-      case "/api/corrections":
-        return json(res, 200, store.corrections.all());
+        return json(
+          res,
+          200,
+          boundedHead(store.actions.recent(400).map(projectSnapshotAction)),
+        );
+      case "/api/episodes": { // Oldest-to-newest within the bounded recent window.
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          EPISODE_SNAPSHOT_LIMIT,
+          1,
+          EPISODE_SNAPSHOT_LIMIT,
+        );
+        const episodes = store.episodes.recentProjection(limit).map(projectSnapshotEpisode);
+        return json(res, 200, boundedTail(episodes));
+      }
+      case "/api/workflows": {
+        try {
+          return json(res, 200, workflowEvidencePage(store, url));
+        } catch (error) {
+          if (error instanceof InvalidWorkflowCursorError) {
+            return json(res, 400, { error: "invalid workflow cursor" });
+          }
+          throw error;
+        }
+      }
+      case "/api/claims": {
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          CLAIM_SNAPSHOT_LIMIT,
+          1,
+          CLAIM_SNAPSHOT_LIMIT,
+        );
+        const claims = applyCorrections(
+          store.claims.all(),
+          store.corrections.all().filter((correction) => correction.targetKind === "claim"),
+        )
+          .sort((left, right) =>
+            right.confidence - left.confidence || right.updatedTs.localeCompare(left.updatedTs),
+          )
+          .slice(0, limit);
+        return json(res, 200, boundedHead(claims.map(projectSnapshotClaim)));
+      }
+      case "/api/graph": {
+        const nodeLimit = boundedQueryInteger(
+          url.searchParams.get("nodes"),
+          GRAPH_NODE_SNAPSHOT_LIMIT,
+          1,
+          GRAPH_NODE_SNAPSHOT_LIMIT,
+        );
+        const edgeLimit = boundedQueryInteger(
+          url.searchParams.get("edges"),
+          GRAPH_EDGE_SNAPSHOT_LIMIT,
+          1,
+          GRAPH_EDGE_SNAPSHOT_LIMIT,
+        );
+        // Reserve independent budgets so a pathological node label cannot
+        // starve every edge (or vice versa) from the same snapshot.
+        const nodes = boundedHead(store.graph.nodes(nodeLimit).map(projectSnapshotNode), 3_000_000);
+        const edges = boundedHead(store.graph.edges(edgeLimit).map(projectSnapshotEdge), 1_400_000);
+        return json(res, 200, { nodes, edges });
+      }
+      case "/api/observations": {
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          OBSERVATION_SNAPSHOT_LIMIT,
+          1,
+          OBSERVATION_SNAPSHOT_LIMIT,
+        );
+        const observations = store.observations.recent(limit).map(projectSnapshotObservation);
+        return json(res, 200, boundedTail(observations));
+      }
+      case "/api/corrections": {
+        const limit = boundedQueryInteger(
+          url.searchParams.get("limit"),
+          CORRECTION_SNAPSHOT_LIMIT,
+          1,
+          CORRECTION_SNAPSHOT_LIMIT,
+        );
+        const corrections = store.corrections.recent(limit).map(projectSnapshotCorrection);
+        return json(res, 200, boundedTail(corrections));
+      }
       case "/api/decisions":
-        return json(res, 200, store.decisions.recent(50));
+        return json(
+          res,
+          200,
+          boundedHead(store.decisions.recent(50).map(projectSnapshotDecision)),
+        );
       case "/api/playbook":
         return json(res, 200, buildPlaybook(store));
       case "/api/connections":
@@ -305,6 +1015,42 @@ function handleApi(
   }
 
   // --- writes: privacy/capture control -----------------------------------
+  if (req.method === "POST" && path === "/api/mesh/verify") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      if (!data || typeof data.project !== "string") {
+        return json(res, 400, { ok: false, error: "project is required" });
+      }
+      if (
+        typeof data.teamId !== "string"
+        || typeof data.deviceId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,120}$/.test(data.teamId)
+        || !/^[A-Za-z0-9._:-]{1,120}$/.test(data.deviceId)
+      ) {
+        return json(res, 400, { ok: false, error: "team relay scope is required" });
+      }
+      const project = normalizeMeshProjectIdentity(data.project);
+      if (!project) {
+        return json(res, 400, { ok: false, error: "project identity is invalid" });
+      }
+      const consents = PrivacyControlStore.forStore(store).read().meshProjectConsents;
+      if (!isMeshProjectConsented(consents, project)) {
+        return json(res, 403, { ok: false, error: "project is not currently consented" });
+      }
+      if (!meshPublisher) {
+        return json(res, 503, { ok: false, error: "team relay is not configured" });
+      }
+      if (meshPublisher.teamId !== data.teamId || meshPublisher.device !== data.deviceId) {
+        return json(res, 409, { ok: false, error: "team relay scope changed; restart required" });
+      }
+      void meshPublisher.publishVerification(project, { teamId: data.teamId, deviceId: data.deviceId })
+        .then((result) => json(res, result.ok ? 200 : 502, result))
+        .catch((error) => {
+          log.debug("mesh verification publish failed open", String(error));
+          json(res, 502, { ok: false, error: "team relay did not confirm verification" });
+        });
+    });
+  }
   if (req.method === "PUT" && path === "/api/privacy") {
     return readBody(req, res, (body) => {
       const data = safeParse(body);
@@ -327,6 +1073,34 @@ function handleApi(
       });
       return json(res, 200, { projects: control.meshProjectConsents });
     });
+  }
+  if (req.method === "PUT" && path === "/api/mesh/sources") {
+    return readBody(req, res, (body) => {
+      const data = safeParse(body) as Record<string, unknown> | undefined;
+      if (!data || !Array.isArray(data.sources)) {
+        return json(res, 400, { error: "sources must be an array" });
+      }
+      const control = PrivacyControlStore.forStore(store).update({
+        meshContextSourceConsents: data.sources as PrivacyControl["meshContextSourceConsents"],
+      });
+      return json(res, 200, { sources: control.meshContextSourceConsents });
+    });
+  }
+  const directiveAck = /^\/api\/mesh\/directives\/([^/]+)\/ack$/.exec(path);
+  if (req.method === "POST" && directiveAck?.[1]) {
+    let id: string;
+    try {
+      id = decodeURIComponent(directiveAck[1]);
+    } catch {
+      return json(res, 400, { error: "invalid directive id" });
+    }
+    void acknowledgeSteeringDirective(store, id)
+      .then((result) => json(res, 200, result))
+      .catch((error) => {
+        log.debug("directive ack reporting failed open", String(error));
+        json(res, 200, { ok: true });
+      });
+    return;
   }
   if (req.method === "PUT" && path === "/api/runtime/resources") {
     return readBody(req, res, (body) => {
@@ -411,16 +1185,66 @@ function handleApi(
       if (!data?.targetKind || !data?.targetId || !data?.verdict) {
         return json(res, 400, { error: "targetKind, targetId, verdict required" });
       }
-      const correction = {
+      const targetKind = String(data.targetKind) as CorrectionTarget;
+      const verdict = String(data.verdict) as CorrectionVerdict;
+      if (!["action", "episode", "claim", "observation", "decision"].includes(targetKind)) {
+        return json(res, 400, { error: "invalid correction targetKind" });
+      }
+      if (!["confirmed", "rejected", "edited"].includes(verdict)) {
+        return json(res, 400, { error: "invalid correction verdict" });
+      }
+      const targetId = String(data.targetId);
+      const note = data.note ? String(data.note) : undefined;
+      const correctedText = data.correctedText ? String(data.correctedText) : undefined;
+      const isWorkflowReview = note === WORKFLOW_REVIEW_NOTE;
+      if (isWorkflowReview) {
+        if (targetKind !== "episode") {
+          return json(res, 400, { error: "workflow reviews must target an episode" });
+        }
+        if (verdict !== "rejected" && !parseWorkflowReview(correctedText)) {
+          return json(res, 400, { error: "invalid workflow review payload" });
+        }
+      } else if (verdict === "edited" && !isMeaningfulCorrection(correctedText)) {
+        return json(res, 400, { error: "edited corrections require replacement text" });
+      }
+      const correction: Correction = {
         id: newId("corr"),
-        targetKind: data.targetKind as never,
-        targetId: String(data.targetId),
-        verdict: data.verdict as never,
-        correctedText: data.correctedText ? String(data.correctedText) : undefined,
-        note: data.note ? String(data.note) : undefined,
+        targetKind,
+        targetId,
+        verdict,
+        origin: "human",
+        correctedText,
+        note,
         createdTs: nowIso(),
       };
-      store.corrections.put(correction);
+      // A correction and its derived memory projection are one unit. This is
+      // true for action/episode/observation/decision corrections too: accepting
+      // a verdict while leaving contradicted claims visible breaks trust.
+      store.db.exec("BEGIN IMMEDIATE");
+      try {
+        // Validate under the same writer lock as the receipt. Otherwise a
+        // concurrent projection/forget can remove the target between a
+        // successful check and this insert, leaving an orphan correction.
+        if (!correctionTargetExists(store, targetKind, targetId)) {
+          store.db.exec("ROLLBACK");
+          return json(res, 404, {
+            error: isWorkflowReview
+              ? "workflow episode not found"
+              : `${targetKind} correction target not found`,
+          });
+        }
+        store.corrections.put(correction);
+        buildGraph(store);
+        store.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          store.db.exec("ROLLBACK");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        log.error(`correction rolled back: ${String(error)}`);
+        return json(res, 500, { error: "correction could not be persisted" });
+      }
       log.info(`correction: ${correction.verdict} on ${correction.targetId}`);
       return json(res, 200, correction);
     });
@@ -430,20 +1254,51 @@ function handleApi(
   if (req.method === "POST" && path === "/api/answer") {
     return readBody(req, res, (body) => {
       const data = safeParse(body) as Record<string, unknown> | undefined;
-      if (!data?.questionId || data.answer == null) {
-        return json(res, 400, { error: "questionId and answer required" });
+      const dismissed = data?.dismissed === true;
+      if (!data?.questionId || (!dismissed && data.answer == null)) {
+        return json(res, 400, { error: "questionId and answer (or dismissed) required" });
       }
-      const answer = {
+      const question = data.question ? String(data.question).trim() : "";
+      const correctedText = dismissed ? undefined : String(data.answer).trim();
+      if (!dismissed && !isMeaningfulCorrection(correctedText)) {
+        return json(res, 400, { error: "answer requires your replacement text" });
+      }
+      const answer: Correction = {
         id: newId("corr"),
         targetKind: "decision" as const,
         targetId: String(data.questionId),
-        verdict: "edited" as const,
-        correctedText: String(data.answer),
-        note: data.question ? String(data.question) : undefined,
+        verdict: dismissed ? "rejected" as const : "edited" as const,
+        origin: "human",
+        correctedText,
+        note: dismissed
+          ? `${DISMISSED_QUESTION_NOTE_PREFIX}${normalizeQuestion(question)}`
+          : question || undefined,
         createdTs: nowIso(),
       };
-      store.corrections.put(answer);
-      log.info(`answer "${answer.correctedText}" → ${answer.targetId}`);
+      store.db.exec("BEGIN IMMEDIATE");
+      try {
+        const decision = store.decisions.get(answer.targetId);
+        if (
+          !decision ||
+          !decision.question ||
+          (decision.kind !== "ask_expert" && decision.kind !== "intervene")
+        ) {
+          store.db.exec("ROLLBACK");
+          return json(res, 404, { error: "question not found" });
+        }
+        store.corrections.put(answer);
+        buildGraph(store);
+        store.db.exec("COMMIT");
+      } catch (error) {
+        try {
+          store.db.exec("ROLLBACK");
+        } catch {
+          // Preserve the materialization error if SQLite already aborted.
+        }
+        log.error(`answer rolled back: ${String(error)}`);
+        return json(res, 500, { error: "answer could not be persisted" });
+      }
+      log.info(`${dismissed ? "dismissed question" : "answered question"} → ${answer.targetId}`);
       return json(res, 200, answer);
     });
   }
@@ -464,13 +1319,129 @@ function captureStatus(
   const pauseActive =
     privacy.mode === "paused" &&
     (!privacy.pausedUntil || Date.parse(privacy.pausedUntil) > Date.now());
+  const effectiveMode = privacy.mode === "private"
+    ? "private"
+    : pauseActive
+      ? "paused"
+      : "normal";
+  const nativeActive = runtime.activeSources.some(
+    (source) => source === "native" || source === "native-stdin",
+  );
+  const agentSessionsActive = runtime.activeSources.includes("agent_sessions");
+  const sourceLastEventAt = runtime.sourceLastEventAt ?? {};
+  const channelLastEventAt = runtime.channelLastEventAt ?? {};
+  const contextHealth = ({
+    enabled,
+    producerActive,
+    lastEventAt,
+    readiness,
+    freshnessMs,
+    resourceBlockReason,
+  }: {
+    enabled: boolean;
+    producerActive: boolean;
+    lastEventAt?: string;
+    readiness: NonNullable<CaptureRuntimeStatus["sourceReadiness"]>["accessibility"];
+    freshnessMs: number;
+    resourceBlockReason?: string;
+  }) => {
+    let status: "disabled" | "blocked" | "unavailable" | "unknown" | "watching" | "receiving";
+    let reason: string | undefined;
+    if (!enabled) {
+      status = "disabled";
+      reason = "privacy-source-disabled";
+    } else if (readiness?.status === "disabled") {
+      status = "disabled";
+      reason = readiness.reason;
+    } else if (effectiveMode !== "normal") {
+      status = "blocked";
+      reason = effectiveMode === "private" ? "private-mode" : "capture-paused";
+    } else if (runtime.resources.suspended) {
+      status = "blocked";
+      reason = "resource-suspended";
+    } else if (resourceBlockReason) {
+      status = "blocked";
+      reason = resourceBlockReason;
+    } else if (!producerActive) {
+      status = "unavailable";
+      reason = "producer-not-running";
+    } else if (readiness?.status === "blocked" || readiness?.status === "unavailable") {
+      status = readiness.status;
+      reason = readiness.reason;
+    } else if (readiness?.status !== "ready") {
+      status = "unknown";
+      reason = "readiness-not-reported";
+    } else if (
+      lastEventAt &&
+      Number.isFinite(Date.parse(lastEventAt)) &&
+      Date.now() - Date.parse(lastEventAt) <= freshnessMs
+    ) {
+      status = "receiving";
+    } else {
+      status = "watching";
+    }
+    return {
+      status,
+      ...(reason ? { reason } : {}),
+      ...(lastEventAt ? { lastEventAt } : {}),
+    };
+  };
+  const screenResourceBlock = runtime.resources.batteryAware && runtime.resources.powerSource === "battery"
+    ? "battery-aware-screen-suppression"
+    : undefined;
   return {
     ...runtime,
     stale:
       runtime.state === "running" &&
       Date.now() - Date.parse(runtime.updatedAt) > 30_000,
     effectiveState: runtime.resources.suspended ? "suspended" : runtime.state,
-    effectiveMode: privacy.mode === "private" ? "private" : pauseActive ? "paused" : "normal",
+    effectiveMode,
+    health: {
+      // Reaching this authenticated endpoint proves only the Studio daemon is
+      // connected. Evidence-channel and interpretation readiness are separate.
+      daemon: { status: "connected" },
+      screenContext: contextHealth({
+        enabled: privacy.sources.screen_video,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.screen_recording ?? sourceLastEventAt.screen_video,
+        readiness: runtime.sourceReadiness?.screen_recording,
+        freshnessMs: 2 * 60_000,
+        resourceBlockReason: screenResourceBlock,
+      }),
+      accessibility: contextHealth({
+        enabled: privacy.sources.accessibility,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.accessibility ?? sourceLastEventAt.accessibility,
+        readiness: runtime.sourceReadiness?.accessibility,
+        freshnessMs: 2 * 60_000,
+      }),
+      agentContext: contextHealth({
+        enabled: privacy.sources.ai_proxy,
+        producerActive: agentSessionsActive,
+        lastEventAt: channelLastEventAt.agent_sessions ?? sourceLastEventAt.ai_proxy,
+        readiness: runtime.sourceReadiness?.agent_sessions,
+        freshnessMs: 5 * 60_000,
+      }),
+      systemAudio: contextHealth({
+        enabled: privacy.sources.audio,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.audio_system,
+        readiness: runtime.sourceReadiness?.audio_system,
+        freshnessMs: 2 * 60_000,
+      }),
+      microphoneAudio: contextHealth({
+        enabled: privacy.sources.audio,
+        producerActive: nativeActive,
+        lastEventAt: channelLastEventAt.audio_mic,
+        readiness: runtime.sourceReadiness?.audio_mic,
+        freshnessMs: 2 * 60_000,
+      }),
+      interpretation: runtime.interpretation ?? {
+        requested: "none",
+        active: "none",
+        status: "disabled",
+      },
+    },
     privacy: {
       mode: privacy.mode,
       ...(privacy.pausedUntil ? { pausedUntil: privacy.pausedUntil } : {}),
@@ -584,44 +1555,60 @@ function connections(store: Store): unknown {
  * evidence resolved so the user can verify before confirming.
  */
 function questions(store: Store): unknown {
-  const answered = new Set(store.corrections.all().map((c) => c.targetId));
+  const corrections = store.corrections.all();
 
   // The agent's proactive questions (it said it was unsure WHY) — each with
   // candidate answers to pick from. The card also offers a free-text box.
-  const agent = store.decisions
-    .recent(50)
-    .filter(
+  const agent = uniqueQuestionDecisions(
+    store.decisions
+      .recent(100)
+      .filter(
       (d) =>
         (d.kind === "ask_expert" || d.kind === "intervene") &&
         d.question &&
-        !answered.has(d.id),
-    )
-    .slice(0, 8)
+        decisionHasSubstantiveEvidence(d, store.actions.byIds(d.evidence)) &&
+        !questionWasResolved(d.id, d.question, corrections),
+      ),
+    8,
+  )
     .map((d) => {
+      const tracker = truncationTracker();
       const obs = d.observationId ? store.observations.get(d.observationId) : undefined;
       return {
-        questionId: d.id,
-        question: d.question,
-        options: obs?.options ?? [],
-        kind: d.kind,
-        createdTs: d.createdTs,
-        evidence: (d.evidence ?? []).map((id) => evidenceSummary(store, id)),
+        questionId: clippedString(d.id, 256, "question.id", tracker, "question"),
+        question: clippedString(d.question, 2_000, "question.question", tracker, "What should happen next?"),
+        options: clippedStrings(obs?.options ?? [], 8, 500, "question.options", tracker),
+        kind: clippedString(d.kind, 160, "question.kind", tracker, "ask_expert"),
+        createdTs: clippedString(d.createdTs, 64, "question.createdTs", tracker, "1970-01-01T00:00:00.000Z"),
+        evidence: clippedStrings(d.evidence ?? [], 24, 256, "question.evidence", tracker)
+          .map((id) => evidenceSummary(store, id)),
       };
     });
 
   // Per-action verification cards (uncertain reconstructions).
-  const cards = store.actions
-    .range()
-    .filter((a) => (a.confidence < 0.85 || a.uncertainty?.length) && !answered.has(a.id))
+  const candidateCards: ActionEvent[] = [];
+  // SQL-bounded newest-first scan. Stop as soon as the consumer inbox is full;
+  // lifetime O(n²) semantic dedupe makes a frequently-polled endpoint degrade
+  // with every day the app runs.
+  for (const action of store.actions.recent(500)) {
+    if (
+      !isActionQuestionWorthy(action) ||
+      actionQuestionWasResolved(action.id, propose(action), corrections) ||
+      candidateCards.some((prior) => sameQuestion(propose(prior), propose(action)))
+    ) continue;
+    candidateCards.push(action);
+    if (candidateCards.length >= 20) break;
+  }
+  const cards = candidateCards
     .map((a) => ({
-      actionId: a.id,
+      actionId: a.id.slice(0, 256),
       proposed: propose(a),
-      action: a.action,
-      app: a.app,
-      text: a.text,
+      action: a.action.slice(0, 160),
+      app: a.app.slice(0, 240),
+      text: a.text?.slice(0, 2_000),
       confidence: a.confidence,
-      uncertainty: a.uncertainty ?? [],
-      evidence: a.evidence.map((id) => evidenceSummary(store, id)),
+      uncertainty: (a.uncertainty ?? []).slice(0, 12).map((item) => item.slice(0, 500)),
+      evidence: a.evidence.slice(0, 24).map((id) => evidenceSummary(store, id.slice(0, 256))),
     }));
 
   return { agent, cards };
@@ -640,7 +1627,7 @@ function propose(a: ActionEvent): string {
 
 function evidenceSummary(store: Store, id: string): unknown {
   const ev: RawEvent | undefined = store.events.get(id);
-  if (!ev) return { id, label: id };
+  if (!ev) return { id: id.slice(0, 256), label: id.slice(0, 256) };
   const text =
     (ev.payload.text as string) ??
     (ev.payload.value as string) ??
@@ -648,14 +1635,14 @@ function evidenceSummary(store: Store, id: string): unknown {
     (ev.payload.title as string) ??
     "";
   return {
-    id,
+    id: id.slice(0, 256),
     source: ev.source,
-    type: ev.type,
-    app: ev.app,
-    ts: ev.ts,
-    label: `${ev.source}/${ev.type}`,
+    type: ev.type.slice(0, 160),
+    app: ev.app.slice(0, 240),
+    ts: ev.ts.slice(0, 64),
+    label: `${ev.source}/${ev.type}`.slice(0, 320),
     snippet: String(text).slice(0, 80),
-    blobRefs: ev.blobRefs,
+    blobRefs: ev.blobRefs.slice(0, 32).map((hash) => hash.slice(0, 256)),
   };
 }
 

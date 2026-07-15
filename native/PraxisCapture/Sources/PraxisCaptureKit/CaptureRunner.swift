@@ -51,6 +51,10 @@ public final class CaptureRunner {
     private var clipboardTimer: Timer?
     private var requestedAudioSystem = false
     private var requestedAudioMic = false
+    private var lastSourceReadiness: [String: String] = [:]
+    private var audioRuntimeReadiness: [String: NativeSourceReadiness] = [:]
+    private var cachedTranscriptionReadiness: OnDeviceTranscriptionState?
+    private var transcriptionReadinessCheckedAt: Date?
 
     public init(
         options: CaptureOptions = CaptureOptions(),
@@ -70,6 +74,7 @@ public final class CaptureRunner {
 
         let axOk = Permissions.accessibilityTrusted()
         let screenOk = Permissions.screenRecordingAllowed()
+        reportSourceReadiness(accessibility: axOk, screenRecording: screenOk)
         log("starting (accessibility=\(axOk), screenRecording=\(screenOk))")
         if !axOk {
             log("Accessibility not granted — focus/input/AX limited.")
@@ -119,31 +124,74 @@ public final class CaptureRunner {
         focus?.stop(); focus = nil
         audio?.stop(); audio = nil
         clipboard = nil
-        screen = nil
+        screen?.stop(); screen = nil
+        lastSourceReadiness = [:]
+        audioRuntimeReadiness = [:]
+        cachedTranscriptionReadiness = nil
+        transcriptionReadinessCheckedAt = nil
     }
 
     /// Toggle the audio taps live (the menu-bar app calls this without
     /// restarting capture). System audio rides the Screen Recording grant; the
     /// mic path requests its own permissions on first enable.
     public func setAudio(system: Bool, mic: Bool) {
+        let previouslyRequestedSystem = requestedAudioSystem
+        let previouslyRequestedMic = requestedAudioMic
         requestedAudioSystem = system
         requestedAudioMic = mic
+        if !system {
+            audioRuntimeReadiness.removeValue(forKey: "audio_system")
+        } else if !previouslyRequestedSystem {
+            audioRuntimeReadiness["audio_system"] = NativeSourceReadiness(
+                channel: "audio_system", status: "unavailable", reason: "tap-starting"
+            )
+        }
+        if !mic {
+            audioRuntimeReadiness.removeValue(forKey: "audio_mic")
+        } else if !previouslyRequestedMic {
+            audioRuntimeReadiness["audio_mic"] = NativeSourceReadiness(
+                channel: "audio_mic", status: "unavailable", reason: "tap-starting"
+            )
+        }
+        if !system && !mic {
+            cachedTranscriptionReadiness = nil
+            transcriptionReadinessCheckedAt = nil
+        }
         if system || mic {
             let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
             guard policy.decision(source: .audio, app: app, window: nil, at: Date()).allowed else {
+                if system {
+                    audioRuntimeReadiness["audio_system"] = NativeSourceReadiness(
+                        channel: "audio_system", status: "unavailable",
+                        reason: "capture-policy-blocked"
+                    )
+                }
+                if mic {
+                    audioRuntimeReadiness["audio_mic"] = NativeSourceReadiness(
+                        channel: "audio_mic", status: "unavailable",
+                        reason: "capture-policy-blocked"
+                    )
+                }
                 audio?.stop()
+                reportSourceReadiness()
                 return
             }
             if audio == nil {
-                audio = AudioCapture(policy: policy)
-                AudioCapture.requestPermissions(mic: mic) { ok in
-                    if !ok { log("audio: speech/mic permission incomplete — transcripts may be unavailable") }
+                audio = AudioCapture(policy: policy) { [weak self] readiness in
+                    self?.receiveAudioReadiness(readiness)
+                }
+                // Speech authorization is shared by both channels. MicTap owns
+                // the microphone request so a pending/changed TCC decision can
+                // be retried by the regular reconciliation loop.
+                AudioCapture.requestPermissions(mic: false) { ok in
+                    if !ok { log("audio: speech permission incomplete — transcripts may be unavailable") }
                 }
             }
             audio?.set(system: system && Permissions.screenRecordingAllowed(), mic: mic)
         } else {
             audio?.stop(); audio = nil
         }
+        reportSourceReadiness()
     }
 
     /// Flush the rolling clip ring (if enabled) to an mp4 blob + NDJSON event.
@@ -167,6 +215,7 @@ public final class CaptureRunner {
     /// One-shot snapshot (smoke testing without a long-running loop).
     public func runOnce(output: FileHandle = .standardOutput) {
         Emitter.shared.output = output
+        reportSourceReadiness()
         let screenOk = Permissions.screenRecordingAllowed()
         log("one-shot (accessibility=\(Permissions.accessibilityTrusted()), screenRecording=\(screenOk))")
         AXSnapshot.snapshotFocused(policy: policy)
@@ -176,6 +225,7 @@ public final class CaptureRunner {
     }
 
     private func reconcilePolicy() {
+        reportSourceReadiness()
         if requestedAudioSystem || requestedAudioMic {
             setAudio(system: requestedAudioSystem, mic: requestedAudioMic)
         }
@@ -183,6 +233,79 @@ public final class CaptureRunner {
         if !policy.decision(source: .screenVideo, app: app, window: nil, at: Date()).allowed {
             Task { [weak self] in await self?.screen?.clipBuffer?.clear() }
         }
+    }
+
+    private func reportSourceReadiness(
+        accessibility: Bool? = nil,
+        screenRecording: Bool? = nil
+    ) {
+        let accessibility = accessibility ?? Permissions.accessibilityTrusted()
+        let screenRecording = screenRecording ?? Permissions.screenRecordingAllowed()
+        let now = Date()
+        if requestedAudioSystem || requestedAudioMic,
+           cachedTranscriptionReadiness == nil ||
+            now.timeIntervalSince(transcriptionReadinessCheckedAt ?? .distantPast) >= 5 {
+            cachedTranscriptionReadiness = Permissions.onDeviceTranscriptionState()
+            transcriptionReadinessCheckedAt = now
+        }
+        let transcription = cachedTranscriptionReadiness
+        report(NativeReadiness.accessibility(trusted: accessibility), window: "Accessibility")
+        report(NativeReadiness.screenRecording(allowed: screenRecording), window: "Screen Recording")
+        let systemPrerequisite = NativeReadiness.systemAudio(
+                requested: requestedAudioSystem,
+                screenRecording: screenRecording,
+                transcriptionStatus: transcription?.status,
+                transcriptionReason: transcription?.reason
+        )
+        report(
+            effectiveAudioReadiness(systemPrerequisite, requested: requestedAudioSystem),
+            window: "System Audio"
+        )
+        let microphonePrerequisite = NativeReadiness.microphoneAudio(
+                requested: requestedAudioMic,
+                microphoneAuthorization: requestedAudioMic
+                    ? Permissions.microphoneAuthorization()
+                    : nil,
+                transcriptionStatus: transcription?.status,
+                transcriptionReason: transcription?.reason
+        )
+        report(
+            effectiveAudioReadiness(microphonePrerequisite, requested: requestedAudioMic),
+            window: "Microphone Audio"
+        )
+    }
+
+    private func effectiveAudioReadiness(
+        _ prerequisite: NativeSourceReadiness,
+        requested: Bool
+    ) -> NativeSourceReadiness {
+        guard requested, prerequisite.status == "ready" else { return prerequisite }
+        return audioRuntimeReadiness[prerequisite.channel] ?? NativeSourceReadiness(
+            channel: prerequisite.channel, status: "unavailable", reason: "tap-starting"
+        )
+    }
+
+    private func receiveAudioReadiness(_ readiness: NativeSourceReadiness) {
+        let apply = { [weak self] in
+            guard let self else { return }
+            self.audioRuntimeReadiness[readiness.channel] = readiness
+            self.reportSourceReadiness()
+        }
+        if Thread.isMainThread { apply() }
+        else { DispatchQueue.main.async(execute: apply) }
+    }
+
+    private func report(_ readiness: NativeSourceReadiness, window: String) {
+        let signature = "\(readiness.status):\(readiness.reason ?? "")"
+        guard lastSourceReadiness[readiness.channel] != signature else { return }
+        lastSourceReadiness[readiness.channel] = signature
+        Emitter.shared.emit(
+            source: "capture_control",
+            app: "Praxis",
+            window: window,
+            type: "source_status",
+            payload: readiness.payload
+        )
     }
 
 

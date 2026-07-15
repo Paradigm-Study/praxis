@@ -5,7 +5,7 @@ import { decide } from "../src/agent/policy.ts";
 import { retrieveLongTermContext } from "../src/agent/retrieve.ts";
 import { AgentLoop } from "../src/agent/loop.ts";
 import type { Observer } from "../src/observer/observer.ts";
-import { freshStore, fullPipeline } from "./helpers.ts";
+import { action, freshStore, fullPipeline } from "./helpers.ts";
 
 function claim(partial: Partial<Claim> & { text: string }): Claim {
   return {
@@ -13,7 +13,7 @@ function claim(partial: Partial<Claim> & { text: string }): Claim {
     kind: partial.kind ?? "decision_rule",
     text: partial.text,
     confidence: partial.confidence ?? 0.9,
-    evidenceEpisodes: partial.evidenceEpisodes ?? ["episode_1"],
+    evidenceEpisodes: partial.evidenceEpisodes ?? ["episode_1", "episode_2"],
     createdTs: partial.createdTs ?? "2026-06-01T00:00:00.000Z",
     updatedTs: partial.updatedTs ?? "2026-06-01T00:00:00.000Z",
   };
@@ -37,6 +37,15 @@ function observation(partial: Partial<Observation>): Observation {
     model: partial.model ?? "claude-sonnet-4-6",
     createdTs: partial.createdTs ?? "2026-06-10T12:00:00.000Z",
   };
+}
+
+function consequentialAction() {
+  return action({
+    id: "action_1",
+    action: "corrected_agent",
+    startTs: "2026-06-10T11:59:00.000Z",
+    text: "Choose the database implementation",
+  });
 }
 
 test("retrieval is bounded to the current situation — relevant claims only", () => {
@@ -73,6 +82,43 @@ test("retrieval is bounded by a limit — not a dump of everything", () => {
   store.close();
 });
 
+test("long-term context applies claim rejection/editing and excludes one-offs", () => {
+  const store = freshStore();
+  try {
+    store.claims.put(claim({
+      id: "context_once",
+      text: "Prefer SQLite for the database.",
+      evidenceEpisodes: ["episode_once"],
+    }));
+    const obs = observation({ intent: "Choose a database for the service." });
+    assert.deepEqual(retrieveLongTermContext(store, obs), []);
+    store.corrections.put({
+      id: "context_edit",
+      targetKind: "claim",
+      targetId: "context_once",
+      verdict: "edited",
+      origin: "human",
+      correctedText: "Prefer Postgres for the service database.",
+      createdTs: "2026-07-13T00:00:00.000Z",
+    });
+    assert.deepEqual(
+      retrieveLongTermContext(store, obs).map((item) => item.text),
+      ["Prefer Postgres for the service database."],
+    );
+    store.corrections.put({
+      id: "context_reject",
+      targetKind: "claim",
+      targetId: "context_once",
+      verdict: "rejected",
+      origin: "human",
+      createdTs: "2026-07-13T00:01:00.000Z",
+    });
+    assert.deepEqual(retrieveLongTermContext(store, obs), []);
+  } finally {
+    store.close();
+  }
+});
+
 test("policy avoids re-asking what long-term memory already established", () => {
   const obs = observation({
     uncertainty: ["unsure why the user picked this database"],
@@ -82,7 +128,7 @@ test("policy avoids re-asking what long-term memory already established", () => 
 
   const decision = decide({
     observation: obs,
-    actions: [],
+    actions: [consequentialAction()],
     claims: [],
     longTermContext: [established],
   });
@@ -103,7 +149,7 @@ test("policy still asks when long-term memory has nothing relevant", () => {
 
   const decision = decide({
     observation: obs,
-    actions: [],
+    actions: [consequentialAction()],
     claims: [],
     longTermContext: [unrelated],
   });
@@ -126,7 +172,7 @@ test("policy does NOT treat a non-answer-bearing claim as established", () => {
 
   const decision = decide({
     observation: obs,
-    actions: [],
+    actions: [consequentialAction()],
     claims: [],
     longTermContext: [openQuestion],
   });
@@ -146,7 +192,7 @@ test("policy still asks when a claim only shares a generic term with the questio
 
   const decision = decide({
     observation: obs,
-    actions: [],
+    actions: [consequentialAction()],
     claims: [],
     longTermContext: [tangential],
   });

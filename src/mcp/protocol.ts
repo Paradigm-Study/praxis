@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import type { Store } from "../storage/index.ts";
 import type { ClaimKind, Correction, CorrectionVerdict } from "../core/types.ts";
 import { CLAIM_KINDS } from "../core/types.ts";
@@ -5,6 +6,7 @@ import { buildPlaybook } from "../transfer/transfer.ts";
 import { retrieveForTask } from "../agent/retrieveForTask.ts";
 import { newId } from "../core/ids.ts";
 import { nowIso } from "../core/time.ts";
+import { applyCorrections } from "../memory/consolidate.ts";
 
 /**
  * MCP protocol layer: JSON-RPC 2.0 message handling + tool implementations,
@@ -82,18 +84,18 @@ export function isLoopback(remoteAddress: string | undefined): boolean {
  * A peer-address check alone does not stop a browser: a page whose hostname
  * re-resolves to 127.0.0.1 posts from the local machine but with a foreign
  * Origin. Native clients send no Origin header at all — absent passes; any
- * present Origin must name a localhost host (any port, any scheme).
+ * present Origin must name localhost or an actual loopback IP literal (any
+ * port, any scheme). A DNS name that merely starts with "127" is not local.
  */
 export function isAllowedOrigin(origin: string | undefined): boolean {
   if (origin === undefined || origin === "") return true; // non-browser client
   try {
     const { hostname } = new URL(origin);
-    return (
-      hostname === "localhost" ||
-      hostname === "[::1]" ||
-      hostname === "::1" ||
-      hostname.startsWith("127.")
-    );
+    const host = hostname.startsWith("[") && hostname.endsWith("]")
+      ? hostname.slice(1, -1)
+      : hostname;
+    if (host.toLowerCase() === "localhost" || host === "::1") return true;
+    return isIP(host) === 4 && host.split(".", 1)[0] === "127";
   } catch {
     return false; // "null" or unparsable Origins are not trusted
   }
@@ -140,9 +142,10 @@ const TOOL_IMPLS: Record<string, ToolImpl> = {
   get_claims: (store, args) => {
     const kind = strArg(args.kind);
     const limit = numArg(args.limit) ?? 50;
+    const corrected = applyCorrections(store.claims.all(), store.corrections.all());
     const claims = kind
-      ? store.claims.byKind(kind as ClaimKind)
-      : store.claims.all();
+      ? corrected.filter((claim) => claim.kind === (kind as ClaimKind))
+      : corrected;
     return ok(claims.slice(0, limit));
   },
 
@@ -168,6 +171,9 @@ const TOOL_IMPLS: Record<string, ToolImpl> = {
     if (!observationId && !claimId) {
       return fail("record_correction requires 'observationId' or 'claimId'");
     }
+    if (observationId && claimId) {
+      return fail("record_correction accepts exactly one target");
+    }
     const verdict: CorrectionVerdict | undefined =
       args.verdict === "confirm"
         ? "confirmed"
@@ -177,18 +183,41 @@ const TOOL_IMPLS: Record<string, ToolImpl> = {
     if (!verdict) {
       return fail("record_correction verdict must be 'confirm' or 'reject'");
     }
-    // Same shape + store path the studio's human-in-the-loop endpoints use
-    // (POST /api/correction and /api/answer): a Correction row that the graph
-    // builder folds back in on the next pass.
+    // A model can report disagreement, but cannot manufacture human trust. The
+    // auditable receipt is intentionally excluded from memory materialization
+    // until a person confirms or edits it through Studio.
     const correction: Correction = {
       id: newId("corr"),
       targetKind: observationId ? "observation" : "claim",
       targetId: observationId ?? claimId!,
       verdict,
+      origin: "agent",
       note: strArg(args.note),
       createdTs: nowIso(),
     };
-    store.corrections.put(correction);
+    store.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Keep target validation and insertion under one writer lock. A target
+      // removed by a concurrent rebuild/forget can never leave an orphaned
+      // correction that was acknowledged as successful.
+      if (observationId && !store.observations.get(observationId)) {
+        store.db.exec("ROLLBACK");
+        return fail("record_correction observation target not found");
+      }
+      if (claimId && !store.claims.get(claimId)) {
+        store.db.exec("ROLLBACK");
+        return fail("record_correction claim target not found");
+      }
+      store.corrections.put(correction);
+      store.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        store.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the materialization error if SQLite already aborted.
+      }
+      return fail(`record_correction could not persist: ${String(error)}`);
+    }
     return ok(correction);
   },
 };
@@ -252,9 +281,9 @@ export const TOOL_DEFINITIONS = [
   {
     name: "record_correction",
     description:
-      "Record a human/agent verdict on an interpretation: confirm or reject an " +
-      "observation or a claim, with an optional note. Feeds the same " +
-      "correction loop as the Studio UI.",
+      "Record an agent-reported confirm/reject suggestion for an observation " +
+      "or claim, with an optional note. This creates an auditable receipt but " +
+      "does not alter trusted memory until a person reviews it in Studio.",
     inputSchema: {
       type: "object",
       properties: {

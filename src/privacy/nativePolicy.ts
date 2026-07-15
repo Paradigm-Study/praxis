@@ -37,6 +37,7 @@ export interface NativeAcquisitionPolicy {
   cloudScreenshotEgressConsent: boolean;
   excludedApps: string[];
   excludedWindows: string[];
+  excludedPaths: string[];
   resources: Pick<RuntimeResourceState, "powerSource" | "suspended" | "batteryAware">;
 }
 
@@ -66,6 +67,7 @@ export function projectNativeAcquisitionPolicy(
     cloudScreenshotEgressConsent: privacy.screenshotConsent === true,
     excludedApps: [...privacy.excludedApps],
     excludedWindows: [...privacy.excludedWindows],
+    excludedPaths: [...privacy.excludedPaths],
     resources: {
       powerSource: resources.powerSource,
       suspended: resources.suspended,
